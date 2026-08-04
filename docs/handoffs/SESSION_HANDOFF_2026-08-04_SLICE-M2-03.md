@@ -103,3 +103,15 @@ job 從未建立 → 永遠沒人處理」，與原本的卡住問題等價。
 
 **測試 288 → 299（單元 39、DB 整合 126、端到端 134），全綠。**
 下一刀維持：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest`。
+
+### 2026-08-05 補遺（關閉章節後的兩項收尾）
+
+1. **`/admin/jobs` 補 R6 角色閘**：原先只驗登入——租戶內任何使用者都能讀租約、
+   認領者與失敗原因。診斷屬技術維運資料，依 §24.6 權限矩陣掛 **R6 系統管理員**
+   （租戶層角色；種子新增「系管丁」）。無 R6 → 403 ＋ `ControlViolationAttempt`。
+2. **SIGKILL 驗收改為確定性 crash-reclaim**：原寫法允許 `wasRunning === COMPLETED`
+   （worker 太快，crash 段可能整段沒執行），且「重領」斷言實為恆真的
+   `attempt_count >= 1`。改以 SQL 構造「已認領但從未提交」的死 worker 狀態
+   （即 SIGKILL-after-claim 的語意），嚴格斷言 `attempt_count = 2` 且認領者易主。
+
+**測試 299 → 301（端到端 136），全綠。**

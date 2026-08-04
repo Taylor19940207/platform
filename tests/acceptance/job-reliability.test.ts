@@ -143,43 +143,49 @@ try {
     && sql(`SELECT count(*) FROM source_identity_assessment WHERE import_batch_id='${B3}'`) === "0");
   worker.kill(); worker = null; await sleep(400);
 
-  // ── 5 kill 後重啟自動恢復 ──
+  // ── 5 crash-reclaim（確定性）──
+  // 不與真實 SIGKILL 競速——原寫法允許 wasRunning === COMPLETED（worker 太快），
+  // 整段 crash-reclaim 可能從未被執行。改以 SQL 直接構造「已認領但從未提交」的
+  // 死 worker 狀態（這正是 SIGKILL-after-claim 的語意），使重領路徑必然被命中。
   await upload(jia, BALANCED);
   const B4 = latestBatch();
-  // 先讓工作被認領並進入 RUNNING，再硬殺 worker
-  worker = startWorker();
-  const claimed = await waitFor(() => jobField(B4, "status") === "RUNNING"
-    || jobField(B4, "status") === "COMPLETED", 8000);
-  const wasRunning = jobField(B4, "status");
-  worker.kill("SIGKILL"); worker = null;
-  check("worker 被 SIGKILL 前已認領工作", claimed, wasRunning);
-  if (wasRunning === "RUNNING") {
-    check("批次未卡在 VALIDATING（ADR-M2-002：VALIDATING 為交易內狀態）",
-      batchField(B4, "status") === "UPLOADED", batchField(B4, "status"));
-    check("租約逾時後可被診斷為 stalled",
-      await waitFor(() => sql(`SELECT (lease_expires_at <= now())::text
-        FROM background_job WHERE subject_id='${B4}'`) === "true", 8000));
-  }
+  sql(`UPDATE background_job SET status='RUNNING', claim_token=gen_random_uuid(),
+       claimed_by='dead-worker#999', claimed_at=now(),
+       lease_expires_at=now() + interval '1 second', attempt_count=1
+       WHERE subject_id='${B4}'`);
+  check("死 worker 已認領（RUNNING, attempt 1），批次未進 VALIDATING（ADR-M2-002）",
+    jobField(B4, "status") === "RUNNING" && batchField(B4, "status") === "UPLOADED",
+    `job=${jobField(B4, "status")} batch=${batchField(B4, "status")}`);
+  check("租約逾時後可被診斷為 stalled",
+    await waitFor(() => sql(`SELECT (lease_expires_at <= now())::text
+      FROM background_job WHERE subject_id='${B4}'`) === "true", 8000));
   worker = startWorker();
   check("重啟後自動恢復：批次最終達成 VALIDATED",
     await waitFor(() => batchField(B4, "status") === "VALIDATED", 20000),
     `${batchField(B4, "status")} / job=${jobField(B4, "status")}`);
+  check("crash-reclaim 確實發生：attempt_count = 2 且認領者已易主",
+    jobField(B4, "attempt_count") === "2" && jobField(B4, "claimed_by") !== "dead-worker#999",
+    `attempts=${jobField(B4, "attempt_count")} by=${jobField(B4, "claimed_by")}`);
   check("重領不產生重複來源事實：仍為 2 列",
     sql(`SELECT count(*) FROM source_ledger_line WHERE import_batch_id='${B4}'`) === "2");
   check("重領不產生重複資料集／涵蓋／評估（各 1 筆）",
     sql(`SELECT count(*) FROM source_dataset WHERE import_batch_id='${B4}'`) === "1"
     && sql(`SELECT count(*) FROM data_coverage WHERE import_batch_id='${B4}'`) === "1"
     && sql(`SELECT count(*) FROM source_identity_assessment WHERE import_batch_id='${B4}'`) === "1");
-  check("重領使 attempt_count 遞增（> 1）", Number(jobField(B4, "attempt_count")) >= 1,
-    jobField(B4, "attempt_count"));
   worker.kill(); worker = null; await sleep(400);
 
   // ── 6 VALIDATING 不可觀察（ADR-M2-002） ──
   check("全程未出現外部可觀察的 VALIDATING 批次",
     sql(`SELECT count(*) FROM import_batch WHERE status='VALIDATING'`) === "0");
 
-  // ── 7 診斷 API ──
-  const diag = await (await fetch(`${API}/admin/jobs`, { headers: { cookie: jia } })).json() as
+  // ── 7 診斷 API（§24.6：技術維運＝R6） ──
+  const denied = await fetch(`${API}/admin/jobs`, { headers: { cookie: jia } });
+  check("無 R6 者（甲）存取診斷 API → 403 ＋ 違規留痕",
+    denied.status === 403
+    && Number(sql(`SELECT count(*) FROM audit_event WHERE kind='CONTROL_VIOLATION_ATTEMPT'
+         AND event_type='admin.jobs.denied'`)) >= 1);
+  const ops = await login("aaaaaaaa-0000-0000-0000-000000000004");   // 系管丁：R6
+  const diag = await (await fetch(`${API}/admin/jobs`, { headers: { cookie: ops } })).json() as
     { jobs: Record<string, unknown>[]; stalled_count: number };
   check("診斷 API 列出工作與卡住計數", Array.isArray(diag.jobs) && diag.jobs.length >= 4);
   const j3 = diag.jobs.find((x) => x.subject_id === B3);

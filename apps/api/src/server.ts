@@ -207,6 +207,18 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
     // ── 診斷：背景工作狀態（SLICE-M2-03 第 16 條；管理用途，本刀只做 API 不做畫面） ──
     if (url.pathname === "/admin/jobs" && req.method === "GET") {
+      // 診斷屬技術維運資料（§24.6 權限矩陣：技術維運＝R6 系統管理員）。
+      // 只驗登入等於把租約、認領者與失敗原因暴露給租戶內任何使用者。
+      const isR6 = query<{ n: string }>(
+        `SELECT count(*) AS n FROM role_assignment
+          WHERE user_id = :'u'::uuid AND role = 'R6' AND revoked_at IS NULL`,
+        { u: s.userId }, { tenantId: s.tenantId });
+      if (Number(isR6[0]?.n) === 0) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "admin.jobs.denied", s.userId,
+          "admin_api", s.userId, { reason: "診斷 API 需 R6 系統管理員角色" });
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8" });
+        return res.end(JSON.stringify({ error: "診斷 API 需 R6 系統管理員角色" }));
+      }
       const jobs = query<Record<string, string>>(
         `SELECT job_id, job_type, subject_id, subject_version, status,
                 claimed_by, claimed_at, lease_expires_at, next_attempt_at,
