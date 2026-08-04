@@ -31,4 +31,4 @@ INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, rep
 INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id) VALUES
   ('99999999-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000001');
 SQL
-echo "種子完成（$DB）"
+echo "種子完成（${DB}）"

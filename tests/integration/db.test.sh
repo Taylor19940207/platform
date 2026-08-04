@@ -26,7 +26,7 @@ expect_err() {
   else ng "$1 → 失敗原因不符：$out"; fi
 }
 
-echo "══ DB 整合測試（$DB）══"
+echo "══ DB 整合測試（${DB}）══"
 bash "$ROOT/packages/database/src/db-reset.sh" $DB >/dev/null 2>&1 || { echo "重建失敗"; exit 1; }
 ok "migration 可從零重建資料庫"
 

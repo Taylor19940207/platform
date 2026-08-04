@@ -12,4 +12,4 @@ for f in "$DIR"/*.sql; do
   { cat "$f"; echo "; INSERT INTO schema_migrations(filename) VALUES ('$name');"; } | psql_run -d "$DB" -1 -f -
   echo "APPLIED  $name"
 done
-echo "migration 完成（$DB）"
+echo "migration 完成（${DB}）"
