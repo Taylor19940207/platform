@@ -50,7 +50,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）
-- [x] 開發環境：macOS＋Docker Compose 為權威；設定全數走 `.env.local`（Mac 實機 48/48 → 87/87）
+- [x] 開發環境：macOS＋Docker Compose 為權威；設定全數走 `.env.local`（Mac 實機 48/48 → 87/87 → 92/92（跨機驗證））
 - [x] **里程碑 2 第一刀（SLICE-M2-01）**：ACCEPTED TB → 版本化映射（批准 SOD／不可覆寫／§24.1A 歸屬）→ G-02 → 集團 TB 預覽＋最小 B-04；Case-001 與 Excel 逐科目比對 12/12（`docs/slices/`、`tests/fixtures/case-001/`）
 - [ ] 里程碑 2 後續：Adjustment 草稿 → PREVIEW CalculationRun → 證據包
 

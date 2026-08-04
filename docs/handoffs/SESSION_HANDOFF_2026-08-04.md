@@ -27,7 +27,11 @@
 - ImportBatch 七狀態與 `identity_status` 正交語意。
 - G-01 借貸平衡與 INV-28 接受硬阻擋。
 - 原檔、雜湊、來源事實及 audit event 的不可變性。
-- SOD-07 以自然人判定，建立者不得批准自己的實例。
+- SOD-07：上傳者不得確認自己上傳的 `UNVERIFIABLE` 匯入批次
+  （`SourceIdentityResolution.resolved_by ≠ ImportBatch.uploaded_by`）。
+- 映射 SoD：映射建立者不得批准自己建立的映射（`created_by ≠ approved_by`）。
+  這是 §24.6 權限矩陣的實例級應用，與 SOD-07 是兩個不同控制，不得混為一談。
+- 兩者皆以自然人判定，角色級禁令擋不住同一人切換角色後自我放行。
 - G-02：任何未映射重要餘額都不得進入覆核或正式輸出。
 - 草稿不能被當成已批准版本；已批准版本不可 UPDATE／DELETE，改版只能新增版本。
 - PREVIEW 必須清楚標示非正式輸出，不能作為入帳或交付依據。
@@ -182,5 +186,6 @@ pnpm test
 若只需延續文件設計，可先不重跑測試；但開始改 Adjustment／CalculationRun 程式前，
 應確認 HEAD、migration 6 份及 92/92 基線仍成立。
 
-外部完整版開發文件位於本機：`/Users/taylor/Documents/交付 3`。使用者已確認另一台
-電腦也有該資料夾，因此不納入 repo；它不得取代 repo 內兩份正式 Markdown 基線。
+另有一份外部完整版開發文件（部分機器上位於 `Documents/交付 3`），**屬可選參考資料，
+不是跨裝置接續的必要依賴**。它不納入 repo，也不得取代 repo 內兩份正式 Markdown 基線；
+任何一台機器在沒有該資料夾的情況下，都必須能只靠本 repo 完成接續與驗證。

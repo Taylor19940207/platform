@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、四份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
+7. `packages/domain/src/importBatch.ts`、六份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
 8. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
 
 CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時閱讀，不得取代已合併的 v1.2／v1.1 正式基線。工程細節以 repo 內 Markdown 與現行程式為準，PDF 供閱讀。
