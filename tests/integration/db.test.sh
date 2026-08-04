@@ -553,6 +553,97 @@ wait $LOCKER
 [ "$n" = "0" ] && ok "關閉②：fence 列鎖持有至 COMMIT——SKIP LOCKED 競爭者拿不到列" \
                || ng "關閉②失效：鎖未生效（競爭者取得 $n 列）"
 
+# ── SLICE-M2-02B：CalculationRun／Manifest／快照（migrations/0012） ──
+MANI=ee110000-0000-0000-0000-000000000001
+MANI2=ee110000-0000-0000-0000-000000000002
+RUNA=ee110000-0000-0000-0000-000000000011
+RUNB=ee110000-0000-0000-0000-000000000012
+expect_ok "Manifest 建立（NO_FX、演算法與標準化版本必填）" \
+  "$T1 INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES ('$MANI','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','NO_FX','sqlcanon-1','h0','aaaaaaaa-0000-0000-0000-000000000001');
+   INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES ('$MANI2','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','NO_FX','sqlcanon-1','h0','aaaaaaaa-0000-0000-0000-000000000001');
+   INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, domain_version_kind,
+        domain_version_value, content_canonical, content_hash, payload)
+   VALUES ('11111111-1111-1111-1111-111111111111','$MANI','SCOPE','SCOPE','1','c','h','{}'::jsonb)"
+expect_err "Manifest 不可修改（INV-17：凍結即不可變）" \
+  "$T1 UPDATE calculation_input_manifest SET frozen_set_content_hash='x' WHERE manifest_id='$MANI'" "不可變"
+expect_err "Manifest entry 不可修改" \
+  "$T1 UPDATE calculation_manifest_entry SET content_hash='x' WHERE manifest_id='$MANI'" "不可變"
+expect_ok "原始 Run 建立（RUNNING）" \
+  "$T1 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, request_key, request_content_hash, engine_version, created_by)
+   VALUES ('$RUNA','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','$B1','$MANI','PREVIEW',
+           'ee110000-0000-0000-0000-0000000000a1','rc1','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')"
+expect_err "同一 Manifest 不得有第二個原始 Run（partial unique）" \
+  "$T1 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, request_key, request_content_hash, engine_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','$B1','$MANI','PREVIEW',
+           gen_random_uuid(),'rc2','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')" "duplicate key"
+expect_err "run_type 僅 PREVIEW——不為 PREVIEW 偷建正式資格（護欄 4）" \
+  "$T1 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, request_key, request_content_hash, engine_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','$B1','$MANI2','OFFICIAL',
+           gen_random_uuid(),'rc3','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')" "check"
+expect_err "Run 建立時必須為 RUNNING" \
+  "$T1 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash, engine_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','$B1','$MANI2','PREVIEW','COMPLETED',
+           gen_random_uuid(),'rc4','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')" "必須為 RUNNING"
+expect_err "replay 必須引用原 run 的同一份 Manifest" \
+  "$T1 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, replay_of_run_id, request_key, request_content_hash, engine_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','$B1','$MANI2','PREVIEW','$RUNA',
+           gen_random_uuid(),'rc5','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')" "同一份 Manifest"
+expect_ok "replay Run 建立（同 Manifest、引用原 run；無隱含一對一）" \
+  "$T1 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, replay_of_run_id, request_key, request_content_hash, engine_version, created_by)
+   VALUES ('$RUNB','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','$B1','$MANI','PREVIEW','$RUNA',
+           'ee110000-0000-0000-0000-0000000000a2','REPLAY|$RUNA','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')"
+expect_err "RUNNING → SUPERSEDED 被拒（本刀不使用，§25.11 語意保留）" \
+  "$T1 UPDATE calculation_run SET status='SUPERSEDED' WHERE calculation_run_id='$RUNA'" "不使用"
+expect_err "COMPLETED 必須帶 result_content_hash（INV-17）" \
+  "$T1 UPDATE calculation_run SET status='COMPLETED' WHERE calculation_run_id='$RUNA'" "result_content_hash"
+expect_ok "RUNNING → COMPLETED（帶結果 hash）" \
+  "$T1 UPDATE calculation_run SET status='COMPLETED', result_content_hash='r1' WHERE calculation_run_id='$RUNA'"
+expect_err "終態不可修改——重演＝建立新 run" \
+  "$T1 UPDATE calculation_run SET result_content_hash='r2' WHERE calculation_run_id='$RUNA'" "終態"
+expect_err "FAILED 必須帶機器代碼與客戶可理解原因" \
+  "$T1 UPDATE calculation_run SET status='FAILED' WHERE calculation_run_id='$RUNB'" "機器代碼"
+expect_ok "FAILED（帶 REPLAY_FAILED 代碼與原因）——失敗狀態屬 replay run，原 run 不變" \
+  "$T1 UPDATE calculation_run SET status='FAILED', failure_reason_code='REPLAY_FAILED',
+       failure_reason='凍結內容雜湊不符' WHERE calculation_run_id='$RUNB'"
+expect_ok "快照輸出建立（run 內 層×科目 唯一）" \
+  "$T1 INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+   VALUES ('11111111-1111-1111-1111-111111111111','$RUNA','SOURCE_TB','ac000000-0000-0000-0000-000000000001',
+           '1002','银行存款',100.00,0)"
+expect_err "快照重複（run×層×科目）→ 拒絕（重領不產生重複產物）" \
+  "$T1 INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+   VALUES ('11111111-1111-1111-1111-111111111111','$RUNA','SOURCE_TB','ac000000-0000-0000-0000-000000000001',
+           '1002','银行存款',200.00,0)" "duplicate key"
+expect_err "快照不可修改" \
+  "$T1 UPDATE balance_snapshot_line SET debit=999 WHERE calculation_run_id='$RUNA'" "不可變"
+expect_ok "BackgroundJob 支援 CALCULATION_RUN 型別" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('11111111-1111-1111-1111-111111111111','CALCULATION_RUN','$RUNA',1,'calc-engine-1','ck1')"
+expect_err "INV-18：計算工作主體屬其他租戶 → 拒絕" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('22222222-2222-2222-2222-222222222222','CALCULATION_RUN','$RUNA',1,'calc-engine-1','ck2')" "不屬於本租戶"
+n=$(APP_C <<<"$T2 SELECT count(*) FROM calculation_run")
+[ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的計算執行" || ng "RLS：calculation_run 洩漏 $n 筆"
+
 # 衍生資料的自然唯一性（冪等第二道防線）
 expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)

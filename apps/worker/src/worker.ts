@@ -25,6 +25,8 @@ import { classifyIdentity, identityStatusOf, type EvidenceKind }
 import { cents, fmtCents } from "../../../packages/domain/src/mapping.ts";
 import { classifyError, verdictFor, type JobErrorClass }
   from "../../../packages/domain/src/backgroundJob.ts";
+import { reasonCodeOf, isDeterministicRunFailure, RUN_REASON }
+  from "../../../packages/domain/src/calculationRun.ts";
 import { config } from "../../../packages/config/src/index.ts";
 
 const INTERVAL = config.pollMs;
@@ -35,9 +37,13 @@ const LEASE = config.jobLeaseSeconds;
 /** 業務裁決：這是結論，不是故障——不重試，直接隔離。 */
 class BusinessRejection extends Error {}
 
-interface Claimed {
+interface ClaimedCore {
   job_id: string; claim_token: string; attempt_count: number; max_attempts: number;
-  import_batch_id: string; tenant_id: string; batch_version: number; file_sha256: string;
+  tenant_id: string; job_type: "IMPORT_VALIDATION" | "CALCULATION_RUN";
+  subject_id: string; subject_version: number;
+}
+interface Claimed extends ClaimedCore {
+  import_batch_id: string; batch_version: number; file_sha256: string;
   declared_legal_entity_id: string; object_key: string; declared_code: string | null;
 }
 
@@ -49,9 +55,9 @@ const lit = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
  * 每次認領產生新的 claim_token——只比對 claimed_by 不是真正的 fencing，
  * worker ID 被重用時舊 worker 可能誤用新租約。
  */
-function claim(): Claimed | null {
+function claim(): ClaimedCore | null {
   const token = randomUUID();
-  const rows = query<Claimed>(
+  const rows = query<ClaimedCore>(
     `UPDATE background_job j
         SET status = 'RUNNING', claim_token = ${lit(token)}::uuid,
             claimed_by = ${lit(WORKER_ID)}, claimed_at = now(),
@@ -59,25 +65,33 @@ function claim(): Claimed | null {
             attempt_count = j.attempt_count + 1
       WHERE j.job_id = (
         SELECT job_id FROM background_job
-         WHERE job_type = 'IMPORT_VALIDATION'
+         WHERE job_type IN ('IMPORT_VALIDATION','CALCULATION_RUN')
            AND (status = 'QUEUED'
              OR (status = 'RETRY_WAIT' AND next_attempt_at <= now())
              OR (status = 'RUNNING'    AND lease_expires_at <= now()))
          ORDER BY next_attempt_at, created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
      RETURNING j.job_id, j.claim_token, j.attempt_count, j.max_attempts,
-       j.subject_id AS import_batch_id, j.tenant_id, j.subject_version AS batch_version,
-       (SELECT file_sha256 FROM import_batch ib WHERE ib.import_batch_id = j.subject_id) AS file_sha256,
-       (SELECT declared_legal_entity_id FROM import_batch ib WHERE ib.import_batch_id = j.subject_id) AS declared_legal_entity_id,
-       (SELECT object_key FROM source_document sd WHERE sd.import_batch_id = j.subject_id LIMIT 1) AS object_key,
-       (SELECT le.authoritative_code FROM import_batch ib
-          JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
-         WHERE ib.import_batch_id = j.subject_id) AS declared_code`,
+       j.tenant_id, j.job_type, j.subject_id, j.subject_version`,
     {}, { asRuntime: false });
   return rows[0] ?? null;
 }
 
+/** 匯入工作的主體細節（認領後載入；同 worker 內讀取，無競態意義上的差異）。 */
+function loadImportDetail(c: ClaimedCore): Claimed {
+  const [r] = query<Omit<Claimed, keyof ClaimedCore | "import_batch_id" | "batch_version">>(
+    `SELECT ib.file_sha256, ib.declared_legal_entity_id,
+            (SELECT object_key FROM source_document sd
+              WHERE sd.import_batch_id = ib.import_batch_id LIMIT 1) AS object_key,
+            le.authoritative_code AS declared_code
+       FROM import_batch ib
+       JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
+      WHERE ib.import_batch_id = ${lit(c.subject_id)}::uuid`,
+    {}, { asRuntime: false });
+  return { ...c, ...r, import_batch_id: c.subject_id, batch_version: c.subject_version };
+}
+
 /** 心跳：只有持有 claim_token 的人能延長租約。 */
-function heartbeat(j: Claimed): void {
+function heartbeat(j: ClaimedCore): void {
   const rows = query<{ ok: number }>(
     `UPDATE background_job
         SET lease_expires_at = now() + interval '${LEASE} seconds'
@@ -90,9 +104,9 @@ function heartbeat(j: Claimed): void {
 
 /** 事件 SQL 片段：與狀態遷移併入同一交易（不得事後補寫）。 */
 function eventSql(tenantId: string, eventType: string, objectId: string,
-                  payload: object, alias: string): string {
+                  payload: object, alias: string, objectType = "import_batch"): string {
   return `INSERT INTO audit_event (tenant_id, kind, event_type, object_type, object_id, payload)
-          VALUES (${lit(tenantId)}::uuid, 'DOMAIN_EVENT', ${lit(eventType)}, 'import_batch',
+          VALUES (${lit(tenantId)}::uuid, 'DOMAIN_EVENT', ${lit(eventType)}, ${lit(objectType)},
                   ${lit(objectId)}::uuid, ${lit(JSON.stringify(payload))}::jsonb); -- ${alias}`;
 }
 
@@ -102,7 +116,7 @@ function eventSql(tenantId: string, eventType: string, objectId: string,
  * 他人重領並寫入」可與本交易後續寫入交錯；鎖住後競爭者的認領
  * （FOR UPDATE SKIP LOCKED）在本交易結束前拿不到這一列。
  */
-function fenceSql(j: Claimed): string {
+function fenceSql(j: ClaimedCore): string {
   return `WITH fence AS (
             SELECT job_id FROM background_job
              WHERE job_id = ${lit(j.job_id)}::uuid
@@ -250,7 +264,7 @@ function commitBusinessRejection(j: Claimed, reason: string): void {
  * 租約到期後本 worker 已無權，寫回落空（0 列）時不得靜默當成功，
  * 也不得改任何狀態（新持有者或下一個認領者才有權）。
  */
-function recordJobFailure(j: Claimed, cls: JobErrorClass, message: string): void {
+function recordJobFailure(j: ClaimedCore, cls: JobErrorClass, message: string): void {
   const v = verdictFor(cls, j.attempt_count, j.max_attempts, config.jobBackoffSeconds);
   if (v.next === "NONE") {
     // LEASE_LOST：新持有者才有權，舊 worker 不得改任何狀態
@@ -286,6 +300,176 @@ function recordJobFailure(j: Claimed, cls: JobErrorClass, message: string): void
       `批次維持 UPLOADED，不需重新上傳`);
 }
 
+// ═══════════ CALCULATION_RUN（SLICE-M2-02B） ═══════════
+// 契約：docs/slices/SLICE-M2-02B_PREVIEW_CalculationRun與輸入凍結.md
+//   計算只讀 Manifest 凍結內容（INV-29）；結果、Run 終態、Job 終態、完成事件同一交易；
+//   可重試失敗期間 Run 保持 RUNNING，耗盡才與 Job 同交易進入失敗終態（護欄 3）。
+
+interface ClaimedCalc extends ClaimedCore { manifest_id: string; replay_of_run_id: string | null }
+
+function loadCalcDetail(c: ClaimedCore): ClaimedCalc {
+  const [r] = query<{ manifest_id: string; replay_of_run_id: string | null }>(
+    `SELECT manifest_id, replay_of_run_id FROM calculation_run
+      WHERE calculation_run_id = ${lit(c.subject_id)}::uuid`, {}, { asRuntime: false });
+  return { ...c, ...r };
+}
+
+/**
+ * 單一交易：完整性驗證（INV-29）→ 從凍結 payload 計算 → 快照 → G-09 → result hash
+ * →（replay 時）與原 run 比對 → Run COMPLETED ＋ Job COMPLETED ＋ 完成事件。
+ * 任一 fn_assert 失敗即整筆回滾——不留半套輸出。
+ */
+function commitCalcResult(j: ClaimedCalc): void {
+  const RUN = lit(j.subject_id);
+  const M = lit(j.manifest_id);
+  const T = lit(j.tenant_id);
+  const replayCompare = j.replay_of_run_id
+    ? `SELECT fn_assert(
+         (SELECT result_content_hash FROM calculation_run
+           WHERE calculation_run_id = ${lit(j.replay_of_run_id)}::uuid) = (SELECT h FROM _res),
+         'RESULT_MISMATCH：重演結果雜湊與原 run 不一致');`
+    : "";
+  exec(`BEGIN;
+        ${fenceSql(j)}
+        SELECT fn_assert((SELECT status = 'RUNNING' FROM calculation_run
+          WHERE calculation_run_id = ${RUN}::uuid), 'RUN_NOT_RUNNING');
+
+        -- INV-29：凍結內容存在且逐筆雜湊相符（依 manifest 的演算法與標準化版本）
+        SELECT fn_assert((SELECT count(*) FROM calculation_manifest_entry
+          WHERE manifest_id = ${M}::uuid) > 0, 'REPLAY_FAILED:MANIFEST_EMPTY');
+        SELECT fn_assert(NOT EXISTS (
+          SELECT 1 FROM calculation_manifest_entry
+           WHERE manifest_id = ${M}::uuid
+             AND encode(sha256(convert_to(content_canonical,'UTF8')),'hex') <> content_hash),
+          'REPLAY_FAILED:CONTENT_HASH_MISMATCH');
+
+        -- 只讀凍結 payload；不回查 mapping_rule／account／source_ledger_line（INV-29）
+        CREATE TEMP TABLE _src ON COMMIT DROP AS
+          SELECT x->>'code' AS code, x->>'name' AS name,
+                 (x->>'debit')::numeric AS debit, (x->>'credit')::numeric AS credit
+            FROM calculation_manifest_entry e, jsonb_array_elements(e.payload) x
+           WHERE e.manifest_id = ${M}::uuid AND e.object_type = 'SOURCE_TB';
+        CREATE TEMP TABLE _m ON COMMIT DROP AS
+          SELECT payload->>'source_code' AS source_code,
+                 (payload->>'target_account_id')::uuid AS target_account_id,
+                 payload->>'target_code' AS target_code, payload->>'target_name' AS target_name
+            FROM calculation_manifest_entry
+           WHERE manifest_id = ${M}::uuid AND object_type = 'MAPPING_RULE';
+        SELECT fn_assert(NOT EXISTS (
+          SELECT 1 FROM _src s LEFT JOIN _m m ON m.source_code = s.code
+           WHERE m.source_code IS NULL), 'REPLAY_FAILED:MAPPING_INCOMPLETE');
+
+        INSERT INTO balance_snapshot_line
+          (tenant_id, calculation_run_id, posting_layer, account_id, account_code, account_name, debit, credit)
+        SELECT ${T}::uuid, ${RUN}::uuid, 'SOURCE_TB', m.target_account_id, m.target_code,
+               MAX(m.target_name), SUM(s.debit), SUM(s.credit)
+          FROM _src s JOIN _m m ON m.source_code = s.code
+         GROUP BY m.target_account_id, m.target_code;
+        INSERT INTO balance_snapshot_line
+          (tenant_id, calculation_run_id, posting_layer, account_id, account_code, account_name, debit, credit)
+        SELECT ${T}::uuid, ${RUN}::uuid, 'ADJUSTMENT', (l->>'account_id')::uuid, l->>'code',
+               MAX(l->>'name'), SUM((l->>'debit')::numeric), SUM((l->>'credit')::numeric)
+          FROM calculation_manifest_entry e, jsonb_array_elements(e.payload->'lines') l
+         WHERE e.manifest_id = ${M}::uuid AND e.object_type = 'ADJUSTMENT'
+         GROUP BY (l->>'account_id')::uuid, l->>'code';
+
+        -- G-09 控制總額：來源層＝凍結 TB 合計；調整層＝凍結分錄合計；整體借貸平衡
+        SELECT fn_assert(
+          (SELECT COALESCE(SUM(debit),0)::text||'|'||COALESCE(SUM(credit),0)::text
+             FROM balance_snapshot_line WHERE calculation_run_id = ${RUN}::uuid AND posting_layer='SOURCE_TB')
+          = (SELECT COALESCE(SUM(debit),0)::text||'|'||COALESCE(SUM(credit),0)::text FROM _src),
+          'CONTROL_TOTAL_MISMATCH:SOURCE');
+        SELECT fn_assert(
+          (SELECT COALESCE(SUM(debit),0)::text||'|'||COALESCE(SUM(credit),0)::text
+             FROM balance_snapshot_line WHERE calculation_run_id = ${RUN}::uuid AND posting_layer='ADJUSTMENT')
+          = (SELECT COALESCE(SUM((l->>'debit')::numeric),0)::text||'|'||COALESCE(SUM((l->>'credit')::numeric),0)::text
+               FROM calculation_manifest_entry e, jsonb_array_elements(e.payload->'lines') l
+              WHERE e.manifest_id = ${M}::uuid AND e.object_type = 'ADJUSTMENT'),
+          'CONTROL_TOTAL_MISMATCH:ADJUSTMENT');
+        SELECT fn_assert(
+          (SELECT COALESCE(SUM(debit),0) = COALESCE(SUM(credit),0)
+             FROM balance_snapshot_line WHERE calculation_run_id = ${RUN}::uuid),
+          'CONTROL_TOTAL_MISMATCH:UNBALANCED');
+
+        -- canonical 結果 hash：排序後的（層｜科目｜借｜貸），排除 run_id 與時間戳
+        CREATE TEMP TABLE _res ON COMMIT DROP AS
+          SELECT encode(sha256(convert_to(COALESCE(
+                   string_agg(posting_layer||'|'||account_code||'|'||debit::text||'|'||credit::text,
+                              E'\n' ORDER BY posting_layer, account_code), ''),'UTF8')),'hex') AS h
+            FROM balance_snapshot_line WHERE calculation_run_id = ${RUN}::uuid;
+        ${replayCompare}
+
+        UPDATE calculation_run SET status='COMPLETED', result_content_hash=(SELECT h FROM _res)
+         WHERE calculation_run_id = ${RUN}::uuid;
+        UPDATE background_job SET status='COMPLETED'
+         WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid;
+        ${eventSql(j.tenant_id, "calculation_run.completed", j.subject_id,
+          { replay_of: j.replay_of_run_id, attempts: j.attempt_count }, "done", "calculation_run")}
+        COMMIT;`, {}, { asRuntime: false });
+}
+
+/** 確定性失敗（REPLAY_FAILED 等）＝結論：Run FAILED ＋ Job COMPLETED ＋ 事件，同一交易。 */
+function commitCalcVerdictFailure(j: ClaimedCalc, message: string): void {
+  const code = reasonCodeOf(message) ?? "REPLAY_FAILED";
+  const human = `${RUN_REASON[code]}（${message.slice(0, 300)}）`;
+  exec(`BEGIN;
+        ${fenceSql(j)}
+        UPDATE calculation_run SET status='FAILED',
+               failure_reason_code=${lit(code)}, failure_reason=${lit(human)}
+         WHERE calculation_run_id = ${lit(j.subject_id)}::uuid AND status='RUNNING';
+        UPDATE background_job SET status='COMPLETED', last_error_class='BUSINESS_VALIDATION',
+               last_error_message=${lit(human.slice(0, 500))}
+         WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid;
+        ${eventSql(j.tenant_id, "calculation_run.failed", j.subject_id,
+          { code, reason: human.slice(0, 300) }, "fail", "calculation_run")}
+        COMMIT;`, {}, { asRuntime: false });
+  console.warn(`[worker] calc run ${j.subject_id.slice(0, 8)} 確定性失敗（${code}）`);
+}
+
+/**
+ * 基礎設施故障：RETRY_WAIT 只改 job（Run 保持 RUNNING）；
+ * 耗盡或系統性錯誤 → Run FAILED ＋ Job FAILED ＋ 事件，同一交易（護欄 3）。
+ */
+function recordCalcInfraFailure(j: ClaimedCalc, cls: JobErrorClass, message: string): void {
+  const v = verdictFor(cls, j.attempt_count, j.max_attempts, config.jobBackoffSeconds);
+  if (v.next !== "FAILED") { recordJobFailure(j, cls, message); return; }
+  const code = cls === "NON_RETRYABLE_SYSTEM" ? "NON_RETRYABLE_SYSTEM" : "INFRA_RETRY_EXHAUSTED";
+  const msg = message.slice(0, 500);
+  try {
+    exec(`BEGIN;
+          ${fenceSql(j)}
+          UPDATE background_job SET status='FAILED', last_error_class=${lit(cls)}::job_error_class,
+                 last_error_message=${lit(msg)}
+           WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid;
+          UPDATE calculation_run SET status='FAILED',
+                 failure_reason_code=${lit(code)},
+                 failure_reason=${lit(`${RUN_REASON[code as "INFRA_RETRY_EXHAUSTED"]}（${msg.slice(0, 200)}）`)}
+           WHERE calculation_run_id = ${lit(j.subject_id)}::uuid AND status='RUNNING';
+          ${eventSql(j.tenant_id, "calculation_run.failed", j.subject_id,
+            { code, reason: msg.slice(0, 200), attempts: j.attempt_count }, "fail", "calculation_run")}
+          COMMIT;`, {}, { asRuntime: false });
+    console.error(`[worker] calc run ${j.subject_id.slice(0, 8)} 終止（${code}）：${msg.slice(0, 160)}`);
+  } catch (e2) {
+    console.warn(`[worker] calc 失敗寫回落空（${String(e2).slice(0, 120)}），交由下一個認領者`);
+  }
+}
+
+function runCalculation(c: ClaimedCore): void {
+  const j = loadCalcDetail(c);
+  try {
+    commitCalcResult(j);
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("LEASE_LOST")) { recordJobFailure(j, "LEASE_LOST", msg); return; }
+    if (isDeterministicRunFailure(msg)) {
+      try { commitCalcVerdictFailure(j, msg); }
+      catch (e2) { recordCalcInfraFailure(j, classifyError(e2), String(e2)); }
+      return;
+    }
+    recordCalcInfraFailure(j, classifyError(e), msg);
+  }
+}
+
 function runJob(j: Claimed): void {
   try {
     const r = evaluate(j);        // 交易外；無 DB 效果
@@ -304,10 +488,15 @@ function runJob(j: Claimed): void {
 function tick(): void {
   try {
     for (let i = 0; i < 10; i++) {
-      const j = claim();
-      if (!j) break;
-      console.log(`[worker] 驗證批次 ${j.import_batch_id.slice(0, 8)}…（第 ${j.attempt_count} 次）`);
-      runJob(j);
+      const c = claim();
+      if (!c) break;
+      if (c.job_type === "CALCULATION_RUN") {
+        console.log(`[worker] 計算執行 ${c.subject_id.slice(0, 8)}…（第 ${c.attempt_count} 次）`);
+        runCalculation(c);
+      } else {
+        console.log(`[worker] 驗證批次 ${c.subject_id.slice(0, 8)}…（第 ${c.attempt_count} 次）`);
+        runJob(loadImportDetail(c));
+      }
     }
   } catch (e) { console.error("[worker]", String(e)); }
 }

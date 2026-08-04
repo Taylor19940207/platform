@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、十份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
+7. `packages/domain/src/importBatch.ts`、十二份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
 8. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
 
 CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時閱讀，不得取代已合併的 v1.2／v1.1 正式基線。工程細節以 repo 內 Markdown 與現行程式為準，PDF 供閱讀。
@@ -40,9 +40,9 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
 里程碑 1、`SLICE-M2-01` 科目映射切片與 `SLICE-M2-02A` 調整生命週期切片均已完成。
-現有 11 份 migration；完整實跑結果為 **301/301**（單元 39、DB 整合 126、端到端 136）。
+現有 12 份 migration；完整實跑結果為 **347/347**（單元 43、DB 整合 147、端到端 157）。
 
-**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091／8092／8093／8094）
+**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8096）
 與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，
 跑完以 `pnpm db:seed` 還原。
 
@@ -60,8 +60,17 @@ fencing、心跳、安全重領、冪等鍵與錯誤四分類；`VALIDATING` 已
 （失敗寫回 fencing、fence 列鎖、`RUNNING→RUNNING` 重領守衛、冪等鍵原始碼去 NUL——
 migration 0011 與 handoff 關閉章節）。
 
-下一刀依序：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest 凍結`
-→ `SLICE-M2-02C 預覽證據包`。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，
+`SLICE-M2-02B PREVIEW CalculationRun ＋ 輸入凍結`已完成（2026-08-05）：切片文件經走查
+六點修訂定稿後實作——同一交易內「解析集合 → 對同一集合驗 G-02 → Manifest ＋ Run ＋
+Job ＋ 事件」（無 TOCTOU）；重演＝新 run 帶 `replay_of_run_id` 引用同一份 Manifest，
+失敗（`REPLAY_FAILED`）屬 replay run，原 run 永不修改；`frozen_set_content_hash` 與
+`result_content_hash` 均排除 run_id／時間戳；輸出為 `BalanceSnapshotLine`（SOURCE_TB／
+ADJUSTMENT 兩層，`NO_FX` 未折算）＋ B-06 骨架；Case-001 調整後集團 TB 逐科目 12/12。
+詳 `docs/slices/SLICE-M2-02B_PREVIEW_CalculationRun與輸入凍結.md` 與
+`docs/handoffs/SESSION_HANDOFF_2026-08-05_SLICE-M2-02B.md`。
+
+下一刀：`SLICE-M2-02C 預覽證據包`（開工前 `mapping_rule` 事件原子化須先修正——
+BACKLOG 既定期限）。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，
 不修改兩份正式基線。
 
 ## 第一次回覆使用者時
