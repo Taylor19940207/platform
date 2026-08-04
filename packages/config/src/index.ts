@@ -29,4 +29,14 @@ export const config = {
   objectStoreDir: env("OBJECT_STORE_DIR", "var/objects"),
   sessionSecret: env("SESSION_SECRET", ""),
   saveWindowSeconds: 5,   // 窗口參數 W（NFR-UX-001；可經批准放寬至 10）
+
+  // ── 背景工作可靠性（SLICE-M2-03；docs/slices/SLICE-M2-03_背景工作可靠性.md）──
+  // 正式預設如下；測試須可縮短，否則 kill／租約到期／重領測試會慢到無法執行。
+  // 驗收的是比例、狀態與行為，不是讓測試真的等四分鐘。
+  jobLeaseSeconds: Number(env("JOB_LEASE_SECONDS", "60")),
+  jobHeartbeatSeconds: Number(env("JOB_HEARTBEAT_SECONDS", "20")),   // 租約的 1/3，容得下一次漏跳
+  jobMaxAttempts: Number(env("JOB_MAX_ATTEMPTS", "5")),              // 首次執行 ＋ 4 次重試
+  // 退避序列（秒）：第 n 次失敗後等待 backoff[n-1]，超出長度取最後一項
+  jobBackoffSeconds: env("JOB_BACKOFF_SECONDS", "5,15,45,135")
+    .split(",").map((x) => Number(x.trim())).filter((x) => Number.isFinite(x) && x >= 0),
 };

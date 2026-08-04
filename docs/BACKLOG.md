@@ -12,6 +12,8 @@
 | 2026-08-04 | 集團 TB 預覽的輸入凍結（CalculationInputManifest）——現用目前生效映射，屬下一刀 CalculationRun | SLICE-M2-01 | 不需改基線 |
 | 2026-08-04 | UNVERIFIABLE 批次的人工確認 UI（SourceIdentityResolution 已有 DB 防線與 SOD-07，缺畫面） | 里程碑 1 | 不需改基線 |
 | 2026-08-04 | 映射草稿的刪除／撤回操作（現只能改版不能清草稿） | SLICE-M2-01 | 不需改基線 |
-| 2026-08-04 | Worker 認領後若在 `VALIDATING` 階段崩潰，需有 lease／heartbeat、逾時重領或安全隔離與重試；補重啟恢復整合測試及管理者診斷 | 2026-08-04 實際瀏覽器走查 | 不需改基線 |
+| ~~2026-08-04~~ | ~~Worker 認領後若在 `VALIDATING` 階段崩潰，需有 lease／heartbeat、逾時重領或安全隔離與重試~~ **已由 SLICE-M2-03 解決**（`BackgroundJob` 租約＋fencing＋安全重領；`VALIDATING` 成為交易內狀態） | 2026-08-04 走查 | 已完成 |
 | 2026-08-04 | 設計書 §25.13 守衛表未列 `prepared_by ≠ approved_by`，但手冊 §849 AC-WFL-001 明確要求「編製人不能批准自己的重大調整」。SOD-01 ∧ SOD-02 推導不出該條（甲編製→乙覆核→甲批准可通過）。02A 已依權威順序以 AC-WFL-001 之名獨立落實；日後基線改版應補為正式守衛編號 | SLICE-M2-02A 規劃 | 需改基線（例外 4：真實案件證明現行設計錯誤）——留待累積實作證據後開 CR |
 | 2026-08-04 | 設計書 §25.12 退回矩陣「調整不換版」與 §26.9「business_version 於提交、退回、覆核、批准等里程碑產生」字面衝突。已由 ADR-M2-001 統一解釋（不建立替代調整，但退回是業務里程碑）；日後改版建議把 §25.12 措辭改為「不建立替代調整」 | SLICE-M2-02A 規劃 | 不需改基線（ADR 已處理；措辭澄清需 CR） |
+| 2026-08-04 | `mapping_rule` 的 DomainEvent 仍在狀態異動的交易外（`server.ts` mapping_rule.drafted／approved、group_tb.preview_generated、mapping.review_ready）。事件插入失敗時映射已生效而事件不存在，與 02A 修正前同一問題。**最晚須在正式審計證據包／交付能力之前修正** | SLICE-M2-02A 覆核 | 不需改基線 |
+| 2026-08-04 | `import_batch` 的 DomainEvent 同樣在交易外（upload／accept／worker 的 quarantined／identity_assessed／validated）。~~併入 SLICE-M2-03 處理~~ **已完成**：上傳與結果寫入皆為單一交易，事件與狀態同進同出 | SLICE-M2-02A 覆核 | 已完成 |

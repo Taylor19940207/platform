@@ -115,8 +115,8 @@ expect_err "確認紀錄不可 UPDATE" \
 
 # ── 不可變性與借貸平衡 ─────────────────────────────
 PSQL_C >/dev/null <<SQL
-INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, granularity, content_sha256, row_count)
-VALUES ('77777777-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','$B1','BALANCE','h',2);
+INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
+VALUES ('77777777-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','h',2);
 INSERT INTO source_ledger_line (tenant_id, source_dataset_id, import_batch_id, source_row_id, account_code, debit, credit, content_sha256) VALUES
  ('11111111-1111-1111-1111-111111111111','77777777-0000-0000-0000-000000000001','$B1','r1','1100',1000.00,0,'h1'),
  ('11111111-1111-1111-1111-111111111111','77777777-0000-0000-0000-000000000001','$B1','r2','4000',0,1000.00,'h2');
@@ -437,6 +437,93 @@ n=$(APP_C <<<"$T2 SELECT count(*) FROM adjustment")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的調整" || ng "RLS：adjustment 洩漏 $n 筆"
 n=$(APP_C <<<"$T2 SELECT count(*) FROM journal_line")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的正式分錄" || ng "RLS：journal_line 洩漏 $n 筆"
+
+# ══ SLICE-M2-03：BackgroundJob 租約、fencing 與冪等 ══════════════
+JOB=cc000000-0000-0000-0000-000000000001
+TOK1=cc000000-0000-0000-0000-0000000000a1
+TOK2=cc000000-0000-0000-0000-0000000000a2
+
+expect_ok "工作：上傳時建立（QUEUED，next_attempt_at 立即）" \
+  "$T1 INSERT INTO background_job (job_id, tenant_id, job_type, subject_id, subject_version,
+        rule_version, idempotency_key)
+   VALUES ('$JOB','11111111-1111-1111-1111-111111111111','IMPORT_VALIDATION','$B1',1,'detect-r1','k1')"
+expect_err "冪等鍵：同一 (job_type, subject, version, rule) 不得建立第二個工作" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('11111111-1111-1111-1111-111111111111','IMPORT_VALIDATION','$B1',1,'detect-r1','k2')" "duplicate key"
+expect_ok "冪等鍵：規則版本不同即為不同工作" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('11111111-1111-1111-1111-111111111111','IMPORT_VALIDATION','$B1',1,'detect-r2','k3')"
+expect_err "INV-18：工作主體屬其他租戶 → 拒絕" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('22222222-2222-2222-2222-222222222222','IMPORT_VALIDATION','$B1',1,'detect-r9','k9')" "不屬於本租戶"
+
+expect_err "認領必須產生新的 claim_token（fencing token）" \
+  "$T1 UPDATE background_job SET status='RUNNING', claimed_by='w1', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=1 WHERE job_id='$JOB'" "claim_token"
+expect_err "認領必須遞增 attempt_count" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOK1', claimed_by='w1', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds' WHERE job_id='$JOB'" "attempt_count"
+expect_ok "認領：RUNNING ＋ 新 token ＋ 租約 ＋ attempt_count=1" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOK1', claimed_by='w1', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=1 WHERE job_id='$JOB'"
+
+# fencing：舊 token 的寫回必須落空，即使 claimed_by 相同（worker ID 會被重用）
+n=$(APP_C <<<"$T1 UPDATE background_job SET status='COMPLETED'
+  WHERE job_id='$JOB' AND claim_token='$TOK2' RETURNING 1" | wc -l | tr -d ' ')
+[ "$n" = "0" ] && ok "fencing：持舊／錯誤 claim_token 的寫回落空" || ng "fencing 失效：影響 $n 列"
+n=$(APP_C <<<"$T1 UPDATE background_job SET lease_expires_at=now()+interval '60 seconds'
+  WHERE job_id='$JOB' AND claim_token='$TOK2' AND lease_expires_at>now() RETURNING 1" | wc -l | tr -d ' ')
+[ "$n" = "0" ] && ok "心跳：持舊 token 無法延長租約" || ng "心跳 fencing 失效"
+n=$(APP_C <<<"$T1 UPDATE background_job SET lease_expires_at=now()+interval '120 seconds'
+  WHERE job_id='$JOB' AND claim_token='$TOK1' AND lease_expires_at>now() RETURNING 1" | wc -l | tr -d ' ')
+[ "$n" = "1" ] && ok "心跳：持有者可延長租約" || ng "心跳失敗"
+
+expect_err "冪等鍵欄位建立後不可變更" \
+  "$T1 UPDATE background_job SET rule_version='detect-r9' WHERE job_id='$JOB'" "不可變更"
+expect_err "失敗終態必須有分類與人可讀原因（§27.4 不吞掉錯誤）" \
+  "$T1 UPDATE background_job SET status='FAILED' WHERE job_id='$JOB'" "人可讀原因"
+expect_err "RETRY_WAIT 必須設定未來的 next_attempt_at" \
+  "$T1 UPDATE background_job SET status='RETRY_WAIT', last_error_class='RETRYABLE_INFRASTRUCTURE',
+       next_attempt_at=now()-interval '1 hour' WHERE job_id='$JOB'" "next_attempt_at"
+expect_ok "RETRY_WAIT：記錄分類與退避時間" \
+  "$T1 UPDATE background_job SET status='RETRY_WAIT', last_error_class='RETRYABLE_INFRASTRUCTURE',
+       last_error_message='connection reset', next_attempt_at=now()+interval '5 seconds' WHERE job_id='$JOB'"
+n=$(APP_C <<<"$T1 SELECT COALESCE(claim_token::text,'released') FROM background_job WHERE job_id='$JOB'")
+[ "$n" = "released" ] && ok "離開 RUNNING 即釋放租約（不留殘存 token）" || ng "租約未釋放：$n"
+
+expect_err "終態不可復活：FAILED 之後不得再 RUNNING" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOK2', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=2 WHERE job_id='$JOB';
+   UPDATE background_job SET status='FAILED', last_error_class='NON_RETRYABLE_SYSTEM',
+       last_error_message='x' WHERE job_id='$JOB';
+   UPDATE background_job SET status='RUNNING', claim_token='cc000000-0000-0000-0000-0000000000a3',
+       claimed_at=now(), lease_expires_at=now()+interval '60 seconds', attempt_count=3 WHERE job_id='$JOB'" \
+  "非法工作狀態遷移"
+
+# 衍生資料的自然唯一性（冪等第二道防線）
+expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
+  "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','h2',2)" "duplicate key"
+expect_ok "冪等：不同 batch_version 視為不同資料集" \
+  "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',2,'BALANCE','h3',2)"
+expect_ok "冪等：data_coverage 首筆" \
+  "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','UNKNOWN')"
+expect_err "冪等：data_coverage 同鍵不得重複" \
+  "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','COMPLETE')" "duplicate key"
+expect_ok "冪等：source_identity_assessment 首筆（batch_version=1, detect-r1）" \
+  "$T1 INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version,
+        detected_identity, match_result, evidence_kind, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'[]'::jsonb,'UNVERIFIABLE','NONE','detect-r1')"
+expect_err "冪等：source_identity_assessment 同鍵不得重複" \
+  "$T1 INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version,
+        detected_identity, match_result, evidence_kind, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'[]'::jsonb,'UNVERIFIABLE','NONE','detect-r1')" "duplicate key"
+
+n=$(APP_C <<<"$T2 SELECT count(*) FROM background_job")
+[ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的背景工作" || ng "RLS：background_job 洩漏 $n 筆"
 
 echo ""
 echo "通過 $pass ／ 失敗 $fail"

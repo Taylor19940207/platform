@@ -1,0 +1,86 @@
+# SLICE-M2-03 完成紀錄（2026-08-04）
+
+> 工程交接紀錄，非正式產品基線。
+> 實作契約：`docs/slices/SLICE-M2-03_背景工作可靠性.md`
+> 可觀察性決定：`docs/adr/ADR-M2-002.md`
+
+## 完成範圍
+
+新增 `BackgroundJob` 非同步工作物件。**不新增客戶業務功能**；新增內部診斷 API。
+
+職責分工（ADR-M2-002）：
+
+    ImportBatch.status    = 業務結果狀態
+    BackgroundJob.status  = 非同步執行進度（QUEUED/RUNNING/RETRY_WAIT/COMPLETED/FAILED）
+
+## 五個原始缺陷的修法
+
+| # | 缺陷 | 修法 |
+|---|---|---|
+| 1 | 認領無租約，崩潰即永久卡住 | 租約 ＋ `claim_token` ＋ 心跳 ＋ 到期安全重領 |
+| 2 | 跨多次 exec 寫入，崩潰留半套來源事實 | 全部 DB 效果收進單一交易；讀檔／解析／計算在交易外 |
+| 3 | 重領會複製來源事實 | 單一交易（回滾即乾淨起點）＋ 三條衍生資料 UNIQUE |
+| 4 | 任何例外都判 QUARANTINED | 錯誤四分類；基礎設施故障不碰 `ImportBatch` |
+| 5 | 事件與狀態不同交易 | 事件併入結果交易 |
+
+## 關鍵設計
+
+**`claim_token` 才是 fencing token。** 只比對 `claimed_by` 不是真正的 fencing——
+worker ID 被重用時，舊 worker 恢復後可能誤用新租約。每次認領產生新 UUID；
+心跳、完成、失敗寫回一律比對 `job_id ＋ claim_token ＋ lease_expires_at > now()`。
+
+**Job 在上傳交易中建立**（不是認領時）。否則會留下「批次已 UPLOADED → 崩潰 →
+job 從未建立 → 永遠沒人處理」，與原本的卡住問題等價。
+
+**冪等鍵是結構化唯一約束**：`UNIQUE (job_type, subject_id, subject_version, rule_version)`；
+`idempotency_key` 為其 canonical hash，屬推導值。衍生資料另補三條自然唯一性
+（`source_dataset`／`data_coverage` 原本沒有 `batch_version`，本刀補上並回填）。
+
+**錯誤四分類**：`BUSINESS_VALIDATION`（立即隔離，不重試）／`RETRYABLE_INFRASTRUCTURE`
+（退避重試，批次維持 UPLOADED）／`NON_RETRYABLE_SYSTEM`（FAILED，人工處理）／
+`LEASE_LOST`（舊 worker 完全停手，不得改任何狀態）。未知例外預設為可重試——
+寧可留下 FAILED 的工作紀錄，也不要偽造一筆業務拒絕。
+
+**`VALIDATING` 成為交易內狀態**：`UPLOADED → VALIDATING → VALIDATED/QUARANTINED`
+（三個狀態、兩次遷移）全在同一交易，外部觀察不到。「批次卡在 VALIDATING」
+**結構性消失**，而不是靠租約回收補救。
+
+## 實作期間發現的兩個問題
+
+1. **`max_attempts` 設定未被套用**：worker 從資料列讀 `max_attempts`，但 API 建立 job
+   時沒寫該欄，DB 用預設 5——`JOB_MAX_ATTEMPTS` 環境變數完全無效。已改為建立時寫入
+   `config.jobMaxAttempts`。此問題由測試發現（期望 3 次、實際 5 次）。
+2. **G-01 不平衡走 `commitResult` 的隔離分支，未記錄 `last_error_class`**：
+   行為正確但診斷不一致（同為業務裁決，走不同路徑卻只有一條有分類）。已補齊。
+
+另有一個 SQL 錯誤（`ds.id` 不能在 `VALUES` 清單內引用）在自測時被攔下——
+值得記錄的是**它的失敗處置是對的**：分類為可重試、批次維持 UPLOADED、退避後重試，
+沒有變成假的 QUARANTINED。
+
+## 測試
+
+**288/288，EXIT=0**（單元 38、DB 整合 116、端到端 134＝20＋25＋62＋27）。
+既有 227 條在 worker 全面改寫後零退化。
+
+租約參數可經環境變數覆寫（`JOB_LEASE_SECONDS`／`JOB_HEARTBEAT_SECONDS`／
+`JOB_MAX_ATTEMPTS`／`JOB_BACKOFF_SECONDS`），測試用 3 秒租約與 1 秒退避。
+
+## 2026-08-04 走查
+
+| # | 操作 | 結果 |
+|---|---|---|
+| 1 | 上傳（無 worker） | 批次 UPLOADED、工作 QUEUED attempts=0 |
+| 2 | 啟動 worker | 正常完成（快到來不及 kill——真正的 SIGKILL 測試在驗收測試內） |
+| 3 | 模擬已死 worker（RUNNING ＋ 租約過期 ＋ 陌生 token） | 批次仍 UPLOADED，**未卡在 VALIDATING** |
+| 4 | 診斷 API | `stalled_count=1`，列出 `claimed_by=dead-worker#999`、租約時間、`attempts=1/3` |
+| 5 | 啟動新 worker | 自動重領 → VALIDATED／MATCHED，attempts=2，新認領者 |
+| 6 | 重領後來源事實 | ledger_line=2、dataset=1、coverage=1、assessment=1（**無重複**） |
+| 7 | 全庫 VALIDATING 批次 | 0 |
+| 8 | 稽核事件 | uploaded → identity_assessed → validated |
+
+## 明確未做
+
+每租戶並行上限與優先序、BullMQ／Redis、階段性進度、診斷畫面（本刀只做 API）、
+`mapping_rule` 事件原子化（BACKLOG）。
+
+**下一刀**：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest`。

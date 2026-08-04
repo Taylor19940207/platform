@@ -14,6 +14,10 @@ import { applyMappings, coverage, g02Check, totalsOf, cents, fmtCents,
 import { canSubmit, canReview, canApprove, g08Check, balanceCheck, legalTransition,
   previewOnlyJudgment, decimalOf, type AdjustmentStatus, type AdjustmentState,
   type GuardResult } from "../../../packages/domain/src/adjustment.ts";
+import { idempotencyKey, isStalled } from "../../../packages/domain/src/backgroundJob.ts";
+
+// 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分
+const DETECTION_RULE_VERSION = "detect-r1";
 
 const PORT = config.port;
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g,
@@ -201,6 +205,27 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     const s = session(req);
     if (!s) return send(302, "", { location: "/" });
 
+    // ── 診斷：背景工作狀態（SLICE-M2-03 第 16 條；管理用途，本刀只做 API 不做畫面） ──
+    if (url.pathname === "/admin/jobs" && req.method === "GET") {
+      const jobs = query<Record<string, string>>(
+        `SELECT job_id, job_type, subject_id, subject_version, status,
+                claimed_by, claimed_at, lease_expires_at, next_attempt_at,
+                attempt_count, max_attempts, last_error_class, last_error_message,
+                created_at, updated_at, completed_at, failed_at
+           FROM background_job ORDER BY created_at DESC LIMIT 200`,
+        {}, { tenantId: s.tenantId });
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      // 卡住＝RUNNING 但租約已過期。這是本刀之前唯一無法回答的問題。
+      return res.end(JSON.stringify({
+        jobs: jobs.map((j) => ({
+          ...j,
+          stalled: isStalled(j.status as "RUNNING", j.lease_expires_at ?? null),
+        })),
+        stalled_count: jobs.filter((j) =>
+          isStalled(j.status as "RUNNING", j.lease_expires_at ?? null)).length,
+      }, null, 2));
+    }
+
     // ── B-00 個人工作台（只顯示被指派的案件——WKB-a） ──
     if (url.pathname === "/") {
       const engagements = query<{ engagement_id: string; name: string }>(
@@ -280,22 +305,35 @@ account_code,account_name,debit,credit
       const batchId = randomUUID();
       const key = `${s.tenantId}/${batchId}/tb.csv`;
       putObject(key, data);
-      exec(`INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id,
-              declared_legal_entity_id, declared_period_revision_id,
-              uploaded_by, provided_by, file_name, file_sha256, status)
-            VALUES (:'id'::uuid, :'t'::uuid, :'e'::uuid, :'le'::uuid, :'pr'::uuid,
-                    :'u'::uuid, :'u'::uuid, 'tb.csv', :'sha', 'DRAFT')`,
-        { id: batchId, t: s.tenantId, e: engagement, le: legal_entity, pr: period_revision,
-          u: s.userId, sha }, { tenantId: s.tenantId });
-      // 原檔紀錄先落地，最後才轉 UPLOADED——§25.5「UPLOADED＝檔案已落地」，
-      // 順序顛倒會讓 worker 在紀錄寫入前搶到批次（object_key 為 null 的競態）。
-      exec(`INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
-            VALUES (:'t'::uuid, :'id'::uuid, 'tb.csv', :'sha', :'k', ${data.length})`,
-        { t: s.tenantId, id: batchId, sha, k: key }, { tenantId: s.tenantId });
-      exec(`UPDATE import_batch SET status='UPLOADED' WHERE import_batch_id = :'id'::uuid`,
-        { id: batchId }, { tenantId: s.tenantId });
-      audit(s.tenantId, "DOMAIN_EVENT", "import_batch.uploaded", s.userId,
+      // 上傳為單一交易：ImportBatch、SourceDocument、BackgroundJob 與 uploaded 事件同進同出。
+      //
+      // job 若改在「認領時」才建立，會留下這條路徑：批次已 UPLOADED → 程式崩潰
+      // → job 從未建立 → 永遠沒人處理。那與原本的卡住問題等價，只是換了位置。
+      //
+      // 原檔紀錄先落地，最後才轉 UPLOADED——§25.5「UPLOADED＝檔案已落地」。
+      const ev = auditSql(s.tenantId, "DOMAIN_EVENT", "import_batch.uploaded", s.userId,
         "import_batch", batchId, { sha256: sha, bytes: data.length });
+      exec(`BEGIN;
+            INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id,
+                    declared_legal_entity_id, declared_period_revision_id,
+                    uploaded_by, provided_by, file_name, file_sha256, status)
+            VALUES ('${batchId}'::uuid, :'t'::uuid, :'e'::uuid, :'le'::uuid, :'pr'::uuid,
+                    :'u'::uuid, :'u'::uuid, 'tb.csv', :'sha', 'DRAFT');
+            INSERT INTO source_document (tenant_id, import_batch_id, file_name,
+                    content_sha256, object_key, byte_size)
+            VALUES (:'t'::uuid, '${batchId}'::uuid, 'tb.csv', :'sha', :'k', ${data.length});
+            UPDATE import_batch SET status='UPLOADED' WHERE import_batch_id = '${batchId}'::uuid;
+            INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version,
+                    rule_version, idempotency_key, max_attempts)
+            SELECT :'t'::uuid, 'IMPORT_VALIDATION', '${batchId}'::uuid, ib.batch_version,
+                   :'rv', :'ik', ${config.jobMaxAttempts}
+              FROM import_batch ib WHERE ib.import_batch_id = '${batchId}'::uuid;
+            ${ev.sql}
+            COMMIT;`,
+        { t: s.tenantId, e: engagement, le: legal_entity, pr: period_revision,
+          u: s.userId, sha, k: key, rv: DETECTION_RULE_VERSION,
+          ik: idempotencyKey("IMPORT_VALIDATION", batchId, 1, DETECTION_RULE_VERSION),
+          ...ev.params }, { tenantId: s.tenantId });
       return send(302, "", { location: "/" });
     }
 
@@ -333,10 +371,14 @@ account_code,account_name,debit,credit
         return send(409, page("拒絕", b04CtxBar(g.b, "B-04"),
           `<h2>⛔ ${pred.guard}：不滿足接受判定式</h2><ul>${pred.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul><p><a href="/">回 B-00</a></p>`));
       }
-      exec(`UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id = :'b'::uuid`,
-        { b: g.b.import_batch_id }, { tenantId: s.tenantId });
-      audit(s.tenantId, "DOMAIN_EVENT", "import_batch.accepted", s.userId,
+      // 狀態與事件同交易（與 SLICE-M2-03 的其餘 import_batch 事件一致）
+      const evAcc = auditSql(s.tenantId, "DOMAIN_EVENT", "import_batch.accepted", s.userId,
         "import_batch", g.b.import_batch_id, {});
+      exec(`BEGIN;
+            UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id = :'b'::uuid;
+            ${evAcc.sql}
+            COMMIT;`,
+        { b: g.b.import_batch_id, ...evAcc.params }, { tenantId: s.tenantId });
       return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
     }
 
