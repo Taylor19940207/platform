@@ -86,6 +86,9 @@ APPROVED
 | 19 | **草稿保存是原子操作**：任一明細解析失敗或科目不存在即整筆拒絕（409），表頭、明細與 `object_version` 全部不變；不得靜默略過後回報成功 | 端到端 |
 | 20 | **PREVIEW 降級不殘留**：合法獨立覆核完成後清除 `output_capability`／`control_reasons`；違規嘗試仍永久留在 AuditEvent。B-05 不得同時顯示 APPROVED 與「只能預覽」 | 端到端 |
 | 21 | **跨租戶錯配寫入被 DB 拒絕**（INV-18）：`tenant_id` 與 `engagement_id`／`period_revision_id`／`prepared_by`／父物件／科目屬不同租戶時一律拒絕——RLS 只比對列自己的 `tenant_id`，不保證父物件同租戶 | DB 整合 |
+| 22 | **樂觀鎖驗證的是「本次 UPDATE 影響一列」**，不是事後比對版本號（後者在對手先前進一格時會誤判成功並覆蓋對方）。兩個相同 `base` 的併發保存只有一個成功，落敗方明確被拒 | 端到端 |
+| 23 | **同租戶不等於同案件**（§24.1A）：`period_revision` 的案件須等於調整的案件；`tenant_id`／`engagement_id`／`period_revision_id`／`basis`／`materiality` 建立後凍結；JournalEntry 的案件與期間須與調整完全一致；JournalLine 的科目須屬調整所屬案件；進入 PENDING_APPROVAL／APPROVED 時 `reviewed_at`／`approved_at` 必填 | DB 整合 |
+| 24 | **生命週期 DomainEvent 與狀態遷移同一交易**：事件插入失敗時狀態、`business_version` 與快照全部回滾，不留孤兒事件，也不留「狀態已前進但事件不存在」的資料 | 端到端 |
 
 ## 明確不做（切片收窄，**不是**修改基線）
 

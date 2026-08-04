@@ -264,6 +264,65 @@ try {
     && sql(`SELECT string_agg(debit::text,',' ORDER BY line_no)
             FROM adjustment_line WHERE adjustment_id='${ADJ3}'`) === linesBefore);
 
+  // ── 12e 真併發：兩個保存請求以相同 base 同時送出，只能一個成功 ──
+  // 事後比對版本號會誤判：若對方先把 5 改成 6，本請求 UPDATE 影響 0 列，
+  // 但事後查到的版本同樣是 6（＝base+1）。必須驗證本次 UPDATE 真的影響一列。
+  const ovRace = adjField(ADJ3, "object_version");
+  const raceBody = (title: string, amount: string) => ({
+    adj: ADJ3, base_object_version: ovRace, title, ...EVIDENCE,
+    lines: `1002,${amount},0\n6602,0,${amount}`,
+  });
+  const [rA, rB] = await Promise.all([
+    post(jia, "/b05/save", raceBody("競態 A", "301.00")),
+    post(jia, "/b05/save", raceBody("競態 B", "302.00")),
+  ]);
+  const winners = [rA, rB].filter((c) => c === 302).length;
+  check("真併發保存：兩個相同 base 的請求只有一個成功",
+    winners === 1, `A=${rA} B=${rB}`);
+  check("落敗的請求被明確拒絕（非靜默覆蓋）", [rA, rB].filter((c) => c === 409).length === 1);
+  check("併發後 object_version 只前進一格",
+    adjField(ADJ3, "object_version") === String(Number(ovRace) + 1));
+  const raceTitle = adjField(ADJ3, "title");
+  const raceLines = sql(`SELECT string_agg(debit::text,',' ORDER BY line_no)
+                         FROM adjustment_line WHERE adjustment_id='${ADJ3}'`);
+  check("勝方的表頭與明細一致，未被落敗方混入",
+    (raceTitle === "競態 A" && raceLines.startsWith("301.00"))
+    || (raceTitle === "競態 B" && raceLines.startsWith("302.00")), `${raceTitle} / ${raceLines}`);
+
+  // ── 12f DomainEvent 與狀態遷移同一交易 ──
+  // 以暫時性 trigger 注入事件插入失敗，驗證狀態、快照與事件全部回滾。
+  sql(`CREATE OR REPLACE FUNCTION fn_test_fail_audit() RETURNS trigger LANGUAGE plpgsql AS $x$
+       BEGIN
+         IF NEW.event_type = 'adjustment.submitted' THEN
+           RAISE EXCEPTION 'INJECTED_AUDIT_FAILURE';
+         END IF;
+         RETURN NEW;
+       END $x$`);
+  sql(`CREATE TRIGGER trg_test_fail_audit BEFORE INSERT ON audit_event
+       FOR EACH ROW EXECUTE FUNCTION fn_test_fail_audit()`);
+  // ADJ3 的 bv=2 快照已被 12b 預佔且不可刪除，故另建一筆乾淨的調整
+  await post(jia, "/b05/create", { batch: B1, title: "事件回滾測試" });
+  const ADJ4 = sql(`SELECT adjustment_id FROM adjustment ORDER BY created_at DESC LIMIT 1`);
+  await post(jia, "/b05/save", { adj: ADJ4, base_object_version: "1", title: "事件回滾測試",
+    ...EVIDENCE, lines: "1002,800.00,0\n6602,0,800.00" });
+  const stBefore = adjField(ADJ4, "status"), bvBefore = adjField(ADJ4, "business_version");
+  const snapBefore = snapCount(ADJ4);
+  const injected = await post(jia, "/b05/submit", { adj: ADJ4 });
+  sql(`DROP TRIGGER trg_test_fail_audit ON audit_event`);
+  sql(`DROP FUNCTION fn_test_fail_audit()`);
+  check("DomainEvent 插入失敗 → 狀態、business_version 與快照全部回滾",
+    injected === 500 && adjField(ADJ4, "status") === stBefore && stBefore === "DRAFTING"
+    && adjField(ADJ4, "business_version") === bvBefore && snapCount(ADJ4) === snapBefore);
+  check("回滾後未留下孤兒事件", sql(`SELECT count(*) FROM audit_event WHERE kind='DOMAIN_EVENT'
+         AND object_id='${ADJ4}' AND event_type='adjustment.submitted'`) === "0");
+  check("回滾後仍可正常送覆核（狀態未被污染）",
+    await post(jia, "/b05/submit", { adj: ADJ4 }) === 302
+    && adjField(ADJ4, "status") === "PENDING_REVIEW");
+  check("每個生命週期事件都有對應的 DomainEvent（同交易保證）",
+    sql(`SELECT count(*) FROM audit_event WHERE kind='DOMAIN_EVENT'
+         AND object_id='${ADJ4}' AND event_type='adjustment.submitted'`) === "1"
+    && snapCount(ADJ4) === 1);
+
   // ── 13 稽核軌跡完整 ──
   const events = sql(`SELECT DISTINCT event_type FROM audit_event WHERE kind='DOMAIN_EVENT'
                       AND object_type='adjustment' ORDER BY event_type`).split("\n").filter(Boolean);

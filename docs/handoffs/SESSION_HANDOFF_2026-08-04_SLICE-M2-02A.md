@@ -128,10 +128,54 @@ BEFORE trigger 依名稱排序執行，順序一旦錯開，錯誤訊息會指�
 4. **PREVIEW 永久殘留** → 合法獨立覆核完成時清除 `output_capability`／`control_reasons`。
    違規嘗試仍永久留在 AuditEvent；輸出資格反映目前狀態，正式資格留給 02B。
 
-### 硬化後
+### 第一輪硬化後
 
-驗收清單增為 **21 條**；測試 **207/207**（單元 27、DB 整合 81、端到端 99）。
-兩個原始探測重跑均被拒絕，`reviewed_by` 未被竄改。
+驗收清單增為 **21 條**；測試 **207/207**。兩個原始探測重跑均被拒絕。
+
+## 第二輪覆核回饋硬化（migration 0009）
+
+第一輪修補後仍有 2 個真洞與 1 個稽核原子性缺口。
+
+### 樂觀鎖仍有競態（真洞）
+
+第一輪的交易內斷言是「目前版本 = base + 1」。若另一請求先把版本從 5 更新成 6，
+本請求的 `UPDATE` 影響 **0 列**，但事後查到的版本同樣是 6，斷言通過——
+接著就去 `DELETE` 並覆蓋對方的明細。**事後比對版本號無法區分「我成功了」與
+「對方成功了」。** 改為驗證本次 UPDATE 真的影響一列：
+
+```sql
+WITH updated AS (
+  UPDATE adjustment SET ... WHERE adjustment_id = ... AND object_version = :base
+  RETURNING 1
+)
+SELECT fn_assert(EXISTS (SELECT 1 FROM updated), 'OPTIMISTIC_LOCK_CONFLICT');
+```
+
+### 同租戶跨案件錯配（真洞）
+
+0008 只確認「都是 T1」，沒確認「屬於同一案件」。補：
+
+- `period_revision` 所屬 engagement 必須等於 `adjustment.engagement_id`；
+- `tenant_id`／`engagement_id`／`period_revision_id`／`basis`／`materiality` 建立後凍結
+  （否則 DRAFTING 的調整可被改到同租戶另一案件，而既有明細仍指向舊案件科目）；
+- JournalEntry 的 `engagement_id`／`period_revision_id` 必須與來源調整完全一致；
+- JournalLine 的科目必須屬於來源調整所屬案件的科目表；
+- 進入 PENDING_APPROVAL／APPROVED 時 `reviewed_at`／`approved_at` 必填。
+
+### DomainEvent 仍在交易外
+
+狀態、快照與正式分錄已原子化，但 `audit(...)` 仍在 COMMIT 後執行。事件插入失敗時
+API 回 500 而狀態已永久前進，驗收「每個遷移都有 DomainEvent」不再成立。
+新增 `auditSql(..., prefix)` 回傳 SQL 片段，02A 的六個生命週期事件
+（create／save／submit／review／return／approve＋物化）全部併入各自的交易。
+`prefix` 讓批准交易能同時容納 `adjustment.approved` 與 `journal.materialized`
+兩個事件而不撞參數名。
+
+### 第二輪硬化後
+
+驗收清單增為 **24 條**；測試 **227/227**（單元 27、DB 整合 93、端到端 107）。
+新增三組失敗案例：真併發保存只有一個成功（A=302／B=409）、同租戶跨案件錯配
+全部被拒、以暫時性 trigger 注入 DomainEvent 插入失敗後狀態／快照／事件全部回滾。
 
 ## 下一刀（不得跳過）
 

@@ -368,6 +368,71 @@ expect_err "INV-18：快照 actor 屬其他租戶 → 拒絕" \
    VALUES ('11111111-1111-1111-1111-111111111111','$ADJ3',9,'SUBMITTED',
            'a2222222-0000-0000-0000-000000000001','R2','{}'::jsonb,'x')" "不屬於本租戶"
 
+# ══ 0009 同租戶跨案件錯配（同租戶 ≠ 同案件）══════════════════
+# 0008 的守衛只確認「都是 T1」。同一租戶底下的另一個案件仍可被錯配引用。
+PSQL_C <<'SQL' >/dev/null 2>&1
+SET app.tenant_id = '11111111-1111-1111-1111-111111111111';
+INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, unit_scope, name) VALUES
+  ('bbbbbbbb-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','LEGAL_ENTITY','另一案件單位');
+INSERT INTO fiscal_calendar (fiscal_calendar_id, tenant_id, engagement_id, name, year_start_month) VALUES
+  ('ffffffff-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','另一案件曆',4);
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id, fiscal_calendar_id, label, start_date, end_date) VALUES
+  ('dddddddd-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','bbbbbbbb-0000-0000-0000-000000000099','ffffffff-0000-0000-0000-000000000099','2026-03','2026-03-01','2026-03-31');
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id) VALUES
+  ('99999999-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000099');
+SQL
+ok "同租戶第二案件種子（期間與科目表皆屬 eeee...0099）"
+
+PR99=99999999-0000-0000-0000-000000000099
+ACC99=ac000000-0000-0000-0000-000000000099
+
+expect_err "§24.1A：期間屬同租戶的另一案件 → 拒絕" \
+  "$T1 INSERT INTO adjustment (tenant_id, engagement_id, period_revision_id, title, prepared_by)
+   VALUES ('11111111-1111-1111-1111-111111111111','$ENG','$PR99','跨案件期間','$JIA')" "與調整的案件"
+expect_err "歸屬凍結：建立後不可改 engagement_id" \
+  "$T1 UPDATE adjustment SET engagement_id='eeeeeeee-0000-0000-0000-000000000099'
+   WHERE adjustment_id='$ADJ2'" "歸屬與分類欄位建立後不可變更"
+expect_err "歸屬凍結：建立後不可改 period_revision_id" \
+  "$T1 UPDATE adjustment SET period_revision_id='$PR99' WHERE adjustment_id='$ADJ2'" "不可變更"
+expect_err "歸屬凍結：建立後不可改 basis／materiality" \
+  "$T1 UPDATE adjustment SET basis='GROUP_GAAP', materiality='MAJOR', tenant_id='22222222-2222-2222-2222-222222222222'
+   WHERE adjustment_id='$ADJ2'" "不可變更"
+expect_err "§24.1A：正式分錄的案件與來源調整不一致 → 拒絕" \
+  "$T1 INSERT INTO journal_entry (tenant_id, engagement_id, period_revision_id, adjustment_id, business_version, entry_date)
+   VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','$PR','$ADJ',4,'2026-03-31')" \
+  "案件（.*）與來源調整的案件"
+expect_err "§24.1A：正式分錄的期間與來源調整不一致 → 拒絕" \
+  "$T1 INSERT INTO journal_entry (tenant_id, engagement_id, period_revision_id, adjustment_id, business_version, entry_date)
+   VALUES ('11111111-1111-1111-1111-111111111111','$ENG','$PR99','$ADJ',4,'2026-03-31')" \
+  "期間（.*）與來源調整的期間"
+expect_err "§24.1A：正式分錄的科目屬同租戶另一案件 → 拒絕" \
+  "$T1 INSERT INTO journal_line (tenant_id, entry_id, line_no, account_id, debit, credit)
+   VALUES ('11111111-1111-1111-1111-111111111111','be000000-0000-0000-0000-000000000001',9,'$ACC99',1,0)" \
+  "與來源調整的案件"
+ADJ4=ad000000-0000-0000-0000-000000000004
+if ! PSQL_C <<SQL >/dev/null 2>&1
+$T1
+INSERT INTO adjustment (adjustment_id, tenant_id, engagement_id, period_revision_id, title, prepared_by,
+                        legal_basis, evidence_ref, judgment_reason, language_tag)
+VALUES ('$ADJ4','11111111-1111-1111-1111-111111111111','$ENG','$PR','時間戳測試','$JIA','a','b','c','ja-JP');
+INSERT INTO adjustment_line (tenant_id, adjustment_id, line_no, target_account_id, debit, credit) VALUES
+  ('11111111-1111-1111-1111-111111111111','$ADJ4',1,'$ACC1',900,0),
+  ('11111111-1111-1111-1111-111111111111','$ADJ4',2,'$ACC2',0,900);
+UPDATE adjustment SET status='PENDING_REVIEW', business_version=2 WHERE adjustment_id='$ADJ4';
+SQL
+then ng "時間戳測試種子建立失敗"; else ok "時間戳測試種子（ADJ4 已達 PENDING_REVIEW）"; fi
+
+# 直接下 SQL 進入覆核／批准時，時間戳不得留空（AC-WFL-001 要求理由與時間）
+expect_err "時間戳必填：進入 PENDING_APPROVAL 時 reviewed_at 不得為 NULL" \
+  "$T1 UPDATE adjustment SET status='PENDING_APPROVAL', reviewed_by='$YI', reviewed_at=NULL,
+       business_version=3 WHERE adjustment_id='$ADJ4'" "覆核時間"
+expect_ok "時間戳齊備 → 可進入 PENDING_APPROVAL" \
+  "$T1 UPDATE adjustment SET status='PENDING_APPROVAL', reviewed_by='$YI', reviewed_at=now(),
+       business_version=3 WHERE adjustment_id='$ADJ4'"
+expect_err "時間戳必填：進入 APPROVED 時 approved_at 不得為 NULL" \
+  "$T1 UPDATE adjustment SET status='APPROVED', approved_by='$BING', approved_at=NULL,
+       business_version=4 WHERE adjustment_id='$ADJ4'" "批准時間"
+
 n=$(APP_C <<<"$T2 SELECT count(*) FROM adjustment")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的調整" || ng "RLS：adjustment 洩漏 $n 筆"
 n=$(APP_C <<<"$T2 SELECT count(*) FROM journal_line")
