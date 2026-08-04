@@ -7,6 +7,10 @@ import { query, exec } from "../../../packages/database/src/psql.ts";
 import { putObject } from "../../../packages/database/src/objectstore.ts";
 import { sign, verify, type Session } from "../../../packages/auth/src/session.ts";
 import { config } from "../../../packages/config/src/index.ts";
+import { acceptancePredicate, type ImportBatchStatus, type IdentityStatus }
+  from "../../../packages/domain/src/importBatch.ts";
+import { applyMappings, coverage, g02Check, totalsOf, cents, fmtCents,
+  type TbAccountLine, type CurrentMapping } from "../../../packages/domain/src/mapping.ts";
 
 const PORT = config.port;
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g,
@@ -67,6 +71,67 @@ function validateContext(s: Session, engagementId: string, legalEntityId: string
     { u: s.userId, e: engagementId }, { tenantId: s.tenantId });
   if (Number(assigned[0]?.n) === 0) return { ok: false, reason: "未被指派此案件" };
   return { ok: true };
+}
+
+/** 使用者在該案件的角色集合（含租戶層指派）。 */
+function rolesOf(s: Session, engagementId: string): Set<string> {
+  return new Set(query<{ role: string }>(
+    `SELECT role FROM role_assignment
+      WHERE user_id = :'u'::uuid AND revoked_at IS NULL
+        AND (engagement_id IS NULL OR engagement_id = :'e'::uuid)`,
+    { u: s.userId, e: engagementId }, { tenantId: s.tenantId }).map((r) => r.role));
+}
+
+interface BatchCtx {
+  import_batch_id: string; engagement_id: string; status: ImportBatchStatus;
+  identity_status: IdentityStatus; hash_verified: boolean;
+  client: string; entity: string; period: string;
+}
+function loadBatch(s: Session, batchId: string): BatchCtx | null {
+  const rows = query<BatchCtx>(
+    `SELECT ib.import_batch_id, ib.engagement_id, ib.status, ib.identity_status, ib.hash_verified,
+            ce.name AS client, le.name AS entity, rp.label AS period
+       FROM import_batch ib
+       JOIN client_engagement ce ON ce.engagement_id = ib.engagement_id
+       JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
+       JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
+       JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
+      WHERE ib.import_batch_id = :'b'::uuid`,
+    { b: batchId }, { tenantId: s.tenantId });
+  return rows[0] ?? null;
+}
+
+/** 目前生效映射：每來源科目取最高「已批准」版本（凍結屬下一刀 CalculationRun）。 */
+function currentMappings(s: Session, engagementId: string): CurrentMapping[] {
+  return query<{ source_account_code: string; target_account_id: string;
+                 target_code: string; target_name: string; version_no: number }>(
+    `SELECT DISTINCT ON (mr.source_account_code)
+            mr.source_account_code, mr.target_account_id, mr.version_no,
+            a.code AS target_code, a.name AS target_name
+       FROM mapping_rule mr JOIN account a ON a.account_id = mr.target_account_id
+      WHERE mr.engagement_id = :'e'::uuid AND mr.approved_at IS NOT NULL
+      ORDER BY mr.source_account_code, mr.version_no DESC`,
+    { e: engagementId }, { tenantId: s.tenantId })
+    .map((r) => ({ sourceAccountCode: r.source_account_code, targetAccountId: r.target_account_id,
+                   targetCode: r.target_code, targetName: r.target_name, versionNo: Number(r.version_no) }));
+}
+
+/** 批次的 TB 科目彙總列。 */
+function tbLines(s: Session, batchId: string): TbAccountLine[] {
+  return query<{ account_code: string; account_name: string; debit: string; credit: string }>(
+    `SELECT account_code, MAX(account_name) AS account_name,
+            SUM(debit) AS debit, SUM(credit) AS credit
+       FROM source_ledger_line WHERE import_batch_id = :'b'::uuid
+      GROUP BY account_code ORDER BY account_code`,
+    { b: batchId }, { tenantId: s.tenantId })
+    .map((r) => ({ accountCode: r.account_code, accountName: r.account_name ?? "",
+                   debitCents: cents(r.debit), creditCents: cents(r.credit) }));
+}
+
+function b04CtxBar(b: BatchCtx, screen: string): string {
+  return `<span>畫面 <b>${esc(screen)}</b></span><span>客戶 <b>${esc(b.client)}</b></span>` +
+    `<span>法人 <b>${esc(b.entity)}</b></span><span>期間 <b>${esc(b.period)}</b></span>` +
+    `<span>批次 <b>${b.import_batch_id.slice(0, 8)}</b>（${b.status}）</span>`;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -152,11 +217,14 @@ account_code,account_name,debit,credit
            <span class="note">上傳後由背景工作驗證：借貸平衡（G-01）＋檔案歸屬比對（identity_status）</span>
          </form>
          <h2>批次狀態</h2>
-         <table><tr><th>客戶</th><th>法人</th><th>期間</th><th>狀態</th><th>身分比對</th><th>檔案</th><th>說明</th></tr>
+         <table><tr><th>客戶</th><th>法人</th><th>期間</th><th>狀態</th><th>身分比對</th><th>檔案</th><th>說明</th><th>動作</th></tr>
          ${batches.map((b) => `<tr><td>${esc(b.client)}</td><td>${esc(b.entity)}</td><td>${esc(b.period)}</td>
            <td><span class="badge st-${b.status}">${b.status}</span></td>
            <td><span class="badge st-${b.identity_status}">${b.identity_status}</span></td>
-           <td>${esc(b.file_name)}</td><td class="note">${esc(b.quarantine_reason ?? "")}</td></tr>`).join("")}
+           <td>${esc(b.file_name)}</td><td class="note">${esc(b.quarantine_reason ?? "")}</td>
+           <td>${b.status === "VALIDATED" && b.identity_status === "MATCHED"
+             ? `<form method="post" action="/b04/accept" style="margin:0"><input type="hidden" name="batch" value="${b.import_batch_id}"><button>接受</button></form>`
+             : b.status === "ACCEPTED" ? `<a href="/b04?batch=${b.import_batch_id}">B-04 映射</a>` : ""}</td></tr>`).join("")}
          </table><p class="note">此頁只顯示您被指派的案件；未指派案件的名稱與數量不會出現（WKB-a）。</p>`));
     }
 
@@ -198,6 +266,256 @@ account_code,account_name,debit,credit
       audit(s.tenantId, "DOMAIN_EVENT", "import_batch.uploaded", s.userId,
         "import_batch", batchId, { sha256: sha, bytes: data.length });
       return send(302, "", { location: "/" });
+    }
+
+    // ═══════════ SLICE-M2-01：B-04 科目映射 ═══════════
+    // 共通入口檢查：批次存在＋使用者被指派該案件（歸屬完整性 §24.1A）
+    const b04Guard = (batchId: string, action: string):
+        { ok: true; b: BatchCtx; roles: Set<string> } | { ok: false; res: void } => {
+      const b = loadBatch(s, batchId);
+      if (!b) return { ok: false, res: send(404, page("404", "", "<h2>批次不存在</h2>")) };
+      const roles = rolesOf(s, b.engagement_id);
+      if (roles.size === 0) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
+          "import_batch", batchId, { reason: "未被指派此案件", action });
+        return { ok: false, res: send(403, page("拒絕", "<b>⛔ 未被指派</b>",
+          `<h2>⛔ 未被指派此案件</h2><p>此次嘗試已寫入稽核軌跡。</p><p><a href="/">回 B-00</a></p>`)) };
+      }
+      return { ok: true, b, roles };
+    };
+
+    // ── 接受批次（VALIDATED → ACCEPTED；G-01 接受判定式，DB 觸發器為最後防線） ──
+    if (url.pathname === "/b04/accept" && req.method === "POST") {
+      const fields = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b04Guard(fields["batch"] ?? "", "batch.accept");
+      if (!g.ok) return;
+      if (!g.roles.has("R2")) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "batch.accept.denied", s.userId,
+          "import_batch", g.b.import_batch_id, { reason: "接受需 R2 角色" });
+        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 接受需 R2 角色</h2>"));
+      }
+      const pred = acceptancePredicate({ status: g.b.status,
+        identityStatus: g.b.identity_status, hashVerified: g.b.hash_verified });
+      if (!pred.ok) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "batch.accept.rejected", s.userId,
+          "import_batch", g.b.import_batch_id, { guard: pred.guard, reasons: pred.reasons });
+        return send(409, page("拒絕", b04CtxBar(g.b, "B-04"),
+          `<h2>⛔ ${pred.guard}：不滿足接受判定式</h2><ul>${pred.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul><p><a href="/">回 B-00</a></p>`));
+      }
+      exec(`UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id = :'b'::uuid`,
+        { b: g.b.import_batch_id }, { tenantId: s.tenantId });
+      audit(s.tenantId, "DOMAIN_EVENT", "import_batch.accepted", s.userId,
+        "import_batch", g.b.import_batch_id, {});
+      return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
+    }
+
+    // ── B-04 映射工作畫面 ──
+    if (url.pathname === "/b04" && req.method === "GET") {
+      const g = b04Guard(url.searchParams.get("batch") ?? "", "b04.view");
+      if (!g.ok) return;
+      const lines = tbLines(s, g.b.import_batch_id);
+      const maps = currentMappings(s, g.b.engagement_id);
+      const { rows, unmapped } = applyMappings(lines, maps);
+      const cov = coverage(lines, maps);
+      const bySource = new Map(maps.map((m) => [m.sourceAccountCode, m]));
+      const drafts = query<Record<string, string>>(
+        `SELECT mr.mapping_rule_id, mr.source_account_code, mr.version_no, mr.created_by,
+                a.code AS target_code, a.name AS target_name
+           FROM mapping_rule mr JOIN account a ON a.account_id = mr.target_account_id
+          WHERE mr.engagement_id = :'e'::uuid AND mr.approved_at IS NULL
+          ORDER BY mr.source_account_code, mr.version_no`,
+        { e: g.b.engagement_id }, { tenantId: s.tenantId });
+      const accounts = query<Record<string, string>>(
+        `SELECT a.account_id, a.code, a.name FROM account a
+           JOIN chart_of_accounts c ON c.coa_id = a.coa_id
+          WHERE c.engagement_id = :'e'::uuid ORDER BY a.code`,
+        { e: g.b.engagement_id }, { tenantId: s.tenantId });
+      const draftBySource = new Map(drafts.map((d) => [d.source_account_code, d]));
+      const fmt = (c: bigint) => c === 0n ? "" : fmtCents(c);
+      return send(200, page("B-04 科目與維度映射", b04CtxBar(g.b, "B-04 科目與維度映射"),
+        `<h2>映射狀態</h2>
+         <p>覆蓋率（按金額）<b>${(cov.ratio * 100).toFixed(1)}%</b>｜
+            未映射科目 <b>${cov.unmappedAccounts.length}</b> 個｜
+            未映射影響金額（借＋貸）<b>${fmtCents(cov.unmappedCents)}</b></p>
+         <table><tr><th>來源科目</th><th>名稱</th><th>借方</th><th>貸方</th><th>映射狀態</th><th>集團科目</th><th>版本</th></tr>
+         ${lines.map((l) => {
+           const m = bySource.get(l.accountCode);
+           const d = draftBySource.get(l.accountCode);
+           const st = m ? `<span class="badge st-MATCHED">已映射</span>${d ? ` <span class="badge st-PENDING_CONFIRMATION">草稿待批（衝突檢視）</span>` : ""}`
+                        : d ? `<span class="badge st-PENDING_CONFIRMATION">草稿待批</span>`
+                            : `<span class="badge st-QUARANTINED">未映射</span>`;
+           return `<tr><td>${esc(l.accountCode)}</td><td>${esc(l.accountName)}</td>
+             <td style="text-align:right">${fmt(l.debitCents)}</td><td style="text-align:right">${fmt(l.creditCents)}</td>
+             <td>${st}</td><td>${m ? esc(`${m.targetCode} ${m.targetName}`) : d ? `<span class="note">${esc(`${d.target_code} ${d.target_name}`)}（草稿）</span>` : "—"}</td>
+             <td>${m ? `v${m.versionNo}` : ""}</td></tr>`;
+         }).join("")}
+         </table>
+         <h2>建立映射（草稿 → 需另一自然人批准）</h2>
+         <form class="up" method="post" action="/b04/map">
+           <input type="hidden" name="batch" value="${g.b.import_batch_id}">
+           來源科目 <select name="source_code">${lines.filter((l) => !bySource.has(l.accountCode))
+             .map((l) => `<option value="${esc(l.accountCode)}">${esc(l.accountCode)} ${esc(l.accountName)}</option>`).join("")}
+             ${lines.filter((l) => bySource.has(l.accountCode))
+             .map((l) => `<option value="${esc(l.accountCode)}">${esc(l.accountCode)} ${esc(l.accountName)}（改版）</option>`).join("")}</select>
+           → 集團科目 <select name="target">${accounts.map((a) =>
+             `<option value="${a.account_id}">${esc(a.code)} ${esc(a.name)}</option>`).join("")}</select>
+           <button>建立草稿</button>
+         </form>
+         ${drafts.length ? `<h2>待批准草稿</h2>
+         <table><tr><th>來源科目</th><th>集團科目</th><th>版本</th><th></th></tr>
+         ${drafts.map((d) => `<tr><td>${esc(d.source_account_code)}</td>
+           <td>${esc(`${d.target_code} ${d.target_name}`)}</td><td>v${d.version_no}</td>
+           <td><form method="post" action="/b04/approve" style="margin:0">
+             <input type="hidden" name="batch" value="${g.b.import_batch_id}">
+             <input type="hidden" name="rule" value="${d.mapping_rule_id}">
+             <button>批准（R4）</button></form></td></tr>`).join("")}
+         </table><p class="note">建立者不得批准自己的草稿（實例級 SOD；DB 觸發器為最後防線）。</p>` : ""}
+         <p><a href="/b04/preview?batch=${g.b.import_batch_id}">→ 產生集團科目 TB 預覽</a>
+            <form method="post" action="/b04/submit" style="display:inline;margin:0">
+              <input type="hidden" name="batch" value="${g.b.import_batch_id}">
+              <button>映射完成確認（G-02）</button></form>　<a href="/">回 B-00</a></p>`));
+    }
+
+    // ── 建立映射草稿 ──
+    if (url.pathname === "/b04/map" && req.method === "POST") {
+      const fields = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b04Guard(fields["batch"] ?? "", "mapping.create");
+      if (!g.ok) return;
+      if (!g.roles.has("R2") && !g.roles.has("R7")) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.create.denied", s.userId,
+          "import_batch", g.b.import_batch_id, { reason: "建立映射需 R2 或 R7" });
+        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 建立映射需 R2 或 R7 角色</h2>"));
+      }
+      const sourceCode = fields["source_code"] ?? "";
+      const target = fields["target"] ?? "";
+      // 歸屬完整性（§24.1A）：目標科目必須屬於本案件的科目表；DB 觸發器為最後防線
+      const okTarget = query<{ n: string }>(
+        `SELECT count(*) AS n FROM account a JOIN chart_of_accounts c ON c.coa_id = a.coa_id
+          WHERE a.account_id = :'a'::uuid AND c.engagement_id = :'e'::uuid`,
+        { a: target, e: g.b.engagement_id }, { tenantId: s.tenantId });
+      if (Number(okTarget[0]?.n) !== 1) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.create.rejected", s.userId,
+          "import_batch", g.b.import_batch_id,
+          { guard: "歸屬/§24.1A", reason: "目標科目不屬於本案件", source_code: sourceCode, target });
+        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"),
+          `<h2>⛔ 歸屬違規：目標科目不屬於本案件的科目表</h2><p>此次嘗試已寫入稽核軌跡。</p>`));
+      }
+      const next = query<{ v: string }>(
+        `SELECT COALESCE(MAX(version_no), 0) + 1 AS v FROM mapping_rule
+          WHERE engagement_id = :'e'::uuid AND source_account_code = :'sc'`,
+        { e: g.b.engagement_id, sc: sourceCode }, { tenantId: s.tenantId })[0].v;
+      const [row] = query<{ mapping_rule_id: string }>(
+        `INSERT INTO mapping_rule (tenant_id, engagement_id, source_account_code,
+                target_account_id, version_no, created_by)
+         VALUES (:'t'::uuid, :'e'::uuid, :'sc', :'a'::uuid, ${Number(next)}, :'u'::uuid)
+         RETURNING mapping_rule_id`,
+        { t: s.tenantId, e: g.b.engagement_id, sc: sourceCode, a: target, u: s.userId },
+        { tenantId: s.tenantId });
+      audit(s.tenantId, "DOMAIN_EVENT", "mapping_rule.drafted", s.userId,
+        "mapping_rule", row.mapping_rule_id, { source_code: sourceCode, target, version: Number(next) });
+      return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
+    }
+
+    // ── 批准映射（R4；批准人 ≠ 建立者） ──
+    if (url.pathname === "/b04/approve" && req.method === "POST") {
+      const fields = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b04Guard(fields["batch"] ?? "", "mapping.approve");
+      if (!g.ok) return;
+      const ruleId = fields["rule"] ?? "";
+      if (!g.roles.has("R4")) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.approve.denied", s.userId,
+          "mapping_rule", ruleId, { reason: "批准需 R4 角色（§24.6 權限矩陣）" });
+        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 批准映射需 R4 角色</h2>"));
+      }
+      const rule = query<{ created_by: string }>(
+        `SELECT created_by FROM mapping_rule
+          WHERE mapping_rule_id = :'m'::uuid AND engagement_id = :'e'::uuid AND approved_at IS NULL`,
+        { m: ruleId, e: g.b.engagement_id }, { tenantId: s.tenantId })[0];
+      if (!rule) return send(404, page("404", b04CtxBar(g.b, "B-04"), "<h2>草稿不存在或已批准</h2>"));
+      if (rule.created_by === s.userId) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.approve.rejected", s.userId,
+          "mapping_rule", ruleId, { guard: "SOD", reason: "建立者不得批准自己建立的映射版本" });
+        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"),
+          "<h2>⛔ SOD：建立者不得批准自己建立的映射版本</h2><p>此次嘗試已寫入稽核軌跡。</p>"));
+      }
+      exec(`UPDATE mapping_rule SET approved_by = :'u'::uuid, approved_at = now()
+             WHERE mapping_rule_id = :'m'::uuid`,
+        { u: s.userId, m: ruleId }, { tenantId: s.tenantId });
+      audit(s.tenantId, "DOMAIN_EVENT", "mapping_rule.approved", s.userId, "mapping_rule", ruleId, {});
+      return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
+    }
+
+    // ── 集團科目 TB 預覽（非正式輸出；§25.9 output_capability=PREVIEW） ──
+    if (url.pathname === "/b04/preview" && req.method === "GET") {
+      const g = b04Guard(url.searchParams.get("batch") ?? "", "b04.preview");
+      if (!g.ok) return;
+      if (g.b.status !== "ACCEPTED")
+        return send(409, page("拒絕", b04CtxBar(g.b, "B-04 預覽"),
+          `<h2>⛔ 批次尚未 ACCEPTED，不產生預覽</h2><p><a href="/">回 B-00</a></p>`));
+      const lines = tbLines(s, g.b.import_batch_id);
+      const maps = currentMappings(s, g.b.engagement_id);
+      const { rows, unmapped } = applyMappings(lines, maps);
+      const cov = coverage(lines, maps);
+      const g02 = g02Check(cov);
+      const src = totalsOf(lines);
+      const grp = totalsOf(rows);
+      const un = totalsOf(unmapped);
+      const tied = grp.debitCents + un.debitCents === src.debitCents
+                && grp.creditCents + un.creditCents === src.creditCents;
+      audit(s.tenantId, "DOMAIN_EVENT", "group_tb.preview_generated", s.userId,
+        "import_batch", g.b.import_batch_id,
+        { mapped_rows: rows.length, unmapped: cov.unmappedAccounts.length, g02_ok: g02.ok });
+      const fmt = (c: bigint) => c === 0n ? "" : fmtCents(c);
+      return send(200, page("集團科目 TB（預覽）", b04CtxBar(g.b, "B-04 集團 TB 預覽"),
+        `<div style="background:#fff3e0;border:1px solid #d9a05b;border-radius:6px;padding:10px 14px;font-weight:600">
+           PREVIEW（預覽）——非正式輸出、未經覆核批准，不得作為入帳或交付依據
+         </div>
+         <p>G-02 ${g02.ok ? `<span class="badge st-MATCHED">通過</span>`
+                          : `<span class="badge st-QUARANTINED">阻擋</span> ${(g02 as { reasons: string[] }).reasons.map(esc).join("；")}`}</p>
+         <h2>集團科目 TB</h2>
+         <table><tr><th>集團科目</th><th>名稱</th><th>借方</th><th>貸方</th><th>來源科目</th></tr>
+         ${rows.map((r) => `<tr><td>${esc(r.targetCode)}</td><td>${esc(r.targetName)}</td>
+           <td style="text-align:right">${fmt(r.debitCents)}</td><td style="text-align:right">${fmt(r.creditCents)}</td>
+           <td class="note">${r.sourceCodes.map(esc).join("、")}</td></tr>`).join("")}
+         ${unmapped.length ? `<tr><td colspan="2"><b>未映射（不得靜默吸收）</b></td><td></td><td></td><td></td></tr>` +
+           unmapped.map((l) => `<tr><td>—</td><td>${esc(l.accountCode)} ${esc(l.accountName)}</td>
+             <td style="text-align:right">${fmt(l.debitCents)}</td><td style="text-align:right">${fmt(l.creditCents)}</td>
+             <td><span class="badge st-QUARANTINED">未映射</span></td></tr>`).join("") : ""}
+         </table>
+         <h2>控制總額勾稽</h2>
+         <table><tr><th></th><th>借方</th><th>貸方</th></tr>
+         <tr><td>來源 TB</td><td style="text-align:right">${fmtCents(src.debitCents)}</td><td style="text-align:right">${fmtCents(src.creditCents)}</td></tr>
+         <tr><td>集團 TB（含未映射）</td><td style="text-align:right">${fmtCents(grp.debitCents + un.debitCents)}</td><td style="text-align:right">${fmtCents(grp.creditCents + un.creditCents)}</td></tr>
+         <tr><td>勾稽</td><td colspan="2">${tied ? `<span class="badge st-MATCHED">一致</span>` : `<span class="badge st-QUARANTINED">不一致</span>`}</td></tr>
+         </table>
+         <p><a href="/b04?batch=${g.b.import_batch_id}">← 回 B-04</a></p>`));
+    }
+
+    // ── 映射完成確認（G-02 守衛；繞過 UI 直接呼叫亦被擋並留痕） ──
+    if (url.pathname === "/b04/submit" && req.method === "POST") {
+      const fields = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b04Guard(fields["batch"] ?? "", "mapping.submit");
+      if (!g.ok) return;
+      if (g.b.status !== "ACCEPTED")
+        return send(409, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 批次尚未 ACCEPTED</h2>"));
+      const cov = coverage(tbLines(s, g.b.import_batch_id), currentMappings(s, g.b.engagement_id));
+      const g02 = g02Check(cov);
+      if (!g02.ok) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.submit.rejected", s.userId,
+          "import_batch", g.b.import_batch_id,
+          { guard: "G-02", reasons: g02.reasons, unmapped_cents: String(cov.unmappedCents) });
+        return send(409, page("G-02 阻擋", b04CtxBar(g.b, "B-04"),
+          `<h2>⛔ G-02：重要來源餘額尚未全數映射</h2>
+           <ul>${g02.reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
+           <p class="note">映射例外批准機制屬後續切片；本切片任何未映射餘額即阻擋。</p>
+           <p><a href="/b04?batch=${g.b.import_batch_id}">回 B-04 處理未映射科目</a></p>`));
+      }
+      audit(s.tenantId, "DOMAIN_EVENT", "mapping.review_ready", s.userId,
+        "import_batch", g.b.import_batch_id, { coverage_ratio: cov.ratio });
+      return send(200, page("G-02 通過", b04CtxBar(g.b, "B-04"),
+        `<h2>✓ G-02 通過：映射完成，可進入覆核</h2>
+         <p class="note">期間狀態機（IN_PREPARATION → IN_REVIEW）屬後續切片；本次僅記錄 DomainEvent。</p>
+         <p><a href="/b04/preview?batch=${g.b.import_batch_id}">查看集團 TB 預覽</a>　<a href="/">回 B-00</a></p>`));
     }
 
     send(404, page("404", "", "<h2>找不到頁面</h2>"));

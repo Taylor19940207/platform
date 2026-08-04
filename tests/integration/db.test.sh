@@ -129,6 +129,46 @@ expect_err "稽核軌跡 append-only" \
   "INSERT INTO audit_event (tenant_id, kind, event_type) VALUES ('11111111-1111-1111-1111-111111111111','DOMAIN_EVENT','test');
    DELETE FROM audit_event" "append-only"
 
+# ── 映射版本化（SLICE-M2-01；migrations/0005） ───────
+PSQL_C >/dev/null <<'SQL'
+INSERT INTO chart_of_accounts (coa_id, tenant_id, engagement_id, name) VALUES
+  ('88888888-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','集團科目表');
+INSERT INTO account (account_id, tenant_id, coa_id, code, name) VALUES
+  ('ac000000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','88888888-0000-0000-0000-000000000001','1002','银行存款'),
+  ('ac000000-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','88888888-0000-0000-0000-000000000001','6602','管理费用');
+INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES
+  ('eeeeeeee-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','另一案件');
+INSERT INTO chart_of_accounts (coa_id, tenant_id, engagement_id, name) VALUES
+  ('88888888-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','另一案件科目表');
+INSERT INTO account (account_id, tenant_id, coa_id, code, name) VALUES
+  ('ac000000-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','88888888-0000-0000-0000-000000000099','1002','银行存款');
+SQL
+ok "映射測試種子（兩案件各一份科目表）"
+
+MR1=ab000000-0000-0000-0000-000000000001
+expect_ok "映射：建立草稿 v1" \
+  "INSERT INTO mapping_rule (mapping_rule_id, tenant_id, engagement_id, source_account_code, target_account_id, version_no, created_by)
+   VALUES ('$MR1','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','111','ac000000-0000-0000-0000-000000000001',1,'aaaaaaaa-0000-0000-0000-000000000001')"
+expect_err "映射歸屬：目標科目屬其他案件 → 拒絕（§24.1A）" \
+  "INSERT INTO mapping_rule (tenant_id, engagement_id, source_account_code, target_account_id, version_no, created_by)
+   VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','112','ac000000-0000-0000-0000-000000000099',1,'aaaaaaaa-0000-0000-0000-000000000001')" "歸屬違規"
+expect_err "映射 SOD：建立者不得批准自己（自然人判定）" \
+  "UPDATE mapping_rule SET approved_by='aaaaaaaa-0000-0000-0000-000000000001', approved_at=now() WHERE mapping_rule_id='$MR1'" "SOD"
+expect_ok "映射批准：另一自然人可批准" \
+  "UPDATE mapping_rule SET approved_by='aaaaaaaa-0000-0000-0000-000000000002', approved_at=now() WHERE mapping_rule_id='$MR1'"
+expect_err "映射版本不可覆寫：已批准列不可修改" \
+  "UPDATE mapping_rule SET target_account_id='ac000000-0000-0000-0000-000000000002' WHERE mapping_rule_id='$MR1'" "不可覆寫"
+expect_err "映射版本不可覆寫：已批准列不可刪除" \
+  "DELETE FROM mapping_rule WHERE mapping_rule_id='$MR1'" "不可覆寫"
+expect_ok "映射改版＝插入新版本列（v2）" \
+  "INSERT INTO mapping_rule (tenant_id, engagement_id, source_account_code, target_account_id, version_no, created_by)
+   VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','111','ac000000-0000-0000-0000-000000000002',2,'aaaaaaaa-0000-0000-0000-000000000001')"
+expect_err "同（案件, 來源科目, 版本）唯一" \
+  "INSERT INTO mapping_rule (tenant_id, engagement_id, source_account_code, target_account_id, version_no, created_by)
+   VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','111','ac000000-0000-0000-0000-000000000001',2,'aaaaaaaa-0000-0000-0000-000000000001')" "duplicate key"
+n=$(APP_C <<<"$T2 SELECT count(*) FROM mapping_rule")
+[ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的映射" || ng "RLS：mapping_rule 洩漏 $n 筆"
+
 echo ""
 echo "通過 $pass ／ 失敗 $fail"
 [ $fail -eq 0 ]
