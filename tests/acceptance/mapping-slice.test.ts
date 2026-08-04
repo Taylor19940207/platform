@@ -154,6 +154,20 @@ try {
   check("映射建立／批准／接受／預覽皆有 DomainEvent",
     Number(sql(`SELECT count(DISTINCT event_type) FROM audit_event WHERE kind='DOMAIN_EVENT'
       AND event_type IN ('mapping_rule.drafted','mapping_rule.approved','import_batch.accepted','group_tb.preview_generated','mapping.review_ready')`)) === 5);
+
+  // ── 邊界：映射版本按報告期間生效日解析（effective_from） ──
+  // 為 600 建 v2 → 6602，effective_from=2026-04-01：
+  // 2026-03 期（期末 03-31）仍解析到 v1（6401），2026-04 期（期末 04-30）改用 v2。
+  await post(staff, "/b04/map", { batch: B2, source_code: "600", target: accountId("6602") });
+  const d600 = sql(`SELECT mapping_rule_id FROM mapping_rule WHERE source_account_code='600' AND approved_at IS NULL`);
+  sql(`UPDATE mapping_rule SET effective_from='2026-04-01' WHERE mapping_rule_id='${d600}'`);
+  await post(senior, "/b04/approve", { batch: B2, rule: d600 });
+  const pvMar = await (await fetch(`${API}/b04/preview?batch=${B1}`, { headers: { cookie: staff } })).text();
+  const pvApr = await (await fetch(`${API}/b04/preview?batch=${B2}`, { headers: { cookie: staff } })).text();
+  check("生效日解析：2026-03 期不受未來版本影響（600 仍在 6401：21,700,000）",
+    pvMar.includes("6401") && pvMar.includes("21,700,000"));
+  check("生效日解析：2026-04 期起用 v2（600 併入 6602：1,850,000；6401 消失）",
+    !pvApr.includes("6401") && pvApr.includes("1,850,000"));
 } finally {
   api.kill(); worker.kill();
 }

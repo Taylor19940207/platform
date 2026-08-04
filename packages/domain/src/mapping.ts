@@ -26,11 +26,28 @@ export interface GroupTbRow {
   sourceCodes: string[];
 }
 
-export const cents = (s: string | number): bigint =>
-  BigInt(Math.round(Number(s || 0) * 100));
+/**
+ * 十進位字串 → 分（bigint）。純字串解析，不經 JavaScript Number——
+ * numeric(20,2) 的整數位可達 18 位，超出 IEEE-754 的 53-bit 精度會靜默失真。
+ */
+export const cents = (s: string | number): bigint => {
+  const str = String(s ?? "0").trim();
+  if (str === "") return 0n;
+  const m = /^(-?)(\d+)(?:\.(\d{1,2}))?$/.exec(str);
+  if (!m) throw new Error(`金額格式錯誤：${str}`);
+  const [, sign, whole, frac = ""] = m;
+  const c = BigInt(whole) * 100n + BigInt((frac + "00").slice(0, 2));
+  return sign === "-" ? -c : c;
+};
 
-export const fmtCents = (c: bigint): string =>
-  (Number(c) / 100).toLocaleString("en-US");
+/** 分（bigint）→ 千分位字串。純字串格式化；小數部分為零時省略。 */
+export const fmtCents = (c: bigint): string => {
+  const neg = c < 0n;
+  const abs = neg ? -c : c;
+  const whole = (abs / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const frac = abs % 100n;
+  return `${neg ? "-" : ""}${whole}${frac === 0n ? "" : "." + frac.toString().padStart(2, "0")}`;
+};
 
 /** 套用目前生效映射：多對一加總；未映射科目另列（不得靜默吸收）。 */
 export function applyMappings(lines: TbAccountLine[], mappings: CurrentMapping[]):

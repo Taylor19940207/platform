@@ -8,6 +8,7 @@ import { query, exec } from "../../../packages/database/src/psql.ts";
 import { getObject } from "../../../packages/database/src/objectstore.ts";
 import { classifyIdentity, identityStatusOf, type EvidenceKind }
   from "../../../packages/domain/src/importBatch.ts";
+import { cents, fmtCents } from "../../../packages/domain/src/mapping.ts";
 import { config } from "../../../packages/config/src/index.ts";
 
 const INTERVAL = config.pollMs;
@@ -85,8 +86,7 @@ function processBatch(b: Claimed): void {
   const { meta, lines, errors } = parseTb(data.toString("utf8"));
   if (errors.length) return quarantine(b, `解析失敗：${errors.slice(0, 3).join("；")}`);
   if (lines.length === 0) return quarantine(b, "檔案沒有資料列");
-  let debit = 0n, credit = 0n;   // 以「分」為單位的整數運算——金額絕不用浮點
-  const cents = (s: string) => BigInt(Math.round(parseFloat(s) * 100));
+  let debit = 0n, credit = 0n;   // 以「分」為單位的整數運算——金額絕不用浮點（cents 為純字串解析）
   for (const l of lines) { debit += cents(l.debit); credit += cents(l.credit); }
   const diff = debit - credit;
 
@@ -130,7 +130,7 @@ function processBatch(b: Claimed): void {
   if (result === "CONFLICT")
     return quarantine(b, `身分不一致：宣告法人代碼 ${b.declared_code}，檔案內為 ${detectedCode}（CONFLICT，無人工豁免）`);
   if (diff !== 0n)
-    return quarantine(b, `借貸不平衡：差額 ${(Number(diff) / 100).toFixed(2)}（G-01）`);
+    return quarantine(b, `借貸不平衡：差額 ${fmtCents(diff)}（G-01）`);
   exec(`UPDATE import_batch SET status='VALIDATED' WHERE import_batch_id=:'id'::uuid`,
     { id: b.import_batch_id }, { asRuntime: false });
   audit(b.tenant_id, "import_batch.validated", b.import_batch_id,

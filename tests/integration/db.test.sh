@@ -168,6 +168,13 @@ expect_err "同（案件, 來源科目, 版本）唯一" \
    VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','111','ac000000-0000-0000-0000-000000000001',2,'aaaaaaaa-0000-0000-0000-000000000001')" "duplicate key"
 n=$(APP_C <<<"$T2 SELECT count(*) FROM mapping_rule")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的映射" || ng "RLS：mapping_rule 洩漏 $n 筆"
+expect_err "硬化：created_by 必填（NULL 會使 SOD 比較永遠不成立）" \
+  "INSERT INTO mapping_rule (tenant_id, engagement_id, source_account_code, target_account_id, version_no)
+   VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','130','ac000000-0000-0000-0000-000000000001',1)" "null value"
+expect_err "硬化：created_by 不可變更（草稿改建立者再自批＝同一個洞）" \
+  "INSERT INTO mapping_rule (mapping_rule_id, tenant_id, engagement_id, source_account_code, target_account_id, version_no, created_by)
+   VALUES ('ab000000-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','140','ac000000-0000-0000-0000-000000000001',1,'aaaaaaaa-0000-0000-0000-000000000001');
+   UPDATE mapping_rule SET created_by='aaaaaaaa-0000-0000-0000-000000000002' WHERE mapping_rule_id='ab000000-0000-0000-0000-000000000002'" "不可變更"
 
 echo ""
 echo "通過 $pass ／ 失敗 $fail"

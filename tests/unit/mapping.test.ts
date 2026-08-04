@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyMappings, coverage, g02Check, totalsOf, cents,
+import { applyMappings, coverage, g02Check, totalsOf, cents, fmtCents,
   type TbAccountLine, type CurrentMapping } from "../../packages/domain/src/mapping.ts";
 
 const L = (code: string, d: number, c: number): TbAccountLine =>
@@ -50,6 +50,18 @@ test("控制總額勾稽：映射後＋未映射 ＝ 來源總額", () => {
   const un = totalsOf(unmapped);
   assert.equal(grp.debitCents + un.debitCents, src.debitCents);
   assert.equal(grp.creditCents + un.creditCents, src.creditCents);
+});
+
+test("大額精確：numeric(20,2) 上限位數不經 Number、無精度損失", () => {
+  // 18 位整數＋2 位小數超出 IEEE-754 53-bit：Number 路徑會失真，字串路徑必須精確
+  assert.equal(cents("123456789012345678.99"), 12345678901234567899n);
+  assert.equal(cents("-123456789012345678.99"), -12345678901234567899n);
+  assert.equal(fmtCents(12345678901234567899n), "123,456,789,012,345,678.99");
+  assert.equal(fmtCents(-12345678901234567899n), "-123,456,789,012,345,678.99");
+  assert.equal(cents("100.5"), 10050n);      // 一位小數補零
+  assert.equal(cents("0"), 0n);
+  assert.equal(fmtCents(10000n), "100");     // 小數為零時省略
+  assert.throws(() => cents("1,000"));       // 非純十進位一律拒絕，不靜默解析
 });
 
 test("借貸平衡的來源全數映射後，集團 TB 借貸仍平衡", () => {

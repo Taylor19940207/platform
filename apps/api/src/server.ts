@@ -85,12 +85,12 @@ function rolesOf(s: Session, engagementId: string): Set<string> {
 interface BatchCtx {
   import_batch_id: string; engagement_id: string; status: ImportBatchStatus;
   identity_status: IdentityStatus; hash_verified: boolean;
-  client: string; entity: string; period: string;
+  client: string; entity: string; period: string; period_end: string;
 }
 function loadBatch(s: Session, batchId: string): BatchCtx | null {
   const rows = query<BatchCtx>(
     `SELECT ib.import_batch_id, ib.engagement_id, ib.status, ib.identity_status, ib.hash_verified,
-            ce.name AS client, le.name AS entity, rp.label AS period
+            ce.name AS client, le.name AS entity, rp.label AS period, rp.end_date AS period_end
        FROM import_batch ib
        JOIN client_engagement ce ON ce.engagement_id = ib.engagement_id
        JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
@@ -101,8 +101,12 @@ function loadBatch(s: Session, batchId: string): BatchCtx | null {
   return rows[0] ?? null;
 }
 
-/** 目前生效映射：每來源科目取最高「已批准」版本（凍結屬下一刀 CalculationRun）。 */
-function currentMappings(s: Session, engagementId: string): CurrentMapping[] {
+/**
+ * 目前生效映射：每來源科目取「該報告期間生效」的最高已批准版本。
+ * 生效以期間終了日判定（TB 為期末餘額）；NULL 生效日＝不限。
+ * 版本凍結（CalculationInputManifest）屬下一刀 CalculationRun。
+ */
+function currentMappings(s: Session, engagementId: string, periodEnd: string): CurrentMapping[] {
   return query<{ source_account_code: string; target_account_id: string;
                  target_code: string; target_name: string; version_no: number }>(
     `SELECT DISTINCT ON (mr.source_account_code)
@@ -110,8 +114,10 @@ function currentMappings(s: Session, engagementId: string): CurrentMapping[] {
             a.code AS target_code, a.name AS target_name
        FROM mapping_rule mr JOIN account a ON a.account_id = mr.target_account_id
       WHERE mr.engagement_id = :'e'::uuid AND mr.approved_at IS NOT NULL
+        AND (mr.effective_from IS NULL OR mr.effective_from <= :'pe'::date)
+        AND (mr.effective_to   IS NULL OR mr.effective_to   >= :'pe'::date)
       ORDER BY mr.source_account_code, mr.version_no DESC`,
-    { e: engagementId }, { tenantId: s.tenantId })
+    { e: engagementId, pe: periodEnd }, { tenantId: s.tenantId })
     .map((r) => ({ sourceAccountCode: r.source_account_code, targetAccountId: r.target_account_id,
                    targetCode: r.target_code, targetName: r.target_name, versionNo: Number(r.version_no) }));
 }
@@ -258,11 +264,13 @@ account_code,account_name,debit,credit
                     :'u'::uuid, :'u'::uuid, 'tb.csv', :'sha', 'DRAFT')`,
         { id: batchId, t: s.tenantId, e: engagement, le: legal_entity, pr: period_revision,
           u: s.userId, sha }, { tenantId: s.tenantId });
-      exec(`UPDATE import_batch SET status='UPLOADED' WHERE import_batch_id = :'id'::uuid`,
-        { id: batchId }, { tenantId: s.tenantId });
+      // 原檔紀錄先落地，最後才轉 UPLOADED——§25.5「UPLOADED＝檔案已落地」，
+      // 順序顛倒會讓 worker 在紀錄寫入前搶到批次（object_key 為 null 的競態）。
       exec(`INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
             VALUES (:'t'::uuid, :'id'::uuid, 'tb.csv', :'sha', :'k', ${data.length})`,
         { t: s.tenantId, id: batchId, sha, k: key }, { tenantId: s.tenantId });
+      exec(`UPDATE import_batch SET status='UPLOADED' WHERE import_batch_id = :'id'::uuid`,
+        { id: batchId }, { tenantId: s.tenantId });
       audit(s.tenantId, "DOMAIN_EVENT", "import_batch.uploaded", s.userId,
         "import_batch", batchId, { sha256: sha, bytes: data.length });
       return send(302, "", { location: "/" });
@@ -314,7 +322,7 @@ account_code,account_name,debit,credit
       const g = b04Guard(url.searchParams.get("batch") ?? "", "b04.view");
       if (!g.ok) return;
       const lines = tbLines(s, g.b.import_batch_id);
-      const maps = currentMappings(s, g.b.engagement_id);
+      const maps = currentMappings(s, g.b.engagement_id, g.b.period_end);
       const { rows, unmapped } = applyMappings(lines, maps);
       const cov = coverage(lines, maps);
       const bySource = new Map(maps.map((m) => [m.sourceAccountCode, m]));
@@ -453,7 +461,7 @@ account_code,account_name,debit,credit
         return send(409, page("拒絕", b04CtxBar(g.b, "B-04 預覽"),
           `<h2>⛔ 批次尚未 ACCEPTED，不產生預覽</h2><p><a href="/">回 B-00</a></p>`));
       const lines = tbLines(s, g.b.import_batch_id);
-      const maps = currentMappings(s, g.b.engagement_id);
+      const maps = currentMappings(s, g.b.engagement_id, g.b.period_end);
       const { rows, unmapped } = applyMappings(lines, maps);
       const cov = coverage(lines, maps);
       const g02 = g02Check(cov);
@@ -498,7 +506,7 @@ account_code,account_name,debit,credit
       if (!g.ok) return;
       if (g.b.status !== "ACCEPTED")
         return send(409, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 批次尚未 ACCEPTED</h2>"));
-      const cov = coverage(tbLines(s, g.b.import_batch_id), currentMappings(s, g.b.engagement_id));
+      const cov = coverage(tbLines(s, g.b.import_batch_id), currentMappings(s, g.b.engagement_id, g.b.period_end));
       const g02 = g02Check(cov);
       if (!g02.ok) {
         audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.submit.rejected", s.userId,
