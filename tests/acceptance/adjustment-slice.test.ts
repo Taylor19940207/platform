@@ -155,6 +155,12 @@ try {
   check("狀態 PENDING_APPROVAL、reviewed_by=乙、bv=3",
     adjField(ADJ, "status") === "PENDING_APPROVAL" && adjField(ADJ, "reviewed_by") === U_YI
     && adjField(ADJ, "business_version") === "3");
+  // 違規嘗試永久留在 AuditEvent；但輸出資格必須反映目前狀態，不得殘留臨時降級
+  check("合法覆核完成後不殘留 PREVIEW 降級（輸出資格反映目前狀態）",
+    adjField(ADJ, "output_capability") === "" && adjField(ADJ, "control_reasons") === "[]");
+  check("PREVIEW 降級雖已清除，G-04 違規嘗試仍永久留在稽核軌跡", guardLogged("G-04／SOD-01") >= 1);
+  check("B-05 不再同時顯示 APPROVED 與「只能預覽」",
+    !(await get(yi, `/b05?adj=${ADJ}`)).includes("只能預覽、不可正式交付"));
 
   // ── 9 批准前不得有正式事實 ──
   check("批准前 JournalLine 為零", journalCount(ADJ) === "0");
@@ -218,6 +224,45 @@ try {
   check("覆核失效後未重新覆核不得再進 PENDING_APPROVAL",
     await post(bing, "/b05/approve", { adj: ADJ2 }) === 409
     && adjField(ADJ2, "status") === "DRAFTING");
+
+  // ── 12b 原子性：狀態遷移與里程碑快照同進同出 ──
+  const snapCount = (a: string): number =>
+    Number(sql(`SELECT count(*) FROM adjustment_version_snapshot WHERE adjustment_id='${a}'`));
+  check("每次狀態遷移都恰好留下一個 business version 快照（無孤兒狀態）",
+    snapCount(ADJ) === Number(adjField(ADJ, "business_version")) - 1);
+  check("快照的 business_version 與調整狀態鏈一致（無跳號）",
+    sql(`SELECT string_agg(business_version::text,',' ORDER BY business_version)
+         FROM adjustment_version_snapshot WHERE adjustment_id='${ADJ}'`) === "2,3,4");
+  // 快照唯一鍵衝突 → 整筆交易回滾：狀態與 business_version 都不得前進
+  await post(jia, "/b05/create", { batch: B1, title: "原子性測試" });
+  const ADJ3 = sql(`SELECT adjustment_id FROM adjustment ORDER BY created_at DESC LIMIT 1`);
+  await post(jia, "/b05/save", { adj: ADJ3, base_object_version: "1", title: "原子性測試",
+    ...EVIDENCE, lines: "1002,700.00,0\n6602,0,700.00" });
+  sql(`INSERT INTO adjustment_version_snapshot (tenant_id, adjustment_id, business_version,
+        milestone, actor_id, acting_role, content, content_sha256)
+       VALUES ('${T1}','${ADJ3}',2,'SUBMITTED','${U_JIA}','R2','{}'::jsonb,'preoccupied')`);
+  const beforeStatus = adjField(ADJ3, "status"), beforeBv = adjField(ADJ3, "business_version");
+  check("快照插入失敗 → 狀態與 business_version 全部回滾",
+    await post(jia, "/b05/submit", { adj: ADJ3 }) === 500
+    && adjField(ADJ3, "status") === beforeStatus && beforeStatus === "DRAFTING"
+    && adjField(ADJ3, "business_version") === beforeBv && beforeBv === "1");
+
+  // ── 12c 草稿保存的原子性與明確拒絕 ──
+  const ovBefore = adjField(ADJ3, "object_version");
+  const linesBefore = sql(`SELECT string_agg(debit::text,',' ORDER BY line_no)
+                           FROM adjustment_line WHERE adjustment_id='${ADJ3}'`);
+  check("草稿第二列科目不存在 → 整筆拒絕 409（不再靜默略過後回報成功）",
+    await post(jia, "/b05/save", { adj: ADJ3, base_object_version: ovBefore, title: "被改壞的標題",
+      ...EVIDENCE, lines: "1002,111.00,0\n9999,0,111.00" }) === 409);
+  check("拒絕後表頭、明細與 object_version 全部不變",
+    adjField(ADJ3, "title") === "原子性測試" && adjField(ADJ3, "object_version") === ovBefore
+    && sql(`SELECT string_agg(debit::text,',' ORDER BY line_no)
+            FROM adjustment_line WHERE adjustment_id='${ADJ3}'`) === linesBefore);
+  check("草稿第二列金額格式錯誤 → 整筆拒絕，明細不變",
+    await post(jia, "/b05/save", { adj: ADJ3, base_object_version: ovBefore, title: "原子性測試",
+      ...EVIDENCE, lines: "1002,111.00,0\n6602,abc,0" }) === 409
+    && sql(`SELECT string_agg(debit::text,',' ORDER BY line_no)
+            FROM adjustment_line WHERE adjustment_id='${ADJ3}'`) === linesBefore);
 
   // ── 13 稽核軌跡完整 ──
   const events = sql(`SELECT DISTINCT event_type FROM audit_event WHERE kind='DOMAIN_EVENT'

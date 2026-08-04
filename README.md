@@ -30,7 +30,7 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 27 ＋ DB 整合 67 ＋ 端到端驗收 90（里程碑 1 之 20 ＋ 映射切片之 25 ＋ 調整切片之 45），共 184 條
+pnpm test          # 單元 27 ＋ DB 整合 81 ＋ 端到端驗收 99（里程碑 1 之 20 ＋ 映射切片之 25 ＋ 調整切片之 54），共 207 條
 ```
 
 **跑測試前先停掉 `pnpm dev`**：端到端測試會自己 spawn API（8091／8092／8093）與 worker，
@@ -50,7 +50,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 
 ## 現況
 
-- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋7 份 migration（25 張表；可從零重建）
+- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋8 份 migration（25 張表；可從零重建）
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）
@@ -65,6 +65,6 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 apps/        api（模組化單體宿主）｜worker（背景驗證）｜web（Next.js 佔位）
 packages/    domain（狀態機）｜database（migration＋轉接層）｜auth｜contracts｜config
 scripts/     dev.mjs｜env.sh（傳輸層）｜sandbox/（非主流程）
-tests/       unit｜integration（DB 守衛 35 條）｜acceptance（端到端 45 條）｜fixtures/case-001
+tests/       unit｜integration（DB 守衛 81 條）｜acceptance（端到端 99 條）｜fixtures/case-001
 docs/        GOVERNANCE｜BACKLOG｜adr/｜slices/
 ```

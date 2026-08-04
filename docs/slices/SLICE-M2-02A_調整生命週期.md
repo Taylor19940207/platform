@@ -81,6 +81,11 @@ APPROVED
 | 14 | G-04 失敗或無合格獨立覆核人時，控制判定記錄 `output_capability = PREVIEW` ＋ `reasons = [G-04, SOD-01]`；**不寫入 `delivery_quality`**（該欄屬 DeliveryRecord，02A 不存在）；B-05 明確顯示「只能預覽、不可正式交付」 | DB 整合＋端到端 |
 | 15 | 編製、送覆核、退回、覆核、批准、物化皆寫入 DomainEvent | 端到端 |
 | 16 | 跨 Tenant／跨案件不可見不可寫；調整指向的集團科目須屬同一 Tenant × 案件（§24.1A） | DB 整合 |
+| 17 | **狀態遷移與 business version 快照同一交易**：快照失敗時狀態與 `business_version` 全部回滾，不得留下「狀態已前進、不可變版本不存在」的資料 | 端到端 |
+| 18 | **同狀態 UPDATE 不得繞過守衛**：`reviewed_by`／`approved_by` 只能在對應遷移設定或清空；`business_version` 只能隨遷移前進一格；已送出的表頭凍結。併發的第二次覆核不得覆蓋第一位覆核人 | DB 整合 |
+| 19 | **草稿保存是原子操作**：任一明細解析失敗或科目不存在即整筆拒絕（409），表頭、明細與 `object_version` 全部不變；不得靜默略過後回報成功 | 端到端 |
+| 20 | **PREVIEW 降級不殘留**：合法獨立覆核完成後清除 `output_capability`／`control_reasons`；違規嘗試仍永久留在 AuditEvent。B-05 不得同時顯示 APPROVED 與「只能預覽」 | 端到端 |
+| 21 | **跨租戶錯配寫入被 DB 拒絕**（INV-18）：`tenant_id` 與 `engagement_id`／`period_revision_id`／`prepared_by`／父物件／科目屬不同租戶時一律拒絕——RLS 只比對列自己的 `tenant_id`，不保證父物件同租戶 | DB 整合 |
 
 ## 明確不做（切片收窄，**不是**修改基線）
 

@@ -298,6 +298,76 @@ expect_err "退回快照不可變" \
 n=$(APP_C <<<"$T1 SELECT adjustment_id FROM adjustment WHERE adjustment_id='$ADJ2'" | wc -l | tr -d ' ')
 [ "$n" = "1" ] && ok "退回不建立新調整：adjustment_id 不變（ADR-M2-001）" || ng "退回後調整筆數異常：$n"
 
+# ══ 0008 硬化：同狀態繞過與跨租戶錯配 ══════════════════════════
+# 缺口 2 實測重現：0008 之前，同狀態 UPDATE 可把 reviewed_by 改成編製人本人，
+# SOD-01 在 DB 層被完全繞過；併發的第二次覆核也會覆蓋第一位覆核人。
+ADJ3=ad000000-0000-0000-0000-000000000003
+if ! PSQL_C <<SQL >/dev/null 2>&1
+$T1
+INSERT INTO adjustment (adjustment_id, tenant_id, engagement_id, period_revision_id, title, prepared_by,
+                        legal_basis, evidence_ref, judgment_reason, language_tag)
+VALUES ('$ADJ3','11111111-1111-1111-1111-111111111111','$ENG','$PR','繞過測試','$JIA',
+        '法源','附件','理由','ja-JP');
+INSERT INTO adjustment_line (tenant_id, adjustment_id, line_no, target_account_id, debit, credit) VALUES
+  ('11111111-1111-1111-1111-111111111111','$ADJ3',1,'$ACC1',700,0),
+  ('11111111-1111-1111-1111-111111111111','$ADJ3',2,'$ACC2',0,700);
+UPDATE adjustment SET status='PENDING_REVIEW', business_version=2 WHERE adjustment_id='$ADJ3';
+UPDATE adjustment SET status='PENDING_APPROVAL', reviewed_by='$YI', reviewed_at=now(), business_version=3
+ WHERE adjustment_id='$ADJ3';
+SQL
+then ng "繞過測試種子建立失敗"; else ok "繞過測試種子（ADJ3 已達 PENDING_APPROVAL，覆核人乙）"; fi
+
+expect_err "繞過封鎖：同狀態改寫 reviewed_by → 拒絕（SOD-01 的比較基準）" \
+  "$T1 UPDATE adjustment SET reviewed_by='$JIA' WHERE adjustment_id='$ADJ3'" "不得改寫"
+expect_err "繞過封鎖：同狀態改寫 business_version → 拒絕" \
+  "$T1 UPDATE adjustment SET business_version=99 WHERE adjustment_id='$ADJ3'" "只能隨狀態遷移變動"
+expect_err "繞過封鎖：同狀態改寫已送出的表頭 → 拒絕" \
+  "$T1 UPDATE adjustment SET title='竄改' WHERE adjustment_id='$ADJ3'" "不可再變更"
+# 併發：兩個覆核請求都讀到 PENDING_REVIEW，第一個先提交。第二個到達時列已是
+# PENDING_APPROVAL，該遷移變成同狀態改寫 reviewed_by —— 被覆核人不可改寫規則擋下。
+expect_err "併發覆核：第二次覆核不得覆蓋第一位覆核人" \
+  "$T1 UPDATE adjustment SET status='PENDING_APPROVAL', reviewed_by='$BING', reviewed_at=now(),
+       business_version=4 WHERE adjustment_id='$ADJ3'" "不得改寫"
+expect_err "里程碑紀律：狀態遷移未遞增 business_version → 拒絕" \
+  "$T1 UPDATE adjustment SET status='DRAFTING', reviewed_by=NULL, reviewed_at=NULL
+   WHERE adjustment_id='$ADJ3'" "必須將 business_version"
+expect_err "里程碑紀律：business_version 跳號 → 拒絕" \
+  "$T1 UPDATE adjustment SET status='DRAFTING', reviewed_by=NULL, reviewed_at=NULL, business_version=9
+   WHERE adjustment_id='$ADJ3'" "前進為"
+expect_err "批准人不可改寫：已批准列以外不得設定 approved_by" \
+  "$T1 UPDATE adjustment SET approved_by='$BING' WHERE adjustment_id='$ADJ3'" "只能在進入 APPROVED"
+n=$(APP_C <<<"$T1 SELECT reviewed_by FROM adjustment WHERE adjustment_id='$ADJ3'")
+[ "$n" = "$YI" ] && ok "繞過嘗試後覆核人仍為乙（未被竄改）" || ng "覆核人已被竄改為 $n"
+
+# 缺口 5 實測重現：tenant_id 自填為 T1、engagement_id 指向 T2 的案件。
+# RLS 只比對列自己的 tenant_id，一般 FK 不保證父物件同租戶（INV-18）。
+PSQL_C <<'SQL' >/dev/null 2>&1
+SET app.tenant_id = '22222222-2222-2222-2222-222222222222';
+INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES
+  ('e2222222-0000-0000-0000-000000000001','22222222-2222-2222-2222-222222222222','T2 案件');
+INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
+  ('a2222222-0000-0000-0000-000000000001','22222222-2222-2222-2222-222222222222','x@t2.jp','T2 使用者');
+SQL
+ok "跨租戶測試種子（T2 案件與使用者）"
+
+expect_err "INV-18：tenant_id=T1 但案件屬 T2 → 拒絕" \
+  "$T1 INSERT INTO adjustment (tenant_id, engagement_id, period_revision_id, title, prepared_by)
+   VALUES ('11111111-1111-1111-1111-111111111111','e2222222-0000-0000-0000-000000000001','$PR','跨租戶','$JIA')" \
+  "案件（.*）不屬於本租戶"
+expect_err "INV-18：編製人屬 T2 → 拒絕" \
+  "$T1 INSERT INTO adjustment (tenant_id, engagement_id, period_revision_id, title, prepared_by)
+   VALUES ('11111111-1111-1111-1111-111111111111','$ENG','$PR','跨租戶','a2222222-0000-0000-0000-000000000001')" \
+  "編製人（.*）不屬於本租戶"
+# 以 ADJ2（退回後為 DRAFTING）測明細層：ADJ3 已離開草稿，會先被明細凍結守衛擋下
+expect_err "INV-18：調整明細的 tenant_id 與父調整不符 → 拒絕" \
+  "$T1 INSERT INTO adjustment_line (tenant_id, adjustment_id, line_no, target_account_id, debit, credit)
+   VALUES ('22222222-2222-2222-2222-222222222222','$ADJ2',3,'$ACC1',1,0)" "不屬於本租戶"
+expect_err "INV-18：快照 actor 屬其他租戶 → 拒絕" \
+  "$T1 INSERT INTO adjustment_version_snapshot (tenant_id, adjustment_id, business_version, milestone,
+        actor_id, acting_role, content, content_sha256)
+   VALUES ('11111111-1111-1111-1111-111111111111','$ADJ3',9,'SUBMITTED',
+           'a2222222-0000-0000-0000-000000000001','R2','{}'::jsonb,'x')" "不屬於本租戶"
+
 n=$(APP_C <<<"$T2 SELECT count(*) FROM adjustment")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的調整" || ng "RLS：adjustment 洩漏 $n 筆"
 n=$(APP_C <<<"$T2 SELECT count(*) FROM journal_line")

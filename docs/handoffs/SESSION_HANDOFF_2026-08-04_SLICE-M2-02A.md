@@ -86,6 +86,53 @@ business version 里程碑鏈：`bv2 SUBMITTED 職員甲 R2` → `bv3 REVIEWED �
 控制違規留痕齊全：AC-WFL-001、G-01、G-04／SOD-01、G-05／SOD-02、G-08 ×2、
 狀態、狀態遷移、退回理由、`adjustment.save.conflict`。
 
+## 覆核回饋硬化（migration 0008）
+
+覆核指出 5 個缺口，全部以實測重現後修正。**其中兩個是實測可繞過的真洞**：
+
+### 缺口 2：同狀態 UPDATE 繞過 DB 守衛（嚴重）
+
+0007 的 `fn_adjustment_guard` 在 `OLD.status = NEW.status` 時直接返回。實測：
+
+```sql
+UPDATE adjustment SET reviewed_by = <編製人甲>, business_version = 999
+ WHERE adjustment_id = ...;   -- 成功
+-- 結果 bv=999 reviewed_by=甲（編製人）→ SOD-01 在 DB 層被完全繞過
+```
+
+修法：把控制關鍵欄位的變動紀律**併進主守衛**（而非另掛 trigger——同事件的多個
+BEFORE trigger 依名稱排序執行，順序一旦錯開，錯誤訊息會指向錯的守衛）：
+
+- `reviewed_by`／`reviewed_at`：只在「進入 PENDING_APPROVAL」首次設定、
+  「PENDING_APPROVAL 退回」清空。**這同時擋住併發的第二次覆核覆蓋第一位覆核人**。
+- `approved_by`／`approved_at`：只在「進入 APPROVED」首次設定。
+- `business_version`：只能隨狀態遷移前進一格；同狀態改寫一律拒絕；遷移未遞增也拒絕。
+- 離開草稿階段後表頭凍結（例外：控制判定欄位，G-04 拒絕時需在同狀態下記錄）。
+
+### 缺口 5：跨租戶錯配寫入（嚴重）
+
+`tenant_id` 是自填欄位，RLS 只比對它；`engagement_id` 的 FK 不保證同租戶。實測：
+以 T1 身分寫入 `engagement_id` 指向 T2 案件的調整**成功**，違反 INV-18。
+
+修法：`fn_adjustment_tenant_guard`（案件／期間／編製人須同租戶）與
+`fn_child_tenant_guard`（明細、快照、分錄的父物件與科目須同租戶）。
+
+### 缺口 1、3、4
+
+1. **快照與狀態遷移不同交易** → submit／review／return／approve 全部改為單一交易
+   （`snapshotSql` 只回傳 SQL 片段，由呼叫端併入同一次 `exec`）。批准交易現在包含
+   狀態、JournalEntry、JournalLine 與快照四者。
+3. **草稿保存非原子** → 先全部解析並解析科目，任一列不合法即整筆 409 拒絕；
+   通過後以單一交易 `UPDATE 表頭 → fn_assert 樂觀鎖 → DELETE 明細 → INSERT 明細`。
+   **舊版把未知科目靜默略過後回傳 302 成功**，不符合「伺服器已確認保存」。
+4. **PREVIEW 永久殘留** → 合法獨立覆核完成時清除 `output_capability`／`control_reasons`。
+   違規嘗試仍永久留在 AuditEvent；輸出資格反映目前狀態，正式資格留給 02B。
+
+### 硬化後
+
+驗收清單增為 **21 條**；測試 **207/207**（單元 27、DB 整合 81、端到端 99）。
+兩個原始探測重跑均被拒絕，`reviewed_by` 未被竄改。
+
 ## 下一刀（不得跳過）
 
 **背景工作可靠性**：job lease／認領時間、heartbeat 或逾時判定、安全重領、冪等執行、

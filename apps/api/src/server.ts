@@ -595,28 +595,36 @@ account_code,account_name,debit,credit
       lines: lines.map((l) => ({ debitCents: cents(l.debit), creditCents: cents(l.credit) })),
     });
 
-    /** business version 里程碑快照：不可變，退回也留節點（ADR-M2-001）。 */
-    const snapshot = (r: AdjRow, lines: AdjLineRow[], bv: number, milestone: string,
-                      role: string, reasonCategory: string | null, reasonNote: string | null): void => {
+    /**
+     * business version 里程碑快照的 SQL 片段（不執行）。
+     *
+     * 必須與狀態遷移在**同一交易**內送出：先更新狀態再另行插入快照，一旦快照失敗
+     * 就會留下「狀態已前進、不可變版本不存在」的資料——這是覆核回饋指出的缺口。
+     */
+    const snapshotSql = (r: AdjRow, lines: AdjLineRow[], bv: number, nextStatus: string,
+                         milestone: string, role: string,
+                         reasonCategory: string | null, reasonNote: string | null):
+        { sql: string; params: Record<string, string> } => {
       const content = JSON.stringify({
-        title: r.title, status: r.status,
+        title: r.title, status: nextStatus,
         evidence: { legal_basis: r.legal_basis, evidence_ref: r.evidence_ref,
                     judgment_reason: r.judgment_reason, language_tag: r.language_tag },
         lines: lines.map((l) => ({ line_no: l.line_no, account: l.code,
                                    debit: l.debit, credit: l.credit })),
       });
-      exec(`INSERT INTO adjustment_version_snapshot
-              (tenant_id, adjustment_id, business_version, milestone, actor_id, acting_role,
-               reason_category, reason_note, content, content_sha256)
-            VALUES (:'t'::uuid, :'a'::uuid, ${bv}, :'m'::adjustment_milestone, :'u'::uuid,
-                    :'r'::role_code,
-                    ${reasonCategory ? ":'rc'" : "NULL"}, ${reasonNote ? ":'rn'" : "NULL"},
-                    :'c'::jsonb, :'h')`,
-        { t: s.tenantId, a: r.adjustment_id, m: milestone, u: s.userId, r: role,
-          ...(reasonCategory ? { rc: reasonCategory } : {}),
-          ...(reasonNote ? { rn: reasonNote } : {}),
-          c: content, h: createHash("sha256").update(content).digest("hex") },
-        { tenantId: s.tenantId });
+      return {
+        sql: `INSERT INTO adjustment_version_snapshot
+                (tenant_id, adjustment_id, business_version, milestone, actor_id, acting_role,
+                 reason_category, reason_note, content, content_sha256)
+              VALUES (:'t'::uuid, :'a'::uuid, ${bv}, :'sm'::adjustment_milestone, :'u'::uuid,
+                      :'sr'::role_code,
+                      ${reasonCategory ? ":'src'" : "NULL"}, ${reasonNote ? ":'srn'" : "NULL"},
+                      :'sc'::jsonb, :'sh');`,
+        params: { t: s.tenantId, a: r.adjustment_id, sm: milestone, u: s.userId, sr: role,
+                  ...(reasonCategory ? { src: reasonCategory } : {}),
+                  ...(reasonNote ? { srn: reasonNote } : {}),
+                  sc: content, sh: createHash("sha256").update(content).digest("hex") },
+      };
     };
 
     /** 共通入口：調整存在＋使用者被指派該案件。 */
@@ -796,16 +804,7 @@ account_code,account_name,debit,credit
         return refuse(r, "adjustment.save",
           { ok: false, guard: "狀態", reasons: [`調整已離開草稿階段（${r.status}），不可編輯`] });
       const base = Number(f["base_object_version"] ?? "0");
-      const updated = query<{ object_version: number }>(
-        `UPDATE adjustment SET title = :'ti', legal_basis = :'lb', evidence_ref = :'er',
-                judgment_reason = :'jr', language_tag = :'lt',
-                object_version = object_version + 1
-          WHERE adjustment_id = :'a'::uuid AND object_version = ${base}
-          RETURNING object_version`,
-        { a: r.adjustment_id, ti: f["title"] ?? r.title, lb: f["legal_basis"] ?? "",
-          er: f["evidence_ref"] ?? "", jr: f["judgment_reason"] ?? "", lt: f["language_tag"] ?? "" },
-        { tenantId: s.tenantId });
-      if (updated.length === 0) {
+      if (base !== r.object_version) {
         // 樂觀鎖衝突：拒絕並顯示，絕不靜默覆蓋（§26.9）
         audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.save.conflict", s.userId,
           "adjustment", r.adjustment_id,
@@ -816,27 +815,60 @@ account_code,account_name,debit,credit
            <p class="note">系統不會靜默覆蓋他人的修改。請重新載入後再編輯。</p>
            <p><a href="/b05?adj=${r.adjustment_id}">重新載入 B-05</a></p>`));
       }
-      // 明細：整批重寫（草稿階段；離開 DRAFTING 後由 DB 觸發器凍結）
-      const raw = (f["lines"] ?? "").replace(/\r\n/g, "\n").split("\n")
-        .map((x) => x.trim()).filter(Boolean);
-      exec(`DELETE FROM adjustment_line WHERE adjustment_id = :'a'::uuid`,
-        { a: r.adjustment_id }, { tenantId: s.tenantId });
-      let n = 0;
-      for (const line of raw) {
-        const [code = "", d = "0", c = "0"] = line.split(",").map((x) => x.trim());
-        const acc = query<{ account_id: string }>(
-          `SELECT a.account_id FROM account a JOIN chart_of_accounts ch ON ch.coa_id = a.coa_id
-            WHERE ch.engagement_id = :'e'::uuid AND a.code = :'c'`,
-          { e: r.engagement_id, c: code }, { tenantId: s.tenantId })[0];
-        if (!acc) continue;              // 未知科目略過；歸屬由 DB 觸發器兜底
-        n += 1;
-        exec(`INSERT INTO adjustment_line (tenant_id, adjustment_id, line_no, target_account_id, debit, credit)
-              VALUES (:'t'::uuid, :'a'::uuid, ${n}, :'ac'::uuid, :'d'::numeric, :'cr'::numeric)`,
-          { t: s.tenantId, a: r.adjustment_id, ac: acc.account_id,
-            d: decimalOf(cents(d)), cr: decimalOf(cents(c)) }, { tenantId: s.tenantId });
+      // 明細先全部解析並解析科目；任何一列不合法就整筆拒絕。
+      // 舊版把未知科目靜默略過後回傳成功——那不符合「伺服器已確認保存」。
+      const parsed = (f["lines"] ?? "").replace(/\r\n/g, "\n").split("\n")
+        .map((x) => x.trim()).filter(Boolean)
+        .map((line, i) => {
+          const [code = "", d = "0", c = "0"] = line.split(",").map((x) => x.trim());
+          let debit: string, credit: string;
+          try { debit = decimalOf(cents(d)); credit = decimalOf(cents(c)); }
+          catch { return { lineNo: i + 1, code, error: `金額格式錯誤：${d}／${c}` }; }
+          const acc = query<{ account_id: string }>(
+            `SELECT a.account_id FROM account a JOIN chart_of_accounts ch ON ch.coa_id = a.coa_id
+              WHERE ch.engagement_id = :'e'::uuid AND a.code = :'c'`,
+            { e: r.engagement_id, c: code }, { tenantId: s.tenantId })[0];
+          if (!acc) return { lineNo: i + 1, code, error: `集團科目不存在於本案件：${code}` };
+          return { lineNo: i + 1, code, accountId: acc.account_id, debit, credit };
+        });
+      const bad = parsed.filter((p) => "error" in p) as { lineNo: number; error: string }[];
+      if (bad.length) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.save.rejected", s.userId,
+          "adjustment", r.adjustment_id, { reason: "明細解析失敗", errors: bad });
+        return send(409, page("草稿未保存", b05CtxBar(r),
+          `<h2>⛔ 草稿未保存：明細有 ${bad.length} 列不合法</h2>
+           <ul>${bad.map((b) => `<li>第 ${b.lineNo} 列：${esc(b.error)}</li>`).join("")}</ul>
+           <p class="note">整筆拒絕——表頭、明細與 object_version 均未變動。</p>
+           <p><a href="/b05?adj=${r.adjustment_id}">回 B-05</a></p>`));
       }
+      const good = parsed as { lineNo: number; accountId: string; debit: string; credit: string }[];
+      const lineParams: Record<string, string> = {};
+      const lineValues = good.map((p, i) => {
+        lineParams[`la${i}`] = p.accountId;
+        lineParams[`ld${i}`] = p.debit;
+        lineParams[`lc${i}`] = p.credit;
+        return `(:'t'::uuid, :'a'::uuid, ${i + 1}, :'la${i}'::uuid, :'ld${i}'::numeric, :'lc${i}'::numeric)`;
+      }).join(",\n                   ");
+      // 表頭與明細必須同進同出：舊版「更新表頭 → 刪明細 → 逐列插入」中途失敗會留下半套草稿。
+      exec(`BEGIN;
+            UPDATE adjustment SET title = :'ti', legal_basis = :'lb', evidence_ref = :'er',
+                   judgment_reason = :'jr', language_tag = :'lt',
+                   object_version = object_version + 1
+             WHERE adjustment_id = :'a'::uuid AND object_version = ${base};
+            SELECT fn_assert(
+              (SELECT object_version FROM adjustment WHERE adjustment_id = :'a'::uuid) = ${base + 1},
+              'OPTIMISTIC_LOCK_CONFLICT');
+            DELETE FROM adjustment_line WHERE adjustment_id = :'a'::uuid;
+            ${lineValues ? `INSERT INTO adjustment_line
+              (tenant_id, adjustment_id, line_no, target_account_id, debit, credit)
+             VALUES ${lineValues};` : ""}
+            COMMIT;`,
+        { t: s.tenantId, a: r.adjustment_id, ti: f["title"] ?? r.title,
+          lb: f["legal_basis"] ?? "", er: f["evidence_ref"] ?? "",
+          jr: f["judgment_reason"] ?? "", lt: f["language_tag"] ?? "", ...lineParams },
+        { tenantId: s.tenantId });
       audit(s.tenantId, "DOMAIN_EVENT", "adjustment.draft_saved", s.userId,
-        "adjustment", r.adjustment_id, { object_version: updated[0].object_version, lines: n });
+        "adjustment", r.adjustment_id, { object_version: base + 1, lines: good.length });
       return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
     }
 
@@ -851,9 +883,13 @@ account_code,account_name,debit,credit
       const verdict = canSubmit(stateOf(r, lines));
       if (!verdict.ok) return refuse(r, "adjustment.submit", verdict);
       const bv = r.business_version + 1;
-      exec(`UPDATE adjustment SET status = 'PENDING_REVIEW', business_version = ${bv}
-             WHERE adjustment_id = :'a'::uuid`, { a: r.adjustment_id }, { tenantId: s.tenantId });
-      snapshot({ ...r, status: "PENDING_REVIEW" }, lines, bv, "SUBMITTED", "R2", null, null);
+      const snap = snapshotSql(r, lines, bv, "PENDING_REVIEW", "SUBMITTED", "R2", null, null);
+      // 狀態遷移與里程碑快照同一交易：快照失敗不得留下「狀態已前進、版本不存在」的資料
+      exec(`BEGIN;
+            UPDATE adjustment SET status = 'PENDING_REVIEW', business_version = ${bv}
+             WHERE adjustment_id = :'a'::uuid;
+            ${snap.sql}
+            COMMIT;`, snap.params, { tenantId: s.tenantId });
       audit(s.tenantId, "DOMAIN_EVENT", "adjustment.submitted", s.userId,
         "adjustment", r.adjustment_id, { business_version: bv });
       return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
@@ -880,13 +916,18 @@ account_code,account_name,debit,credit
         return refuse(r, "adjustment.review", verdict);
       }
       const bv = r.business_version + 1;
-      exec(`UPDATE adjustment SET status = 'PENDING_APPROVAL', reviewed_by = :'u'::uuid,
-                 reviewed_at = now(), business_version = ${bv}
-             WHERE adjustment_id = :'a'::uuid`,
-        { a: r.adjustment_id, u: s.userId }, { tenantId: s.tenantId });
-      snapshot({ ...r, status: "PENDING_APPROVAL" }, lines, bv, "REVIEWED", "R3", null, null);
+      const snap = snapshotSql(r, lines, bv, "PENDING_APPROVAL", "REVIEWED", "R3", null, null);
+      // 合法的獨立覆核完成 → 清除先前 G-04 失敗留下的「只能預覽」臨時判定。
+      // 違規嘗試永久留在 AuditEvent；輸出資格必須反映目前狀態，正式資格留給 02B 決定。
+      exec(`BEGIN;
+            UPDATE adjustment SET status = 'PENDING_APPROVAL', reviewed_by = :'u'::uuid,
+                   reviewed_at = now(), business_version = ${bv},
+                   output_capability = NULL, control_reasons = '[]'::jsonb
+             WHERE adjustment_id = :'a'::uuid;
+            ${snap.sql}
+            COMMIT;`, { ...snap.params, u: s.userId }, { tenantId: s.tenantId });
       audit(s.tenantId, "DOMAIN_EVENT", "adjustment.reviewed", s.userId,
-        "adjustment", r.adjustment_id, { business_version: bv });
+        "adjustment", r.adjustment_id, { business_version: bv, preview_downgrade_cleared: true });
       return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
     }
 
@@ -909,10 +950,13 @@ account_code,account_name,debit,credit
       const bv = r.business_version + 1;
       // 從 PENDING_APPROVAL 退回：既有覆核失效，修正後須重新覆核（§25.12 L911）
       const clearReview = r.status === "PENDING_APPROVAL";
-      exec(`UPDATE adjustment SET status = 'DRAFTING', business_version = ${bv}
-                 ${clearReview ? ", reviewed_by = NULL, reviewed_at = NULL" : ""}
-             WHERE adjustment_id = :'a'::uuid`, { a: r.adjustment_id }, { tenantId: s.tenantId });
-      snapshot({ ...r, status: "DRAFTING" }, lines, bv, "RETURNED", need, category, note);
+      const snap = snapshotSql(r, lines, bv, "DRAFTING", "RETURNED", need, category, note);
+      exec(`BEGIN;
+            UPDATE adjustment SET status = 'DRAFTING', business_version = ${bv}
+                   ${clearReview ? ", reviewed_by = NULL, reviewed_at = NULL" : ""}
+             WHERE adjustment_id = :'a'::uuid;
+            ${snap.sql}
+            COMMIT;`, snap.params, { tenantId: s.tenantId });
       audit(s.tenantId, "DOMAIN_EVENT", "adjustment.returned", s.userId,
         "adjustment", r.adjustment_id,
         { from: r.status, business_version: bv, reason_category: category,
@@ -937,6 +981,7 @@ account_code,account_name,debit,credit
       const values = lines.map((l, i) =>
         `('${s.tenantId}'::uuid, '${entryId}'::uuid, ${i + 1}, '${l.target_account_id}'::uuid,` +
         ` ${decimalOf(cents(l.debit))}, ${decimalOf(cents(l.credit))})`).join(",\n               ");
+      const snap = snapshotSql(r, lines, bv, "APPROVED", "APPROVED", "R4", null, null);
       exec(`BEGIN;
             UPDATE adjustment SET status = 'APPROVED', approved_by = :'u'::uuid,
                    approved_at = now(), business_version = ${bv}
@@ -947,10 +992,10 @@ account_code,account_name,debit,credit
                     :'a'::uuid, ${bv}, :'ed'::date);
             INSERT INTO journal_line (tenant_id, entry_id, line_no, account_id, debit, credit)
             VALUES ${values};
+            ${snap.sql}
             COMMIT;`,
-        { a: r.adjustment_id, u: s.userId, t: s.tenantId, e: r.engagement_id,
+        { ...snap.params, u: s.userId, e: r.engagement_id,
           pr: r.period_revision_id, ed: r.period_end }, { tenantId: s.tenantId });
-      snapshot({ ...r, status: "APPROVED" }, lines, bv, "APPROVED", "R4", null, null);
       audit(s.tenantId, "DOMAIN_EVENT", "adjustment.approved", s.userId,
         "adjustment", r.adjustment_id, { business_version: bv });
       audit(s.tenantId, "DOMAIN_EVENT", "journal.materialized", s.userId,
