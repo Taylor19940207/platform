@@ -10,5 +10,8 @@ const procs = [
   p.on("exit", (c) => { console.log(`[${name}] exited (${c})`); procs.forEach((q) => q.kill()); process.exit(c ?? 1); });
   return p;
 });
-process.on("SIGINT", () => { procs.forEach((p) => p.kill()); process.exit(0); });
+// SIGINT 與 SIGTERM 都要收拾子行程——只攔 SIGINT 時，`kill <dev.mjs>` 會遺留
+// 殭屍 worker 繼續搶批次（且可能是舊程式碼），污染測試與開發資料。
+for (const sig of ["SIGINT", "SIGTERM"])
+  process.on(sig, () => { procs.forEach((p) => p.kill()); process.exit(0); });
 console.log("dev 啟動：http://localhost:" + (process.env.PORT ?? 8080));

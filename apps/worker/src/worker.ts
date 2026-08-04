@@ -96,13 +96,20 @@ function eventSql(tenantId: string, eventType: string, objectId: string,
                   ${lit(objectId)}::uuid, ${lit(JSON.stringify(payload))}::jsonb); -- ${alias}`;
 }
 
-/** 交易內的 fencing 斷言：租約已被接手就整批放棄。 */
+/**
+ * 交易內的 fencing 斷言＋列鎖：租約已被接手就整批放棄。
+ * FOR UPDATE 把 job 列鎖到 COMMIT——沒有列鎖時，「檢查通過 → 租約到期 →
+ * 他人重領並寫入」可與本交易後續寫入交錯；鎖住後競爭者的認領
+ * （FOR UPDATE SKIP LOCKED）在本交易結束前拿不到這一列。
+ */
 function fenceSql(j: Claimed): string {
-  return `SELECT fn_assert(EXISTS (
-            SELECT 1 FROM background_job
+  return `WITH fence AS (
+            SELECT job_id FROM background_job
              WHERE job_id = ${lit(j.job_id)}::uuid
                AND claim_token = ${lit(j.claim_token)}::uuid
-               AND lease_expires_at > now()), 'LEASE_LOST');`;
+               AND lease_expires_at > now()
+               FOR UPDATE)
+          SELECT fn_assert(EXISTS (SELECT 1 FROM fence), 'LEASE_LOST');`;
 }
 
 /** TB 解析：#key=value 中繼資料列 ＋ CSV（account_code,account_name,debit,credit） */
@@ -237,7 +244,12 @@ function commitBusinessRejection(j: Claimed, reason: string): void {
         COMMIT;`, {}, { asRuntime: false });
 }
 
-/** 執行失敗：批次維持 UPLOADED（不污染業務狀態），只改 job。 */
+/**
+ * 執行失敗：批次維持 UPLOADED（不污染業務狀態），只改 job。
+ * 失敗寫回同樣受 fencing 約束：必須「持有 token 且租約仍有效」——
+ * 租約到期後本 worker 已無權，寫回落空（0 列）時不得靜默當成功，
+ * 也不得改任何狀態（新持有者或下一個認領者才有權）。
+ */
 function recordJobFailure(j: Claimed, cls: JobErrorClass, message: string): void {
   const v = verdictFor(cls, j.attempt_count, j.max_attempts, config.jobBackoffSeconds);
   if (v.next === "NONE") {
@@ -246,24 +258,32 @@ function recordJobFailure(j: Claimed, cls: JobErrorClass, message: string): void
     return;
   }
   const msg = message.slice(0, 500);
-  if (v.next === "RETRY_WAIT") {
-    exec(`UPDATE background_job
-             SET status='RETRY_WAIT', last_error_class=${lit(cls)}::job_error_class,
-                 last_error_message=${lit(msg)},
-                 next_attempt_at = now() + interval '${v.backoff} seconds'
-           WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid`,
-      {}, { asRuntime: false });
-    console.warn(`[worker] job ${j.job_id.slice(0, 8)} 第 ${j.attempt_count} 次失敗（${cls}），` +
-      `${v.backoff}s 後重試：${msg.slice(0, 120)}`);
+  const fence = `WHERE job_id = ${lit(j.job_id)}::uuid
+                   AND claim_token = ${lit(j.claim_token)}::uuid
+                   AND lease_expires_at > now()`;
+  const rows = v.next === "RETRY_WAIT"
+    ? query<{ ok: number }>(
+        `UPDATE background_job
+            SET status='RETRY_WAIT', last_error_class=${lit(cls)}::job_error_class,
+                last_error_message=${lit(msg)},
+                next_attempt_at = now() + interval '${v.backoff} seconds'
+          ${fence} RETURNING 1 AS ok`, {}, { asRuntime: false })
+    : query<{ ok: number }>(
+        `UPDATE background_job
+            SET status='FAILED', last_error_class=${lit(cls)}::job_error_class,
+                last_error_message=${lit(msg)}
+          ${fence} RETURNING 1 AS ok`, {}, { asRuntime: false });
+  if (rows.length === 0) {
+    console.warn(`[worker] job ${j.job_id.slice(0, 8)} 失敗寫回落空（租約已到期或被接手），` +
+      `不改任何狀態，交由下一個認領者處理`);
     return;
   }
-  exec(`UPDATE background_job
-           SET status='FAILED', last_error_class=${lit(cls)}::job_error_class,
-               last_error_message=${lit(msg)}
-         WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid`,
-    {}, { asRuntime: false });
-  console.error(`[worker] job ${j.job_id.slice(0, 8)} 終止（${cls}）：${msg.slice(0, 200)}　` +
-    `批次維持 UPLOADED，不需重新上傳`);
+  if (v.next === "RETRY_WAIT")
+    console.warn(`[worker] job ${j.job_id.slice(0, 8)} 第 ${j.attempt_count} 次失敗（${cls}），` +
+      `${v.backoff}s 後重試：${msg.slice(0, 120)}`);
+  else
+    console.error(`[worker] job ${j.job_id.slice(0, 8)} 終止（${cls}）：${msg.slice(0, 200)}　` +
+      `批次維持 UPLOADED，不需重新上傳`);
 }
 
 function runJob(j: Claimed): void {

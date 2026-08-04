@@ -88,3 +88,13 @@ test("卡住判定：RUNNING 且租約已過期", () => {
   assert.equal(isStalled("RETRY_WAIT", "2026-08-04T11:59:00Z", now), false);
   assert.equal(isStalled("RUNNING", null, now), false);
 });
+
+test("關閉修正(4)：冪等鍵 canonical 分隔為 U+0000 跳脫序列（原始碼不得含 NUL byte），向量釘死", () => {
+  // 分隔符必須以六字元跳脫序列表示，不得是原始位元組——原始 NUL 會讓整檔被 git 視為二進位。
+  // 此向量在修正前後以同一輸入計得，釘住 canonicalization：改變分隔符＝改變所有冪等鍵。
+  assert.equal(
+    idempotencyKey("IMPORT_VALIDATION", "00000000-0000-0000-0000-0000000000b1", 1, "detect-r1"),
+    "4a8d653c1c4d4562ce04ad2cdd1fc92dca58089e58bfacc107e5fadb68da98fa");
+  // U+0000 分隔須避免欄位注入型碰撞：["a","b c"] 不得等於 ["a b","c"]
+  assert.notEqual(idempotencyKey("a", "b c", 1, "r"), idempotencyKey("a b", "c", 1, "r"));
+});

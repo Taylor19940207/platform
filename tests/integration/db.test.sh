@@ -500,6 +500,59 @@ expect_err "終態不可復活：FAILED 之後不得再 RUNNING" \
        claimed_at=now(), lease_expires_at=now()+interval '60 seconds', attempt_count=3 WHERE job_id='$JOB'" \
   "非法工作狀態遷移"
 
+# ── 關閉修正 ①②③（2026-08-05；SLICE-M2-03 逐行審查回饋） ────────
+J2=cc000000-0000-0000-0000-000000000002
+TOKA=cc000000-0000-0000-0000-0000000000b1
+TOKB=cc000000-0000-0000-0000-0000000000b2
+TOKC=cc000000-0000-0000-0000-0000000000b3
+expect_ok "關閉③ 前置：建立並認領第二個工作（attempt 1）" \
+  "$T1 INSERT INTO background_job (job_id, tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('$J2','11111111-1111-1111-1111-111111111111','IMPORT_VALIDATION','$B1',3,'detect-r1','k4');
+   UPDATE background_job SET status='RUNNING', claim_token='$TOKA', claimed_by='w1', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=1 WHERE job_id='$J2'"
+expect_err "關閉③：活租約不可被搶（RUNNING→RUNNING 未到期換 token）" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOKB', claimed_by='w2', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=2 WHERE job_id='$J2'" "不得重領"
+expect_ok "前置：使租約到期（同 token 欄位更新＝心跳路徑，合法）" \
+  "$T1 UPDATE background_job SET lease_expires_at=now()-interval '1 second' WHERE job_id='$J2'"
+expect_err "關閉③：到期重領仍須遞增 attempt_count（同狀態不再是後門）" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOKB', claimed_by='w2', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds' WHERE job_id='$J2'" "attempt_count"
+expect_ok "關閉③：到期重領（新 token＋attempt_count 遞增）成功" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOKB', claimed_by='w2', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=2 WHERE job_id='$J2'"
+expect_ok "前置：再次使租約到期" \
+  "$T1 UPDATE background_job SET lease_expires_at=now()-interval '1 second' WHERE job_id='$J2'"
+n=$(APP_C <<<"$T1 UPDATE background_job SET status='RETRY_WAIT', last_error_class='RETRYABLE_INFRASTRUCTURE',
+      last_error_message='conn reset', next_attempt_at=now()+interval '5 seconds'
+    WHERE job_id='$J2' AND claim_token='$TOKB' AND lease_expires_at>now() RETURNING 1" | wc -l | tr -d ' ')
+[ "$n" = "0" ] && ok "關閉①：租約到期後失敗寫回落空（0 列，不改任何狀態）" || ng "關閉①失效：影響 $n 列"
+expect_err "關閉②：交易內 fencing 斷言——租約到期即 LEASE_LOST" \
+  "$T1 WITH fence AS (SELECT job_id FROM background_job
+        WHERE job_id='$J2' AND claim_token='$TOKB' AND lease_expires_at>now() FOR UPDATE)
+   SELECT fn_assert(EXISTS (SELECT 1 FROM fence), 'LEASE_LOST')" "LEASE_LOST"
+expect_ok "前置：到期重領（attempt 3，租約有效）" \
+  "$T1 UPDATE background_job SET status='RUNNING', claim_token='$TOKC', claimed_by='w3', claimed_at=now(),
+       lease_expires_at=now()+interval '60 seconds', attempt_count=3 WHERE job_id='$J2'"
+# 交易 A 持 fence 列鎖 2 秒；期間競爭者以 FOR UPDATE SKIP LOCKED 探測必須拿不到列
+( PSQL_C >/dev/null 2>&1 <<LOCKSQL
+$T1
+BEGIN;
+WITH fence AS (SELECT job_id FROM background_job
+  WHERE job_id='$J2' AND claim_token='$TOKC' AND lease_expires_at>now() FOR UPDATE)
+SELECT fn_assert(EXISTS (SELECT 1 FROM fence), 'LEASE_LOST');
+SELECT pg_sleep(2);
+COMMIT;
+LOCKSQL
+) &
+LOCKER=$!
+sleep 1
+n=$(APP_C <<<"$T1 SELECT count(*) FROM (
+      SELECT job_id FROM background_job WHERE job_id='$J2' FOR UPDATE SKIP LOCKED) x")
+wait $LOCKER
+[ "$n" = "0" ] && ok "關閉②：fence 列鎖持有至 COMMIT——SKIP LOCKED 競爭者拿不到列" \
+               || ng "關閉②失效：鎖未生效（競爭者取得 $n 列）"
+
 # 衍生資料的自然唯一性（冪等第二道防線）
 expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)

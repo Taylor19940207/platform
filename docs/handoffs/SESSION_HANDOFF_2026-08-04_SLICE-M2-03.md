@@ -84,3 +84,22 @@ job 從未建立 → 永遠沒人處理」，與原本的卡住問題等價。
 `mapping_rule` 事件原子化（BACKLOG）。
 
 **下一刀**：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest`。
+
+## 2026-08-05 關閉章節（逐行審查四項修正）
+
+上方「已完成」寫於首輪測試全綠之後；使用者逐行審查另發現四項缺口——
+**測試全綠不等於封住**。已全部修正，切片自此正式關閉。
+
+| # | 缺口 | 修正 |
+|---|---|---|
+| ① | `recordJobFailure()` 未驗 `lease_expires_at > now()`，也未斷言影響列數——租約到期後仍可寫回失敗狀態 | 失敗寫回加入租約有效條件並以 `RETURNING` 斷言列數；0 列＝租約已失，記 log 放棄、不改任何狀態，交由下一個認領者處理 |
+| ② | `commitResult()`／`commitBusinessRejection()` 的 fencing 用 `SELECT EXISTS` 未取列鎖——檢查通過後租約到期、他人重領，寫入可交錯 | `fenceSql` 改為 CTE ＋ `FOR UPDATE`：job 列鎖至 COMMIT，競爭者的 `SKIP LOCKED` 認領在交易結束前拿不到列（雙 session 列鎖測試驗證） |
+| ③ | `fn_background_job_guard()` 同狀態提前返回——`RUNNING→RUNNING` 到期重領完全繞過認領檢查（新 token、attempt_count 遞增） | migration **0011**：同狀態捷徑僅限非重領欄位更新（心跳）；重領必走完整認領檢查，且**活租約不可被搶**（舊租約未到期即拒絕） |
+| ④ | `packages/domain/src/backgroundJob.ts` 冪等鍵分隔符為**原始 NUL byte**，整檔被 git 視為二進位 | 改為六字元跳脫序列（同一字元，雜湊不變——以修正前後同輸入向量釘死）；檔案恢復為文字 |
+
+**過程中另發現並修復**：`scripts/dev.mjs` 只攔 SIGINT，`kill` 送 SIGTERM 時子行程變殭屍——
+一個拉取前舊程式碼的殭屍 worker 持續搶測試批次並以舊邏輯寫入（缺 `batch_version` →
+假隔離）。已補 SIGTERM 處理；這也再次驗證 README「跑測試前先停 dev」警語的必要性。
+
+**測試 288 → 299（單元 39、DB 整合 126、端到端 134），全綠。**
+下一刀維持：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest`。

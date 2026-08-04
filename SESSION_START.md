@@ -40,7 +40,7 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
 里程碑 1、`SLICE-M2-01` 科目映射切片與 `SLICE-M2-02A` 調整生命週期切片均已完成。
-現有 10 份 migration；完整實跑結果為 **288/288**（單元 38、DB 整合 116、端到端 134）。
+現有 11 份 migration；完整實跑結果為 **299/299**（單元 39、DB 整合 126、端到端 134）。
 
 **跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091／8092／8093／8094）
 與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，
@@ -54,9 +54,11 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 - `docs/handoffs/SESSION_HANDOFF_2026-08-04_SLICE-M2-02A.md`（調整生命週期 ＋ 覆核回饋硬化）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-04_SLICE-M2-03.md`（背景工作可靠性）
 
-`SLICE-M2-03 背景工作可靠性`已完成：`BackgroundJob` 提供租約、`claim_token` fencing、
-心跳、安全重領、冪等鍵與錯誤四分類；`VALIDATING` 已成為交易內狀態，批次不可能永久卡住
-（`docs/adr/ADR-M2-002.md`）。
+`SLICE-M2-03 背景工作可靠性`已完成並**正式關閉**：`BackgroundJob` 提供租約、`claim_token`
+fencing、心跳、安全重領、冪等鍵與錯誤四分類；`VALIDATING` 已成為交易內狀態，批次不可能
+永久卡住（`docs/adr/ADR-M2-002.md`）。2026-08-05 逐行審查的四項缺口已修正並各有邊界測試
+（失敗寫回 fencing、fence 列鎖、`RUNNING→RUNNING` 重領守衛、冪等鍵原始碼去 NUL——
+migration 0011 與 handoff 關閉章節）。
 
 下一刀依序：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest 凍結`
 → `SLICE-M2-02C 預覽證據包`。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，
