@@ -39,13 +39,12 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
-里程碑 1 與 `SLICE-M2-01` 科目映射切片均已完成。現有 6 份 migration；使用者完整實跑結果為 **92/92**（單元 12、DB 整合 35、端到端 45）。目前提交鏈：
+里程碑 1、`SLICE-M2-01` 科目映射切片與 `SLICE-M2-02A` 調整生命週期切片均已完成。
+現有 7 份 migration；完整實跑結果為 **184/184**（單元 27、DB 整合 67、端到端 90）。
 
-```text
-8f0507f 映射切片硬化：SOD 防繞過、精確金額、生效日解析
-1229305 SLICE-M2-01 科目映射切片
-fc4124b macOS bash 3.2 相容修正
-```
+**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091／8092／8093）
+與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，
+跑完以 `pnpm db:seed` 還原。
 
 2026-08-04 已另做實際瀏覽器走查：甲上傳與接受、G-02 未映射阻擋、甲建立草稿、乙批准、覆蓋率 100%、G-02 通過、PREVIEW 非正式輸出與控制總額勾稽均正常；2026-03／04 預覽也確認按報告期解析生效版本。
 
@@ -53,11 +52,14 @@ fc4124b macOS bash 3.2 相容修正
 
 `docs/handoffs/SESSION_HANDOFF_2026-08-04.md`
 
-下一個最小產品切片是：
+下一個最小工作範圍是**背景工作可靠性**（job lease／認領時間、heartbeat 或逾時判定、
+安全重領、冪等執行、worker 重啟恢復測試、卡住任務診斷）——這同時解決 backlog 裡
+`VALIDATING` 永久卡住的問題。必須排在 CalculationRun 之前，否則等於把非同步的
+CalculationRun 建在不可靠的 worker 上，後面一定重做。
 
-`Adjustment 草稿 → 雙人批准 → PREVIEW CalculationRun → CalculationInputManifest 凍結 → 證據包`
-
-開始實作前先做一頁切片與驗收清單，不擴寫大型規格，不修改兩份正式基線。另將 worker 在 `VALIDATING` 階段崩潰後缺少 lease／逾時重領的可靠性問題記入上線前 backlog。
+其後依序：`SLICE-M2-02B PREVIEW CalculationRun ＋ CalculationInputManifest 凍結`
+→ `SLICE-M2-02C 預覽證據包`。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，
+不修改兩份正式基線。
 
 ## 第一次回覆使用者時
 

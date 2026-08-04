@@ -11,6 +11,9 @@ import { acceptancePredicate, type ImportBatchStatus, type IdentityStatus }
   from "../../../packages/domain/src/importBatch.ts";
 import { applyMappings, coverage, g02Check, totalsOf, cents, fmtCents,
   type TbAccountLine, type CurrentMapping } from "../../../packages/domain/src/mapping.ts";
+import { canSubmit, canReview, canApprove, g08Check, balanceCheck, legalTransition,
+  previewOnlyJudgment, decimalOf, type AdjustmentStatus, type AdjustmentState,
+  type GuardResult } from "../../../packages/domain/src/adjustment.ts";
 
 const PORT = config.port;
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g,
@@ -381,7 +384,25 @@ account_code,account_name,debit,credit
          <p><a href="/b04/preview?batch=${g.b.import_batch_id}">→ 產生集團科目 TB 預覽</a>
             <form method="post" action="/b04/submit" style="display:inline;margin:0">
               <input type="hidden" name="batch" value="${g.b.import_batch_id}">
-              <button>映射完成確認（G-02）</button></form>　<a href="/">回 B-00</a></p>`));
+              <button>映射完成確認（G-02）</button></form>　<a href="/">回 B-00</a></p>
+         <h2>調整（B-05）</h2>
+         <form class="up" method="post" action="/b05/create">
+           <input type="hidden" name="batch" value="${g.b.import_batch_id}">
+           標題 <input name="title" size="40" value="GROUP_GAAP 調整">
+           <button>建立調整草稿（R2）</button>
+           <span class="note">本切片只收 MAJOR 重大調整，走完整三段式 R2→R3→R4</span>
+         </form>
+         ${(() => {
+           const adjs = query<Record<string, string>>(
+             `SELECT adjustment_id, title, status, business_version FROM adjustment
+               WHERE engagement_id = :'e'::uuid ORDER BY created_at DESC LIMIT 20`,
+             { e: g.b.engagement_id }, { tenantId: s.tenantId });
+           return adjs.length ? `<table><tr><th>調整</th><th>狀態</th><th>bv</th><th></th></tr>
+             ${adjs.map((a) => `<tr><td>${esc(a.title)}</td>
+               <td><span class="badge st-${a.status === "APPROVED" ? "ACCEPTED" : "UPLOADED"}">${a.status}</span></td>
+               <td>${esc(a.business_version)}</td>
+               <td><a href="/b05?adj=${a.adjustment_id}">開啟 B-05</a></td></tr>`).join("")}</table>` : "";
+         })()}`));
     }
 
     // ── 建立映射草稿 ──
@@ -524,6 +545,417 @@ account_code,account_name,debit,credit
         `<h2>✓ G-02 通過：映射完成，可進入覆核</h2>
          <p class="note">期間狀態機（IN_PREPARATION → IN_REVIEW）屬後續切片；本次僅記錄 DomainEvent。</p>
          <p><a href="/b04/preview?batch=${g.b.import_batch_id}">查看集團 TB 預覽</a>　<a href="/">回 B-00</a></p>`));
+    }
+
+    // ═══════════ SLICE-M2-02A：B-05 調整編製・覆核・批准 ═══════════
+    // 契約：docs/slices/SLICE-M2-02A_調整生命週期.md
+    // 三個守衛掛在三個不同的狀態遷移；DB 觸發器（0007）為最後防線。
+
+    interface AdjRow {
+      adjustment_id: string; engagement_id: string; period_revision_id: string;
+      status: AdjustmentStatus; title: string;
+      legal_basis: string | null; evidence_ref: string | null;
+      judgment_reason: string | null; language_tag: string | null;
+      prepared_by: string; reviewed_by: string | null; approved_by: string | null;
+      object_version: number; business_version: number;
+      output_capability: string | null; control_reasons: string[];
+      period_end: string; period_label: string; client: string;
+    }
+    interface AdjLineRow {
+      adjustment_line_id: string; line_no: number; target_account_id: string;
+      code: string; name: string; debit: string; credit: string;
+    }
+
+    const loadAdj = (adjId: string): AdjRow | null => query<AdjRow>(
+      `SELECT adj.adjustment_id, adj.engagement_id, adj.period_revision_id, adj.status, adj.title,
+              adj.legal_basis, adj.evidence_ref, adj.judgment_reason, adj.language_tag,
+              adj.prepared_by, adj.reviewed_by, adj.approved_by,
+              adj.object_version, adj.business_version,
+              adj.output_capability, adj.control_reasons,
+              rp.end_date AS period_end, rp.label AS period_label, ce.name AS client
+         FROM adjustment adj
+         JOIN client_engagement ce ON ce.engagement_id = adj.engagement_id
+         JOIN period_revision pr ON pr.period_revision_id = adj.period_revision_id
+         JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
+        WHERE adj.adjustment_id = :'a'::uuid`,
+      { a: adjId }, { tenantId: s.tenantId })[0] ?? null;
+
+    const adjLines = (adjId: string): AdjLineRow[] => query<AdjLineRow>(
+      `SELECT al.adjustment_line_id, al.line_no, al.target_account_id, al.debit, al.credit,
+              a.code, a.name
+         FROM adjustment_line al JOIN account a ON a.account_id = al.target_account_id
+        WHERE al.adjustment_id = :'a'::uuid ORDER BY al.line_no`,
+      { a: adjId }, { tenantId: s.tenantId });
+
+    /** domain 判定所需的狀態物件（與 DB 守衛同語意）。 */
+    const stateOf = (r: AdjRow, lines: AdjLineRow[]): AdjustmentState => ({
+      status: r.status, preparedBy: r.prepared_by, reviewedBy: r.reviewed_by,
+      evidence: { legalBasis: r.legal_basis, evidenceRef: r.evidence_ref,
+                  judgmentReason: r.judgment_reason, languageTag: r.language_tag },
+      lines: lines.map((l) => ({ debitCents: cents(l.debit), creditCents: cents(l.credit) })),
+    });
+
+    /** business version 里程碑快照：不可變，退回也留節點（ADR-M2-001）。 */
+    const snapshot = (r: AdjRow, lines: AdjLineRow[], bv: number, milestone: string,
+                      role: string, reasonCategory: string | null, reasonNote: string | null): void => {
+      const content = JSON.stringify({
+        title: r.title, status: r.status,
+        evidence: { legal_basis: r.legal_basis, evidence_ref: r.evidence_ref,
+                    judgment_reason: r.judgment_reason, language_tag: r.language_tag },
+        lines: lines.map((l) => ({ line_no: l.line_no, account: l.code,
+                                   debit: l.debit, credit: l.credit })),
+      });
+      exec(`INSERT INTO adjustment_version_snapshot
+              (tenant_id, adjustment_id, business_version, milestone, actor_id, acting_role,
+               reason_category, reason_note, content, content_sha256)
+            VALUES (:'t'::uuid, :'a'::uuid, ${bv}, :'m'::adjustment_milestone, :'u'::uuid,
+                    :'r'::role_code,
+                    ${reasonCategory ? ":'rc'" : "NULL"}, ${reasonNote ? ":'rn'" : "NULL"},
+                    :'c'::jsonb, :'h')`,
+        { t: s.tenantId, a: r.adjustment_id, m: milestone, u: s.userId, r: role,
+          ...(reasonCategory ? { rc: reasonCategory } : {}),
+          ...(reasonNote ? { rn: reasonNote } : {}),
+          c: content, h: createHash("sha256").update(content).digest("hex") },
+        { tenantId: s.tenantId });
+    };
+
+    /** 共通入口：調整存在＋使用者被指派該案件。 */
+    const b05Guard = (adjId: string, action: string):
+        { ok: true; r: AdjRow; roles: Set<string> } | { ok: false; res: void } => {
+      const r = loadAdj(adjId);
+      if (!r) return { ok: false, res: send(404, page("404", "", "<h2>調整不存在</h2>")) };
+      const roles = rolesOf(s, r.engagement_id);
+      if (roles.size === 0) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
+          "adjustment", adjId, { reason: "未被指派此案件", action });
+        return { ok: false, res: send(403, page("拒絕", "<b>⛔ 未被指派</b>",
+          `<h2>⛔ 未被指派此案件</h2><p>此次嘗試已寫入稽核軌跡。</p>`)) };
+      }
+      return { ok: true, r, roles };
+    };
+
+    const b05CtxBar = (r: AdjRow): string =>
+      `<span>畫面 <b>B-05 調整編製・覆核・批准</b></span><span>客戶 <b>${esc(r.client)}</b></span>` +
+      `<span>期間 <b>${esc(r.period_label)}</b></span>` +
+      `<span>調整 <b>${r.adjustment_id.slice(0, 8)}</b>（${r.status}）</span>` +
+      `<span>bv <b>${r.business_version}</b>／ov <b>${r.object_version}</b></span>`;
+
+    /** 守衛失敗的統一出口：留痕 ＋ 409。 */
+    const refuse = (r: AdjRow, action: string, g: Extract<GuardResult, { ok: false }>,
+                    extra: object = {}) => {
+      audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.rejected`, s.userId,
+        "adjustment", r.adjustment_id, { guard: g.guard, reasons: g.reasons, ...extra });
+      return send(409, page(`${g.guard} 阻擋`, b05CtxBar(r),
+        `<h2>⛔ ${esc(g.guard)}</h2><ul>${g.reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+         <p class="note">此次嘗試已寫入稽核軌跡。</p>
+         <p><a href="/b05?adj=${r.adjustment_id}">回 B-05</a></p>`));
+    };
+
+    const roleDenied = (r: AdjRow, action: string, need: string) => {
+      audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
+        "adjustment", r.adjustment_id, { reason: `需 ${need} 角色（§24.6 權限矩陣）` });
+      return send(403, page("拒絕", b05CtxBar(r), `<h2>⛔ 此操作需 ${esc(need)} 角色</h2>`));
+    };
+
+    // ── 建立調整草稿（R2） ──
+    if (url.pathname === "/b05/create" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b04Guard(f["batch"] ?? "", "adjustment.create");
+      if (!g.ok) return;
+      if (!g.roles.has("R2")) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.denied", s.userId,
+          "import_batch", g.b.import_batch_id, { reason: "編製調整需 R2 角色" });
+        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 編製調整需 R2 角色</h2>"));
+      }
+      const pr = query<{ period_revision_id: string }>(
+        `SELECT declared_period_revision_id AS period_revision_id FROM import_batch
+          WHERE import_batch_id = :'b'::uuid`,
+        { b: g.b.import_batch_id }, { tenantId: s.tenantId })[0];
+      const [row] = query<{ adjustment_id: string }>(
+        `INSERT INTO adjustment (tenant_id, engagement_id, period_revision_id, title, prepared_by)
+         VALUES (:'t'::uuid, :'e'::uuid, :'pr'::uuid, :'ti', :'u'::uuid)
+         RETURNING adjustment_id`,
+        { t: s.tenantId, e: g.b.engagement_id, pr: pr.period_revision_id,
+          ti: f["title"] || "未命名調整", u: s.userId }, { tenantId: s.tenantId });
+      audit(s.tenantId, "DOMAIN_EVENT", "adjustment.drafted", s.userId,
+        "adjustment", row.adjustment_id, { title: f["title"] ?? "" });
+      return send(302, "", { location: `/b05?adj=${row.adjustment_id}` });
+    }
+
+    // ── B-05 工作畫面 ──
+    if (url.pathname === "/b05" && req.method === "GET") {
+      const g = b05Guard(url.searchParams.get("adj") ?? "", "b05.view");
+      if (!g.ok) return;
+      const { r } = g;
+      const lines = adjLines(r.adjustment_id);
+      const st = stateOf(r, lines);
+      const g08 = g08Check(st.evidence);
+      const bal = balanceCheck(st.lines);
+      const accounts = query<Record<string, string>>(
+        `SELECT a.account_id, a.code, a.name FROM account a
+           JOIN chart_of_accounts c ON c.coa_id = a.coa_id
+          WHERE c.engagement_id = :'e'::uuid ORDER BY a.code`,
+        { e: r.engagement_id }, { tenantId: s.tenantId });
+      const snaps = query<Record<string, string>>(
+        `SELECT s.business_version, s.milestone, s.reason_category, s.reason_note,
+                s.occurred_at, u.display_name AS actor
+           FROM adjustment_version_snapshot s JOIN app_user u ON u.user_id = s.actor_id
+          WHERE s.adjustment_id = :'a'::uuid ORDER BY s.business_version`,
+        { a: r.adjustment_id }, { tenantId: s.tenantId });
+      const jl = query<{ n: string }>(
+        `SELECT count(*) AS n FROM journal_line jl
+           JOIN journal_entry je ON je.entry_id = jl.entry_id
+          WHERE je.adjustment_id = :'a'::uuid`,
+        { a: r.adjustment_id }, { tenantId: s.tenantId })[0];
+      const editable = r.status === "DRAFTING";
+      const previewOnly = r.output_capability === "PREVIEW";
+      const person = (id: string | null) => id ? esc(id.slice(-4)) : "—";
+      return send(200, page("B-05 調整編製・覆核・批准", b05CtxBar(r),
+        `${previewOnly ? `<div style="background:#fff3e0;border:1px solid #d9a05b;border-radius:6px;padding:10px 14px;font-weight:600">
+           只能預覽、不可正式交付　output_capability = PREVIEW　理由：${(r.control_reasons ?? []).map(esc).join("；")}
+         </div>` : ""}
+         <h2>${esc(r.title)}　<span class="badge st-${r.status === "APPROVED" ? "ACCEPTED" : r.status === "DRAFTING" ? "UPLOADED" : "VALIDATED"}">${r.status}</span></h2>
+         <p class="note">編製 ${person(r.prepared_by)}｜覆核 ${person(r.reviewed_by)}｜批准 ${person(r.approved_by)}
+            ｜business_version <b>${r.business_version}</b>｜object_version <b>${r.object_version}</b>
+            ｜已物化 JournalLine <b>${jl.n}</b></p>
+
+         <h2>G-08 必要證據（四項缺一不可）</h2>
+         <p>${g08.ok ? `<span class="badge st-MATCHED">齊備</span>`
+                     : `<span class="badge st-QUARANTINED">未齊</span> ${esc(g08.reasons.join("；"))}`}</p>
+         <!-- 證據永遠顯示：覆核人（R3）與批准人（R4）必須看得到要覆核的內容，
+              不能因為調整已離開草稿階段而隱藏。 -->
+         <table><tr><th>項目</th><th>內容</th></tr>
+         ${([["法源／政策依據", r.legal_basis], ["附件／支持文件", r.evidence_ref],
+             ["判斷理由", r.judgment_reason], ["語言標籤", r.language_tag]] as [string, string | null][])
+           .map(([label, v]) => `<tr><td>${label}</td><td>${v ? esc(v)
+             : `<span class="badge st-QUARANTINED">未填</span>`}</td></tr>`).join("")}
+         </table>
+         ${editable ? `<form class="up" method="post" action="/b05/save">
+           <input type="hidden" name="adj" value="${r.adjustment_id}">
+           <input type="hidden" name="base_object_version" value="${r.object_version}">
+           標題 <input name="title" size="40" value="${esc(r.title)}"><br>
+           法源／政策依據 <input name="legal_basis" size="50" value="${esc(r.legal_basis ?? "")}"><br>
+           附件／支持文件 <input name="evidence_ref" size="50" value="${esc(r.evidence_ref ?? "")}"><br>
+           判斷理由 <input name="judgment_reason" size="50" value="${esc(r.judgment_reason ?? "")}"><br>
+           語言標籤 <select name="language_tag">
+             ${["", "ja-JP", "zh-CN", "zh-TW", "en"].map((t) =>
+               `<option value="${t}"${t === (r.language_tag ?? "") ? " selected" : ""}>${t || "（未設定）"}</option>`).join("")}
+           </select><br>
+           分錄明細（每行 <code>集團科目代碼,借方,貸方</code>）<br>
+           <textarea name="lines" rows="4" cols="60">${esc(lines.map((l) => `${l.code},${l.debit},${l.credit}`).join("\n"))}</textarea><br>
+           <button>儲存草稿</button>
+           <span class="note">儲存只遞增 object_version（併發控制），不產生 business_version 節點</span>
+         </form>` : ""}
+
+         <h2>分錄明細</h2>
+         <table><tr><th>#</th><th>集團科目</th><th>名稱</th><th>借方</th><th>貸方</th></tr>
+         ${lines.map((l) => `<tr><td>${l.line_no}</td><td>${esc(l.code)}</td><td>${esc(l.name)}</td>
+           <td style="text-align:right">${esc(l.debit)}</td><td style="text-align:right">${esc(l.credit)}</td></tr>`).join("")}
+         </table>
+         <p>借貸 ${bal.ok ? `<span class="badge st-MATCHED">平衡</span>`
+                          : `<span class="badge st-QUARANTINED">${esc(bal.reasons.join("；"))}</span>`}</p>
+         <p class="note">可用集團科目：${accounts.map((a) => esc(a.code)).join("、")}</p>
+
+         <h2>工作流</h2>
+         <p>
+         ${r.status === "DRAFTING" ? `<form method="post" action="/b05/submit" style="display:inline">
+            <input type="hidden" name="adj" value="${r.adjustment_id}"><button>送覆核（R2）</button></form>` : ""}
+         ${r.status === "PENDING_REVIEW" ? `<form method="post" action="/b05/review" style="display:inline">
+            <input type="hidden" name="adj" value="${r.adjustment_id}"><button>覆核通過（R3）</button></form>` : ""}
+         ${r.status === "PENDING_APPROVAL" ? `<form method="post" action="/b05/approve" style="display:inline">
+            <input type="hidden" name="adj" value="${r.adjustment_id}"><button>批准（R4）</button></form>` : ""}
+         ${r.status === "PENDING_REVIEW" || r.status === "PENDING_APPROVAL"
+           ? `<form method="post" action="/b05/return" style="display:inline">
+              <input type="hidden" name="adj" value="${r.adjustment_id}">
+              理由分類 <select name="reason_category">
+                <option>MISSING_EVIDENCE</option><option>CALCULATION_ERROR</option>
+                <option>POLICY_MISMATCH</option><option>OTHER</option></select>
+              <input name="reason_note" size="24" placeholder="說明（必填）">
+              <button>退回至草稿</button></form>` : ""}
+         </p>
+         <p class="note">SOD-01 編製人不得覆核自己｜SOD-02 覆核人不得兼批准｜
+            AC-WFL-001 編製人不得批准自己（三者為自然人判定，具備角色也不得自我放行）</p>
+
+         <h2>business version 里程碑</h2>
+         <table><tr><th>bv</th><th>里程碑</th><th>操作人</th><th>理由分類</th><th>說明</th><th>時間</th></tr>
+         ${snaps.map((v) => `<tr><td>${esc(v.business_version)}</td><td>${esc(v.milestone)}</td>
+           <td>${esc(v.actor)}</td><td>${esc(v.reason_category ?? "")}</td>
+           <td>${esc(v.reason_note ?? "")}</td><td class="note">${esc(v.occurred_at)}</td></tr>`).join("")}
+         </table>
+         <p class="note">退回不建立新調整、不建立替代版本；但退回是業務里程碑，留下不可變節點（ADR-M2-001）。</p>
+         <p><a href="/">回 B-00</a></p>`));
+    }
+
+    // ── 儲存草稿（object_version 樂觀鎖；不產生 business_version） ──
+    if (url.pathname === "/b05/save" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b05Guard(f["adj"] ?? "", "adjustment.save");
+      if (!g.ok) return;
+      const { r } = g;
+      if (r.status !== "DRAFTING")
+        return refuse(r, "adjustment.save",
+          { ok: false, guard: "狀態", reasons: [`調整已離開草稿階段（${r.status}），不可編輯`] });
+      const base = Number(f["base_object_version"] ?? "0");
+      const updated = query<{ object_version: number }>(
+        `UPDATE adjustment SET title = :'ti', legal_basis = :'lb', evidence_ref = :'er',
+                judgment_reason = :'jr', language_tag = :'lt',
+                object_version = object_version + 1
+          WHERE adjustment_id = :'a'::uuid AND object_version = ${base}
+          RETURNING object_version`,
+        { a: r.adjustment_id, ti: f["title"] ?? r.title, lb: f["legal_basis"] ?? "",
+          er: f["evidence_ref"] ?? "", jr: f["judgment_reason"] ?? "", lt: f["language_tag"] ?? "" },
+        { tenantId: s.tenantId });
+      if (updated.length === 0) {
+        // 樂觀鎖衝突：拒絕並顯示，絕不靜默覆蓋（§26.9）
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.save.conflict", s.userId,
+          "adjustment", r.adjustment_id,
+          { reason: "object_version 衝突", base_object_version: base, current: r.object_version });
+        return send(409, page("併發衝突", b05CtxBar(r),
+          `<h2>⛔ 併發衝突：草稿已被他人更新</h2>
+           <p>你根據的版本 ov=${base}，目前為 ov=${r.object_version}。</p>
+           <p class="note">系統不會靜默覆蓋他人的修改。請重新載入後再編輯。</p>
+           <p><a href="/b05?adj=${r.adjustment_id}">重新載入 B-05</a></p>`));
+      }
+      // 明細：整批重寫（草稿階段；離開 DRAFTING 後由 DB 觸發器凍結）
+      const raw = (f["lines"] ?? "").replace(/\r\n/g, "\n").split("\n")
+        .map((x) => x.trim()).filter(Boolean);
+      exec(`DELETE FROM adjustment_line WHERE adjustment_id = :'a'::uuid`,
+        { a: r.adjustment_id }, { tenantId: s.tenantId });
+      let n = 0;
+      for (const line of raw) {
+        const [code = "", d = "0", c = "0"] = line.split(",").map((x) => x.trim());
+        const acc = query<{ account_id: string }>(
+          `SELECT a.account_id FROM account a JOIN chart_of_accounts ch ON ch.coa_id = a.coa_id
+            WHERE ch.engagement_id = :'e'::uuid AND a.code = :'c'`,
+          { e: r.engagement_id, c: code }, { tenantId: s.tenantId })[0];
+        if (!acc) continue;              // 未知科目略過；歸屬由 DB 觸發器兜底
+        n += 1;
+        exec(`INSERT INTO adjustment_line (tenant_id, adjustment_id, line_no, target_account_id, debit, credit)
+              VALUES (:'t'::uuid, :'a'::uuid, ${n}, :'ac'::uuid, :'d'::numeric, :'cr'::numeric)`,
+          { t: s.tenantId, a: r.adjustment_id, ac: acc.account_id,
+            d: decimalOf(cents(d)), cr: decimalOf(cents(c)) }, { tenantId: s.tenantId });
+      }
+      audit(s.tenantId, "DOMAIN_EVENT", "adjustment.draft_saved", s.userId,
+        "adjustment", r.adjustment_id, { object_version: updated[0].object_version, lines: n });
+      return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
+    }
+
+    // ── 送覆核（R2；G-08 ＋ 分錄成立性） ──
+    if (url.pathname === "/b05/submit" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b05Guard(f["adj"] ?? "", "adjustment.submit");
+      if (!g.ok) return;
+      const { r } = g;
+      if (!g.roles.has("R2")) return roleDenied(r, "adjustment.submit", "R2");
+      const lines = adjLines(r.adjustment_id);
+      const verdict = canSubmit(stateOf(r, lines));
+      if (!verdict.ok) return refuse(r, "adjustment.submit", verdict);
+      const bv = r.business_version + 1;
+      exec(`UPDATE adjustment SET status = 'PENDING_REVIEW', business_version = ${bv}
+             WHERE adjustment_id = :'a'::uuid`, { a: r.adjustment_id }, { tenantId: s.tenantId });
+      snapshot({ ...r, status: "PENDING_REVIEW" }, lines, bv, "SUBMITTED", "R2", null, null);
+      audit(s.tenantId, "DOMAIN_EVENT", "adjustment.submitted", s.userId,
+        "adjustment", r.adjustment_id, { business_version: bv });
+      return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
+    }
+
+    // ── 覆核通過（R3；G-04／SOD-01） ──
+    if (url.pathname === "/b05/review" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b05Guard(f["adj"] ?? "", "adjustment.review");
+      if (!g.ok) return;
+      const { r } = g;
+      if (!g.roles.has("R3")) return roleDenied(r, "adjustment.review", "R3");
+      const lines = adjLines(r.adjustment_id);
+      const verdict = canReview(stateOf(r, lines), s.userId);
+      if (!verdict.ok) {
+        // G-04 失敗 → 只能預覽（§25.9 L862）。02A 不產生預覽檔，只記錄資格與理由。
+        if (verdict.guard === "G-04／SOD-01") {
+          const j = previewOnlyJudgment([verdict.guard, ...verdict.reasons]);
+          exec(`UPDATE adjustment SET output_capability = :'oc', control_reasons = :'cr'::jsonb
+                 WHERE adjustment_id = :'a'::uuid`,
+            { a: r.adjustment_id, oc: j.outputCapability, cr: JSON.stringify(j.reasons) },
+            { tenantId: s.tenantId });
+        }
+        return refuse(r, "adjustment.review", verdict);
+      }
+      const bv = r.business_version + 1;
+      exec(`UPDATE adjustment SET status = 'PENDING_APPROVAL', reviewed_by = :'u'::uuid,
+                 reviewed_at = now(), business_version = ${bv}
+             WHERE adjustment_id = :'a'::uuid`,
+        { a: r.adjustment_id, u: s.userId }, { tenantId: s.tenantId });
+      snapshot({ ...r, status: "PENDING_APPROVAL" }, lines, bv, "REVIEWED", "R3", null, null);
+      audit(s.tenantId, "DOMAIN_EVENT", "adjustment.reviewed", s.userId,
+        "adjustment", r.adjustment_id, { business_version: bv });
+      return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
+    }
+
+    // ── 退回至草稿（兩個節點皆可；理由必填） ──
+    if (url.pathname === "/b05/return" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b05Guard(f["adj"] ?? "", "adjustment.return");
+      if (!g.ok) return;
+      const { r } = g;
+      const need = r.status === "PENDING_REVIEW" ? "R3" : "R4";
+      if (!g.roles.has(need)) return roleDenied(r, "adjustment.return", need);
+      const t = legalTransition(r.status, "DRAFTING");
+      if (!t.ok) return refuse(r, "adjustment.return", t);
+      const category = (f["reason_category"] ?? "").trim();
+      const note = (f["reason_note"] ?? "").trim();
+      if (!category || !note)
+        return refuse(r, "adjustment.return",
+          { ok: false, guard: "退回理由", reasons: ["退回必須記錄理由分類與說明（§25.12）"] });
+      const lines = adjLines(r.adjustment_id);
+      const bv = r.business_version + 1;
+      // 從 PENDING_APPROVAL 退回：既有覆核失效，修正後須重新覆核（§25.12 L911）
+      const clearReview = r.status === "PENDING_APPROVAL";
+      exec(`UPDATE adjustment SET status = 'DRAFTING', business_version = ${bv}
+                 ${clearReview ? ", reviewed_by = NULL, reviewed_at = NULL" : ""}
+             WHERE adjustment_id = :'a'::uuid`, { a: r.adjustment_id }, { tenantId: s.tenantId });
+      snapshot({ ...r, status: "DRAFTING" }, lines, bv, "RETURNED", need, category, note);
+      audit(s.tenantId, "DOMAIN_EVENT", "adjustment.returned", s.userId,
+        "adjustment", r.adjustment_id,
+        { from: r.status, business_version: bv, reason_category: category,
+          review_invalidated: clearReview });
+      return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
+    }
+
+    // ── 批准（R4；G-08 複查 ＋ G-05／SOD-02 ＋ AC-WFL-001）＋ 同交易物化 ──
+    if (url.pathname === "/b05/approve" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const g = b05Guard(f["adj"] ?? "", "adjustment.approve");
+      if (!g.ok) return;
+      const { r } = g;
+      if (!g.roles.has("R4")) return roleDenied(r, "adjustment.approve", "R4");
+      const lines = adjLines(r.adjustment_id);
+      const verdict = canApprove(stateOf(r, lines), s.userId);
+      if (!verdict.ok) return refuse(r, "adjustment.approve", verdict);
+      const bv = r.business_version + 1;
+      // 批准與物化必須在同一交易：批准失敗不得留下殘留分錄（切片驗收 11）。
+      // psql 單次呼叫＋BEGIN/COMMIT＝單一交易；ON_ERROR_STOP=1 使中途失敗整批回滾。
+      const entryId = randomUUID();
+      const values = lines.map((l, i) =>
+        `('${s.tenantId}'::uuid, '${entryId}'::uuid, ${i + 1}, '${l.target_account_id}'::uuid,` +
+        ` ${decimalOf(cents(l.debit))}, ${decimalOf(cents(l.credit))})`).join(",\n               ");
+      exec(`BEGIN;
+            UPDATE adjustment SET status = 'APPROVED', approved_by = :'u'::uuid,
+                   approved_at = now(), business_version = ${bv}
+             WHERE adjustment_id = :'a'::uuid;
+            INSERT INTO journal_entry (entry_id, tenant_id, engagement_id, period_revision_id,
+                    adjustment_id, business_version, entry_date)
+            VALUES ('${entryId}'::uuid, :'t'::uuid, :'e'::uuid, :'pr'::uuid,
+                    :'a'::uuid, ${bv}, :'ed'::date);
+            INSERT INTO journal_line (tenant_id, entry_id, line_no, account_id, debit, credit)
+            VALUES ${values};
+            COMMIT;`,
+        { a: r.adjustment_id, u: s.userId, t: s.tenantId, e: r.engagement_id,
+          pr: r.period_revision_id, ed: r.period_end }, { tenantId: s.tenantId });
+      snapshot({ ...r, status: "APPROVED" }, lines, bv, "APPROVED", "R4", null, null);
+      audit(s.tenantId, "DOMAIN_EVENT", "adjustment.approved", s.userId,
+        "adjustment", r.adjustment_id, { business_version: bv });
+      audit(s.tenantId, "DOMAIN_EVENT", "journal.materialized", s.userId,
+        "adjustment", r.adjustment_id, { entry_id: entryId, lines: lines.length });
+      return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
     }
 
     send(404, page("404", "", "<h2>找不到頁面</h2>"));
