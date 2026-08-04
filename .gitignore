@@ -1,0 +1,8 @@
+node_modules/
+.pnpm-store/
+.env.local
+var/
+infra/local/
+*.log
+*.tsbuildinfo
+.DS_Store

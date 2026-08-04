@@ -1,0 +1,32 @@
+# 開發基礎設施（macOS＋Docker Desktop）。應用程式在 Host 上執行，不進容器。
+# 資料存於 named volume——容器重啟不遺失（needs: docker compose up -d）。
+services:
+  db:
+    image: postgres:16
+    container_name: cbfc-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-dev}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-dev}
+      POSTGRES_DB: ${DB_NAME:-cbfc_dev}
+    ports: ["${DB_PORT:-5433}:5432"]
+    volumes: [dbdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-dev} -d ${DB_NAME:-cbfc_dev}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7
+    container_name: cbfc-redis
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+  minio:
+    image: minio/minio
+    container_name: cbfc-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-dev}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-devdevdev}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [objdata:/data]
+volumes: { dbdata: {}, redisdata: {}, objdata: {} }
