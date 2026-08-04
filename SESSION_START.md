@@ -37,28 +37,27 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 
 ## 目前進度與下一步
 
-環境重構已完成兩個 commit，業務規則、資料模型及狀態機沒有被修改。`pnpm install` 與單元測試已可執行；完整 DB／端到端測試宣稱為 48/48，舊 acceptance test 的 `|| true` 假陽性已移除。由於先前執行環境沒有 Docker daemon，仍需在使用者的 Mac 實機完成最後驗證：
+macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
-盤點時已知還有一個小缺口：Docker Compose 預設自動讀取的是 `.env`，不是 `.env.local`。目前 Compose 有預設值，所以不改設定時可以啟動；但只要使用者修改 `.env.local` 的 DB port／帳密，Compose 與應用就會不一致。實機驗證前須將 README 與固定指令統一為 `docker compose --env-file .env.local ...`，或提供等價的單一包裝指令；不要再維護第二份 `.env`。
+里程碑 1 與 `SLICE-M2-01` 科目映射切片均已完成。現有 6 份 migration；使用者完整實跑結果為 **92/92**（單元 12、DB 整合 35、端到端 45）。目前提交鏈：
 
-```bash
-cp .env.example .env.local
-docker compose --env-file .env.local up -d
-docker compose --env-file .env.local ps
-pnpm install
-pnpm db:migrate
-pnpm db:seed
-pnpm test
-pnpm dev
+```text
+8f0507f 映射切片硬化：SOD 防繞過、精確金額、生效日解析
+1229305 SLICE-M2-01 科目映射切片
+fc4124b macOS bash 3.2 相容修正
 ```
 
-驗證瀏覽器可開啟 `http://localhost:8080`，並確認 `docker compose --env-file .env.local restart` 後資料仍存在。若失敗，先診斷並修好 Mac 開發基線；不要同時開始里程碑 2。
+2026-08-04 已另做實際瀏覽器走查：甲上傳與接受、G-02 未映射阻擋、甲建立草稿、乙批准、覆蓋率 100%、G-02 通過、PREVIEW 非正式輸出與控制總額勾稽均正常；2026-03／04 預覽也確認按報告期解析生效版本。
 
-Mac 基線通過後，下一個產品里程碑才是：
+完整對話、證據、走查資料與接續注意事項見：
 
-`科目映射 → 集團科目 TB → Adjustment 草稿 → PREVIEW CalculationRun → 證據包`
+`docs/handoffs/SESSION_HANDOFF_2026-08-04.md`
 
-開始該里程碑前，先把要件手冊中的對應 REQ／AC 與基本設計書 §24～§28 做成一個小型實作切片及驗收清單，不再擴寫新的大型規格文件。新想法記入 `docs/BACKLOG.md`；只有符合 `docs/GOVERNANCE.md` 的四種例外才修改基線。
+下一個最小產品切片是：
+
+`Adjustment 草稿 → 雙人批准 → PREVIEW CalculationRun → CalculationInputManifest 凍結 → 證據包`
+
+開始實作前先做一頁切片與驗收清單，不擴寫大型規格，不修改兩份正式基線。另將 worker 在 `VALIDATING` 階段崩潰後缺少 lease／逾時重領的可靠性問題記入上線前 backlog。
 
 ## 第一次回覆使用者時
 

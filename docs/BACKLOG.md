@@ -12,3 +12,4 @@
 | 2026-08-04 | 集團 TB 預覽的輸入凍結（CalculationInputManifest）——現用目前生效映射，屬下一刀 CalculationRun | SLICE-M2-01 | 不需改基線 |
 | 2026-08-04 | UNVERIFIABLE 批次的人工確認 UI（SourceIdentityResolution 已有 DB 防線與 SOD-07，缺畫面） | 里程碑 1 | 不需改基線 |
 | 2026-08-04 | 映射草稿的刪除／撤回操作（現只能改版不能清草稿） | SLICE-M2-01 | 不需改基線 |
+| 2026-08-04 | Worker 認領後若在 `VALIDATING` 階段崩潰，需有 lease／heartbeat、逾時重領或安全隔離與重試；補重啟恢復整合測試及管理者診斷 | 2026-08-04 實際瀏覽器走查 | 不需改基線 |
