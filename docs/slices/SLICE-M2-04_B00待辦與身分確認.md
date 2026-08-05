@@ -45,10 +45,13 @@ resolved_by`，歸屬、版本、角色與狀態皆可被直接 SQL 繞過。
 4. **確認頁**：宣告目標（客戶×法人×期間＋法人權威代碼）、**全部** Assessment 列
    （evidence_kind、偵測值、match_result、識別規則版本、別名表版本、評估時間——
    多筆並存全部顯示）、批次版本與檔案雜湊、必填理由、選填證據參照。
-5. **提交必須明確選定 assessment**：`POST` 攜帶 `assessment_id`；伺服器重新驗證
-   它是**該批次目前版本**的 **UNVERIFIABLE** 評估（非最新、非第一筆的模糊取法）；
-   Resolution 凍結**該筆** assessment 的規則版本。同批次存在新舊兩筆評估時，
-   只能解析明確選定且仍有效的那一筆（測試明列）。
+5. **提交必須明確選定 assessment，「仍有效」＝current 指標**：0019 於 `import_batch`
+   增 `current_identity_assessment_id`——worker 建立 Assessment 時**同一交易**更新
+   此指標；人工確認**只能選中該 ID**（歷史 Assessment 全部顯示，但只有 current
+   可提交）；Resolution 明確保存 assessment ID 與該筆規則版本；重解析切換 current
+   後，舊 Resolution 不自動沿用（CTX-e）。`POST` 攜帶 `assessment_id`，伺服器重驗
+   「＝current ∧ 該批次目前版本 ∧ UNVERIFIABLE」。同批次新舊兩筆評估並存時，
+   只能解析明確選定且＝current 的那一筆（測試明列）。
 6. **資料接受角色＝R2（本刀）**；客戶政策指定角色屬後續，如實標示。
 7. **SOD-07 應用層先判**：上傳者可開啟確認頁但提交 403＋CVA；DB 為最後防線。
 8. **確認＝單一交易**：Resolution＋`identity_status → MANUALLY_RESOLVED`＋DomainEvent
@@ -59,12 +62,24 @@ resolved_by`，歸屬、版本、角色與狀態皆可被直接 SQL 繞過。
    - assessment、resolution、batch **同租戶且同批次**；
    - 三者 `batch_version` 相同，**且等於批次目前版本**；
    - 該 assessment 的 `match_result = 'UNVERIFIABLE'`；
+   - **`assessment_id ＝ import_batch.current_identity_assessment_id`**（重解析後
+     舊評估不可沿用）；
    - `resolved_by` 為有效使用者，且對該案件具**有效 R2 指派**；
-   - 批次處於允許確認的狀態（非 QUARANTINED／SUPERSEDED）；
-   並修 `fn_import_batch_guard`：**`identity_status` 遷移至 `MANUALLY_RESOLVED`
-   必須存在對應的有效 Resolution**——0018 同狀態提前返回使直接 SQL 可繞過
-   Resolution 改寫 identity_status，此門必須關（同時保留 worker 寫入
-   MATCHED／PENDING_CONFIRMATION／CONFLICT 的既有路徑）。
+   - **允許確認狀態＝正向白名單**：`import_batch.status = 'VALIDATED'` ∧
+     `identity_status = 'PENDING_CONFIRMATION'`（不是「非 QUARANTINED／SUPERSEDED」
+     的負向表述——DRAFT／UPLOADED／VALIDATING／ACCEPTED 一律不可確認）；
+   - **並發要求**：guard 以 `FOR UPDATE` 鎖住 ImportBatch 列**與當下使用的 R2
+     `role_assignment` 列**——「資格檢查通過」到交易提交之間，批次狀態變更與
+     角色撤銷不得交錯。
+   並修 `fn_import_batch_guard` 的 identity 遷移白名單：
+   - `NOT_CHECKED → MATCHED／PENDING_CONFIRMATION／CONFLICT`：**僅限
+     `status = 'VALIDATING'` 階段**（worker 交易內寫入的唯一合法路徑，
+     不作「保留既有路徑」的籠統描述）；
+   - `PENDING_CONFIRMATION → MANUALLY_RESOLVED`：僅限 `status = 'VALIDATED'`
+     且**已存在對應 current assessment 的有效 Resolution**；
+   - `current_identity_assessment_id` 只能於 `VALIDATING` 階段更新；
+   - 其他 identity 遷移一律拒絕——關掉 0018 同狀態提前返回留下的
+     「直接 SQL 改寫 identity_status」後門。
 10. **CVA 邊界（§25.18）**：權限、指派、SOD-07、繞過狀態守衛的拒絕寫 CVA；
     **理由空白等一般欄位驗證錯誤回 409＋機器代碼，不寫 CVA**（不得把欄位錯誤
     灌進不可變軌跡）。
@@ -80,12 +95,12 @@ resolved_by`，歸屬、版本、角色與狀態皆可被直接 SQL 繞過。
 | 4 | **三人分離**：甲編製→乙見待覆核（甲不見）；乙覆核後→**只有丙見待批准，甲、乙皆不見**（AC-WFL-001＋SOD-02） |
 | 5 | **R6 負面**：系管丁登入 B-00 看不到任何客戶名稱、計數與明細（租戶層角色不取得客戶工作存取權） |
 | 6 | 確認頁完整呈現（決策 4）；同批次多筆 assessment 全部顯示 |
-| 7 | 提交攜帶 `assessment_id`；選定過期版本或非 UNVERIFIABLE 評估 → 409 拒絕；**同批次新舊兩筆評估並存時，只能解析明確選定且仍有效的那一筆** |
+| 7 | 提交攜帶 `assessment_id`；選定非 current、過期版本或非 UNVERIFIABLE 評估 → 409 拒絕；**同批次新舊兩筆評估並存時，只能解析明確選定且＝current 的那一筆**；worker 建立 Assessment 與更新 current 指標同一交易 |
 | 8 | 角色與 SOD：非 R2 提交 → 403＋CVA；上傳者本人提交 → 403＋CVA（應用層），直接 SQL 由 DB 觸發器拒絕；**理由空白 → 409＋機器代碼，不寫 CVA** |
 | 9 | 確認單一交易：Resolution＋MANUALLY_RESOLVED＋DomainEvent 同生共死；payload 含理由／證據參照／該筆 assessment 規則版本 |
 | 10 | 確認後可接受（G-01）；**確認不自動接受**（CTX-g）；CONFLICT 不入佇列且不可確認（CTX-c） |
 | 11 | 效力只及批次版本（CTX-e）：新批次版本需重新確認，原紀錄並存不可覆寫 |
-| 12 | **0019 防繞過（DB 測試逐條）**：跨租戶／跨批次 assessment 拒絕；batch_version 三方不一致或≠批次目前版本拒絕；對 MATCH／CONFLICT 評估建 Resolution 拒絕；resolved_by 無該案件有效 R2 指派拒絕；QUARANTINED 批次拒絕；**無 Resolution 直接 UPDATE identity_status=MANUALLY_RESOLVED 拒絕** |
+| 12 | **0019 防繞過（DB 測試逐條）**：跨租戶／跨批次 assessment 拒絕；batch_version 三方不一致拒絕；非 current assessment 拒絕；對 MATCH／CONFLICT 評估建 Resolution 拒絕；resolved_by 無該案件有效 R2 指派拒絕；**狀態白名單**（非 VALIDATED＋PENDING_CONFIRMATION 一律拒絕）；identity 遷移白名單（非 VALIDATING 階段寫入判定拒絕、已判定不得改寫、**無 Resolution 直接 UPDATE 為 MANUALLY_RESOLVED 拒絕**） |
 | 13 | 既有 427 條零退化 |
 
 ## 明確不做（B-00 P1 或後續刀）
@@ -94,6 +109,8 @@ resolved_by`，歸屬、版本、角色與狀態皆可被直接 SQL 繞過。
 Session 恢復（第 4 刀）；期間生命週期；別名表管理；游標級回位；R1 表面 A；
 客戶政策指定資料接受角色；粒度不足升級佇列（隨多基礎／規則刀）。
 
-**流程**：本文件走查通過 → **migration 0019** → domain／query → API／B-00 →
-三層測試（0019 防繞過逐條＋佇列過濾＋SOD 呈現＋確認交易原子性）→ Case-001 走查
-（no-id 批次確認→接受全流程）→ 更新 handoff → 期間生命週期切片。
+**流程**：本文件定稿（2026-08-05 二輪走查通過）→ **migration 0019（含 current
+assessment 指標）** → worker 寫入 current 指標（與 Assessment 同交易）→
+domain／query → API／B-00 → 三層測試（0019 防繞過逐條＋佇列過濾＋SOD 呈現＋
+確認交易原子性）→ Case-001 走查（no-id 批次確認→接受全流程）→ 更新 handoff →
+期間生命週期切片。
