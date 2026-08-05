@@ -69,9 +69,8 @@ ADJUSTMENT 兩層，`NO_FX` 未折算）＋ B-06 骨架；Case-001 調整後集�
 詳 `docs/slices/SLICE-M2-02B_PREVIEW_CalculationRun與輸入凍結.md` 與
 `docs/handoffs/SESSION_HANDOFF_2026-08-05_SLICE-M2-02B.md`。
 
-下一刀：`SLICE-M2-02C 預覽證據包`（開工前 `mapping_rule` 事件原子化須先修正——
-BACKLOG 既定期限）。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，
-不修改兩份正式基線。
+下一刀：`SLICE-M2-02C 預覽證據包`（前置的 `mapping_rule` 事件原子化已於 2026-08-05
+完成）。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，不修改兩份正式基線。
 
 ## 第一次回覆使用者時
 
