@@ -41,3 +41,25 @@ OFFICIAL run／交付；02C 證據包；未批准調整入 PREVIEW；折算（MV
 SUPERSEDED 失效鏈。**02C 開工前必修**：`mapping_rule` 事件原子化（BACKLOG 既定期限）。
 
 **下一刀**：`SLICE-M2-02C 預覽證據包`（先寫一頁切片與驗收清單）。
+
+## 2026-08-05 關閉章節（逐行審查四缺口＋兩項次要邊界）
+
+上方寫於首輪 347/347 之後；使用者逐行審查發現四個弱化「凍結、不可變、
+DB 最後防線」宣稱的缺口，已全部修正（migration 0013），切片自此正式關閉。
+
+| # | 缺口 | 修正 |
+|---|---|---|
+| ① | entry 只禁 UPDATE/DELETE，Run 建立後仍可 INSERT；worker 未重算 frozen_set_content_hash；hash 只蓋 canonical、計算卻讀 payload——單獨竄改 payload 偵測不到 | Manifest 封存觸發器（有 Run 引用即拒絕新 entry）；worker 補集合層 hash 重算；canonicalization 升 **v2**（content_hash 涵蓋 canonical＋payload::text），驗證端依 manifest 記錄的版本分流（INT-e3） |
+| ② | balance_snapshot_line 可向終態 Run 追加新列——result_content_hash 固定後結果仍可變 | 快照 INSERT 觸發器：父 Run 必須 RUNNING；DB 測試改於 RUNNING 階段寫入並新增終態拒絕案例 |
+| ③ | 新表只有 RLS（看列自身 tenant_id），無父項歸屬守衛——0008 已防過的 FK＋RLS 缺口在新表重演 | entry↔Manifest、Run↔Manifest／batch／created_by、snapshot↔Run 的租戶／案件／期間一致性觸發器（§24.1A／INV-18） |
+| ④ | 建立交易用預設 READ COMMITTED——逐 statement 換 snapshot，「同一 snapshot」只對 TEMP 物化的映射集合成立 | 建立交易改 `BEGIN ISOLATION LEVEL REPEATABLE READ`（TB／映射／調整／CoA 同一快照） |
+
+次要：request_key 唯一改 **(tenant_id, request_key)**（跨租戶 UUID 碰撞不互相阻擋，
+API 併發回查同步改約束名）；終態欄位互斥（COMPLETED 無失敗欄位、FAILED 無結果
+欄位、RUNNING／建立時不得預填）。
+
+新增測試：DB 整合 147 → 157（封存、終態快照拒絕、三類歸屬、互斥三態、約束改名）；
+端到端 21 → 23（**單獨竄改 payload → replay FAILED**、**封存後追加 entry 被 DB 拒絕**）。
+
+**測試 347 → 359（單元 43、DB 整合 157、端到端 159），全綠。**
+下一步依序：`mapping_rule` 事件原子化（BACKLOG 既定期限）→ `SLICE-M2-02C 預覽證據包`。

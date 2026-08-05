@@ -10,8 +10,13 @@ export type CalculationRunStatus = "RUNNING" | "COMPLETED" | "FAILED" | "SUPERSE
 
 /** 計算引擎版本：入 manifest（引擎升級也可能改變結果，§25.3）。 */
 export const ENGINE_VERSION = "calc-engine-1";
-/** canonical 序列化版本：入 manifest（序列化一改，內容相同也會算出不同雜湊，§26.9）。 */
-export const CANONICALIZATION_VERSION = "sqlcanon-1";
+/**
+ * canonical 序列化版本：入 manifest（序列化一改，內容相同也會算出不同雜湊，§26.9）。
+ * v2（0013 hardening）：content_hash 涵蓋 content_canonical ＋ payload::text——
+ * 計算實際讀的是 payload，只 hash canonical 會讓單獨竄改 payload 無法偵測。
+ * 驗證端依 manifest 記錄的版本分流（INT-e3：標準化版本不得造成假性失敗）。
+ */
+export const CANONICALIZATION_VERSION = "sqlcanon-2";
 
 const LEGAL: Record<CalculationRunStatus, CalculationRunStatus[]> = {
   RUNNING: ["COMPLETED", "FAILED"],

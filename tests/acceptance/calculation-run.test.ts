@@ -219,6 +219,30 @@ try {
     sql(`SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='${REPLAY2}'`) === "0"
     && runField(RUN1, "status") === "COMPLETED");
 
+  // 10b 單獨竄改 payload（canonical 完好）→ v2 hash 仍偵測（0013①）
+  sql(`ALTER TABLE calculation_manifest_entry DISABLE TRIGGER trg_cme_immutable`);
+  sql(`UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{0,debit}','"999999.00"')
+       WHERE object_type='SOURCE_TB' AND manifest_id =
+         (SELECT manifest_id FROM calculation_run WHERE calculation_run_id='${RUN2}')`);
+  sql(`ALTER TABLE calculation_manifest_entry ENABLE TRIGGER trg_cme_immutable`);
+  await post(jia, "/b06/replay", { run: RUN2 });
+  const REPLAY3 = sql(`SELECT calculation_run_id FROM calculation_run WHERE replay_of_run_id='${RUN2}'`);
+  check("單獨竄改 payload → replay FAILED（content_hash v2 涵蓋 payload）",
+    await waitFor(() => runField(REPLAY3, "status") === "FAILED", 20000)
+    && runField(REPLAY3, "failure_reason_code") === "REPLAY_FAILED"
+    && runField(RUN2, "status") === "COMPLETED",
+    `replay3=${runField(REPLAY3, "status")}`);
+
+  // 10c Manifest 封存：Run 建立後不得追加 entry（0013①，DB 最後防線）
+  let sealErr = "";
+  try {
+    sql(`INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type,
+           domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+         SELECT tenant_id, manifest_id, 'SCOPE', 'SCOPE', '99', 'x', 'x', '{}'::jsonb
+           FROM calculation_run WHERE calculation_run_id='${RUN1}'`);
+  } catch (e) { sealErr = String(e); }
+  check("Manifest 封存：Run 建立後追加 entry 被 DB 拒絕", sealErr.includes("封存"));
+
   // 11 單一真相來源：Run 終態與 Job 終態不存在矛盾組合
   check("無矛盾組合：Run 終態 ⇔ Job 終態（全庫掃描）",
     sql(`SELECT count(*) FROM calculation_run r

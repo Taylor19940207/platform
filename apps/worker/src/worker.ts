@@ -334,14 +334,27 @@ function commitCalcResult(j: ClaimedCalc): void {
         SELECT fn_assert((SELECT status = 'RUNNING' FROM calculation_run
           WHERE calculation_run_id = ${RUN}::uuid), 'RUN_NOT_RUNNING');
 
-        -- INV-29：凍結內容存在且逐筆雜湊相符（依 manifest 的演算法與標準化版本）
+        -- INV-29：凍結內容存在且逐筆雜湊相符——依 manifest 記錄的標準化版本分流驗證
+        -- （INT-e3）。v2 涵蓋 canonical＋payload：計算實際讀 payload，兩者都要驗。
         SELECT fn_assert((SELECT count(*) FROM calculation_manifest_entry
           WHERE manifest_id = ${M}::uuid) > 0, 'REPLAY_FAILED:MANIFEST_EMPTY');
         SELECT fn_assert(NOT EXISTS (
-          SELECT 1 FROM calculation_manifest_entry
-           WHERE manifest_id = ${M}::uuid
-             AND encode(sha256(convert_to(content_canonical,'UTF8')),'hex') <> content_hash),
+          SELECT 1 FROM calculation_manifest_entry e
+            JOIN calculation_input_manifest m ON m.manifest_id = e.manifest_id
+           WHERE e.manifest_id = ${M}::uuid
+             AND encode(sha256(convert_to(
+                   CASE WHEN m.canonicalization_version = 'sqlcanon-1'
+                        THEN e.content_canonical
+                        ELSE e.content_canonical || E'\n' || e.payload::text END,'UTF8')),'hex')
+                 <> e.content_hash),
           'REPLAY_FAILED:CONTENT_HASH_MISMATCH');
+        -- 集合層：重算 frozen_set_content_hash——偵測 entry 集合被擴充或抽換
+        SELECT fn_assert(
+          (SELECT frozen_set_content_hash FROM calculation_input_manifest
+            WHERE manifest_id = ${M}::uuid)
+          = encode(sha256(convert_to((SELECT string_agg(content_hash, E'\n' ORDER BY content_canonical)
+              FROM calculation_manifest_entry WHERE manifest_id = ${M}::uuid),'UTF8')),'hex'),
+          'REPLAY_FAILED:SET_HASH_MISMATCH');
 
         -- 只讀凍結 payload；不回查 mapping_rule／account／source_ledger_line（INV-29）
         CREATE TEMP TABLE _src ON COMMIT DROP AS

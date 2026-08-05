@@ -1151,7 +1151,9 @@ account_code,account_name,debit,credit
       const maniId = randomUUID();
       const ik = idempotencyKey("CALCULATION_RUN", runId, 1, ENGINE_VERSION);
       try {
-        exec(`BEGIN;
+        // REPEATABLE READ：READ COMMITTED 是逐 statement 換 snapshot——TEMP 表只保證
+        // G-02 與 Manifest 用同一映射集合，TB／調整／CoA 仍可能來自不同時間點。
+        exec(`BEGIN ISOLATION LEVEL REPEATABLE READ;
           SELECT fn_assert((SELECT status FROM import_batch
             WHERE import_batch_id = :'b'::uuid AND engagement_id = :'e'::uuid) = 'ACCEPTED',
             'BATCH_NOT_ACCEPTED');
@@ -1232,13 +1234,14 @@ account_code,account_name,debit,credit
               jsonb_build_object('coa_id',c.coa_id,'version_no',c.version_no,'name',c.name)
             FROM chart_of_accounts c WHERE c.engagement_id = :'e'::uuid;
 
-          -- frozen hash 只涵蓋計算輸入（entries）；run_id／建立者／時間不入 hash
+          -- frozen hash 只涵蓋計算輸入（entries）；run_id／建立者／時間不入 hash。
+          -- v2：entry hash 涵蓋 canonical＋payload（計算實際讀 payload，兩者都要蓋到）
           INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id,
             period_revision_id, calculation_scope, hash_algorithm, canonicalization_version,
             frozen_set_content_hash, created_by)
           SELECT :'mani'::uuid, :'t'::uuid, :'e'::uuid, :'pr'::uuid, 'NO_FX', 'sha256', :'cv',
             encode(sha256(convert_to((SELECT string_agg(
-              encode(sha256(convert_to(content_canonical,'UTF8')),'hex'),
+              encode(sha256(convert_to(content_canonical || E'\n' || payload::text,'UTF8')),'hex'),
               E'\n' ORDER BY content_canonical) FROM _entries),'UTF8')),'hex'),
             :'u'::uuid;
           INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
@@ -1246,7 +1249,8 @@ account_code,account_name,debit,credit
             content_canonical, content_hash, payload)
           SELECT :'t'::uuid, :'mani'::uuid, object_type, object_id, concurrency_version,
             domain_version_kind, domain_version_value, content_canonical,
-            encode(sha256(convert_to(content_canonical,'UTF8')),'hex'), payload
+            encode(sha256(convert_to(content_canonical || E'\n' || payload::text,'UTF8')),'hex'),
+            payload
           FROM _entries;
 
           INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id,
@@ -1272,7 +1276,7 @@ account_code,account_name,debit,credit
         if (code === "G02_UNMAPPED" || code === "BATCH_NOT_ACCEPTED")
           return b06Refuse(g.b, "calculation.create.rejected", code,
             msg.split(`${code}:`)[1]?.split("\n")[0] ?? "");
-        if (msg.includes("calculation_run_request_key_key")) {   // 併發同 key：回查
+        if (msg.includes("calculation_run_tenant_request_key_uq")) {   // 併發同 key：回查
           const again = query<{ calculation_run_id: string; request_content_hash: string }>(
             `SELECT calculation_run_id, request_content_hash FROM calculation_run
               WHERE request_key = :'rk'::uuid`, { rk: requestKey }, { tenantId: s.tenantId });
