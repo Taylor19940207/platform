@@ -63,3 +63,19 @@ API 併發回查同步改約束名）；終態欄位互斥（COMPLETED 無失敗
 
 **測試 347 → 359（單元 43、DB 整合 157、端到端 159），全綠。**
 下一步依序：`mapping_rule` 事件原子化（BACKLOG 既定期限）→ `SLICE-M2-02C 預覽證據包`。
+
+### 0014 收口（關閉審查兩項 P1＋兩小項）——02B 至此正式鎖定
+
+| # | P1 缺口 | 修正 |
+|---|---|---|
+| ① | 封存／終態 guard 只讀父列不加鎖：外部 INSERT 可在「檢查時尚無 Run／仍 RUNNING、提交時已有 Run／已終態」的間隙穿過，留下未被 result_content_hash 涵蓋的快照 | entry guard 與 Run insert guard 皆 `FOR UPDATE` 鎖 Manifest；snapshot guard `FOR UPDATE` 鎖 Run；worker 計算交易一開始鎖 Run。**兩個雙 session 確定性測試**驗證競爭者阻塞至提交後被拒（封存／不得追加結果） |
+| ② | §24.1A 期間歸屬可繞過：只比對「Run 與 Manifest 填同一 period_revision_id」，未驗期間屬於案件、也未驗等於批次宣告期間；Manifest 自身歸屬未驗 | 新增 Manifest INSERT 歸屬守衛（案件×租戶、期間∈案件、created_by∈租戶）；Run insert guard 補「期間∈案件」與「期間＝批次宣告期間」——「兩邊填同一錯誤期間」的構造被 DB 測試證明擋下 |
+
+小項：RUNNING 互斥補 `failure_reason`；canonicalization／hash 演算法**白名單雙層
+fail closed**（manifest CHECK 於寫入端＋worker 斷言於讀取端——未知版本不再落入 v2 預設）。
+
+過程中的測試修正：0014 前置種子與 02A 區既有 E99 期間撞主鍵導致 heredoc 靜默中止
+（`PSQL_C >/dev/null` 吞掉 stderr 的教訓）——改為沿用既有 PR99、只補 E1 第二期間。
+
+**測試 359 → 367（DB 整合 165），全綠。02B 正式關閉。**
+下一步依序：`mapping_rule` 事件原子化 → `SLICE-M2-02C 預覽證據包`。

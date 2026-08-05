@@ -331,8 +331,18 @@ function commitCalcResult(j: ClaimedCalc): void {
     : "";
   exec(`BEGIN;
         ${fenceSql(j)}
-        SELECT fn_assert((SELECT status = 'RUNNING' FROM calculation_run
-          WHERE calculation_run_id = ${RUN}::uuid), 'RUN_NOT_RUNNING');
+        -- 交易一開始鎖 Run（0014①）：外部快照寫入在本交易期間阻塞於此鎖，
+        -- 終態提交後重讀即被拒——「算完 hash、尚未終態」的間隙不存在。
+        WITH runlock AS (
+          SELECT status FROM calculation_run
+           WHERE calculation_run_id = ${RUN}::uuid FOR UPDATE)
+        SELECT fn_assert((SELECT status = 'RUNNING' FROM runlock), 'RUN_NOT_RUNNING');
+
+        -- 白名單 fail closed（0014 小項②）：未知版本不得落入任何預設分支
+        SELECT fn_assert((SELECT hash_algorithm = 'sha256'
+            AND canonicalization_version IN ('sqlcanon-1','sqlcanon-2')
+          FROM calculation_input_manifest WHERE manifest_id = ${M}::uuid),
+          'REPLAY_FAILED:UNKNOWN_CANONICALIZATION_OR_ALGORITHM');
 
         -- INV-29：凍結內容存在且逐筆雜湊相符——依 manifest 記錄的標準化版本分流驗證
         -- （INT-e3）。v2 涵蓋 canonical＋payload：計算實際讀 payload，兩者都要驗。

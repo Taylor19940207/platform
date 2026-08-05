@@ -697,6 +697,104 @@ expect_err "INV-18：計算工作主體屬其他租戶 → 拒絕" \
 n=$(APP_C <<<"$T2 SELECT count(*) FROM calculation_run")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的計算執行" || ng "RLS：calculation_run 洩漏 $n 筆"
 
+# ── 0014：並發競態與期間歸屬 ─────────────────────────
+# E99 期間（PR99）已由前段 02A 區建立；此處只補 E1 的第二期間（2026-05）
+PSQL_C >/dev/null <<'SQL'
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id, fiscal_calendar_id, label, start_date, end_date) VALUES
+  ('dddddddd-0000-0000-0000-000000000052','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001','ffffffff-0000-0000-0000-000000000001','2026-05','2026-05-01','2026-05-31');
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id) VALUES
+  ('99999999-0000-0000-0000-000000000052','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000052');
+SQL
+ok "0014 前置：E1 第二期間（2026-05；E99 期間沿用前段）"
+PR99=99999999-0000-0000-0000-000000000099
+PR52=99999999-0000-0000-0000-000000000052
+MANI5=ee110000-0000-0000-0000-000000000005
+expect_err "0014②：Manifest 掛他案件的期間（E1 × E99 期間）→ 拒絕" \
+  "$T1 INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '$PR99','NO_FX','sqlcanon-2','h','aaaaaaaa-0000-0000-0000-000000000001')" "期間不屬於本案件"
+expect_err "0014②：Run 期間 ≠ 批次宣告期間 → 拒絕（Manifest 與 Run 填同一錯誤期間也擋）" \
+  "$T1 INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES ('$MANI5','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '$PR52','NO_FX','sqlcanon-2','h5','aaaaaaaa-0000-0000-0000-000000000001');
+   INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, request_key, request_content_hash, engine_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '$PR52','$B1','$MANI5','PREVIEW',
+           gen_random_uuid(),'rc9','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')" "批次宣告期間"
+expect_err "0014 小項：RUNNING 不得帶 failure_reason（互斥補漏）" \
+  "$T1 UPDATE calculation_run SET failure_reason='x' WHERE calculation_run_id='$RUNC'" "互斥"
+expect_err "0014 白名單：未知 canonicalization 版本 fail closed" \
+  "$T1 INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','NO_FX','sqlcanon-99','h','aaaaaaaa-0000-0000-0000-000000000001')" "check"
+expect_err "0014 白名單：未知 hash 演算法 fail closed" \
+  "$T1 INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, hash_algorithm, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+           '99999999-0000-0000-0000-000000000001','NO_FX','md5','sqlcanon-2','h','aaaaaaaa-0000-0000-0000-000000000001')" "check"
+
+# 競態 a：Run 建立交易持 Manifest 鎖期間，entry 追加必須阻塞後被拒（封存無 TOCTOU 窗）
+MANI4=ee110000-0000-0000-0000-000000000004
+RUND=ee110000-0000-0000-0000-000000000014
+PSQL_C >/dev/null <<SQL
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+     calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('$MANI4','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+        '99999999-0000-0000-0000-000000000001','NO_FX','sqlcanon-2','h4','aaaaaaaa-0000-0000-0000-000000000001');
+INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, domain_version_kind,
+     domain_version_value, content_canonical, content_hash, payload)
+VALUES ('11111111-1111-1111-1111-111111111111','$MANI4','SCOPE','SCOPE','1','c4','h4','{}'::jsonb);
+SQL
+( PSQL_C >/dev/null 2>&1 <<RACEA
+BEGIN;
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+     import_batch_id, manifest_id, run_type, request_key, request_content_hash, engine_version, created_by)
+VALUES ('$RUND','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+        '99999999-0000-0000-0000-000000000001','$B1','$MANI4','PREVIEW',
+        'ee110000-0000-0000-0000-0000000000a4','rcA','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001');
+SELECT pg_sleep(2);
+COMMIT;
+RACEA
+) &
+RACEAPID=$!
+sleep 1
+if out=$(PSQL_C 2>&1 <<<"INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, domain_version_kind,
+      domain_version_value, content_canonical, content_hash, payload)
+    VALUES ('11111111-1111-1111-1111-111111111111','$MANI4','SCOPE','SCOPE','2','c5','h5','{}'::jsonb)"); then
+  wait $RACEAPID; ng "0014① 競態a：Run 建立中 entry 竟可追加"
+else
+  wait $RACEAPID
+  echo "$out" | grep -q "封存" && ok "0014① 競態a：entry 追加阻塞至 Run 建立提交後被拒（封存）" \
+                              || ng "0014① 競態a：失敗原因不符：$out"
+fi
+
+# 競態 b：worker 終態提交持 Run 鎖期間，外部快照必須阻塞後被拒
+( PSQL_C >/dev/null 2>&1 <<RACEB
+BEGIN;
+WITH runlock AS (SELECT status FROM calculation_run WHERE calculation_run_id='$RUND' FOR UPDATE)
+SELECT count(*) FROM runlock;
+SELECT pg_sleep(2);
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='rD' WHERE calculation_run_id='$RUND';
+COMMIT;
+RACEB
+) &
+RACEBPID=$!
+sleep 1
+if out=$(PSQL_C 2>&1 <<<"INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+      account_code, account_name, debit, credit)
+    VALUES ('11111111-1111-1111-1111-111111111111','$RUND','SOURCE_TB','ac000000-0000-0000-0000-000000000001',
+            '1002','银行存款',1,0)"); then
+  wait $RACEBPID; ng "0014① 競態b：終態提交中快照竟可寫入"
+else
+  wait $RACEBPID
+  echo "$out" | grep -q "不得追加結果" && ok "0014① 競態b：快照阻塞至終態提交後被拒（result hash 固定）" \
+                                       || ng "0014① 競態b：失敗原因不符：$out"
+fi
+
 # 衍生資料的自然唯一性（冪等第二道防線）
 expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
