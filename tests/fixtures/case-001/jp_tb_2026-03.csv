@@ -1,4 +1,5 @@
 #legal_entity_code=1234567890123
+#completeness=COMPLETE
 account_code,account_name,debit,credit
 100,現金,350000,0
 111,普通預金,8200000,0

@@ -178,8 +178,12 @@ function evaluate(j: Claimed) {
   const evidence: EvidenceKind = detectedCode ? "AUTHORITATIVE_ID" : "NONE";
   const result = classifyIdentity(j.declared_code, detectedCode, evidence);
   const idStatus = identityStatusOf(result);
+  // 完整度＝獨立證據（提供者顯式聲明，聲明本身在檔案內、受 file hash 涵蓋）。
+  // G-01 平衡只證明「收到的資料內部平衡」，不證明「本期應有資料全部收到」——不得推定 COMPLETE。
+  const declared = meta["completeness"] ?? "";
+  const completeness = declared === "COMPLETE" || declared === "PARTIAL" ? declared : "UNKNOWN";
 
-  return { sha, lines, diff, detectedCode, evidence, result, idStatus };
+  return { sha, lines, diff, detectedCode, evidence, result, idStatus, completeness };
 }
 
 /**
@@ -221,7 +225,7 @@ function commitResult(j: Claimed, r: ReturnType<typeof evaluate>): void {
            ${lineRows}
         ) AS v(source_row_id, account_code, account_name, debit, credit, content_sha256);
         INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-        VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version}, 'BALANCE', 'COMPLETE');
+        VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version}, 'BALANCE', ${lit(r.completeness)});
         INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version,
                 detected_identity, match_result, evidence_kind, detection_rule_version)
         VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version},
@@ -373,7 +377,9 @@ function commitCalcResult(j: ClaimedCalc): void {
         CREATE TEMP TABLE _src ON COMMIT DROP AS
           SELECT x->>'code' AS code, x->>'name' AS name,
                  (x->>'debit')::numeric AS debit, (x->>'credit')::numeric AS credit
-            FROM calculation_manifest_entry e, jsonb_array_elements(e.payload) x
+            FROM calculation_manifest_entry e, jsonb_array_elements(
+                   CASE WHEN jsonb_typeof(e.payload)='array' THEN e.payload
+                        ELSE e.payload->'lines' END) x
            WHERE e.manifest_id = ${M}::uuid AND e.object_type = 'SOURCE_TB';
         CREATE TEMP TABLE _m ON COMMIT DROP AS
           SELECT payload->>'source_code' AS source_code,
@@ -549,14 +555,21 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
   const M = lit(j.manifest_id); const RUN = lit(j.calculation_run_id);
   const B = lit(j.import_batch_id); const T = lit(j.tenant_id);
 
-  const batch = q(`SELECT batch_version::text, COALESCE(file_sha256,'') AS file_sha256
-                     FROM import_batch WHERE import_batch_id = ${B}::uuid`)[0];
-  // 凍結來源的 batch_version：讀 Manifest SOURCE_TB entry（不信任任何 current 值）
-  const frozenBv = q(`SELECT domain_version_value AS bv FROM calculation_manifest_entry
-                       WHERE manifest_id = ${M}::uuid AND object_type='SOURCE_TB'`)[0]?.bv ?? batch.batch_version;
+  // 來源節完全讀 Manifest（0018）：SOURCE_TB entry 必須恰一筆且含凍結 meta——
+  // 缺、重複或缺 meta 一律 fail closed，不回退 current import_batch。
+  const srcEntries = q(`SELECT payload->>'batch_id' AS batch_id,
+                               payload->>'batch_version' AS bv,
+                               payload->>'file_sha256' AS file_sha
+                          FROM calculation_manifest_entry
+                         WHERE manifest_id = ${M}::uuid AND object_type='SOURCE_TB'`);
+  if (srcEntries.length !== 1)
+    throw new Error(`UPSTREAM_VERIFY_FAILED:SOURCE_TB_ENTRY_COUNT=${srcEntries.length}`);
+  const srcMeta = srcEntries[0];
+  if (!srcMeta.batch_id || !srcMeta.bv || srcMeta.file_sha == null)
+    throw new Error("UPSTREAM_VERIFY_FAILED:SOURCE_TB_META_MISSING（舊版 Manifest 無凍結 meta，不回退 current）");
   const srcTb = q(`SELECT x->>'code' AS code, COALESCE(x->>'name','') AS name,
                           x->>'debit' AS debit, x->>'credit' AS credit
-                     FROM calculation_manifest_entry e, jsonb_array_elements(e.payload) x
+                     FROM calculation_manifest_entry e, jsonb_array_elements(e.payload->'lines') x
                     WHERE e.manifest_id = ${M}::uuid AND e.object_type='SOURCE_TB'
                     ORDER BY x->>'code'`);
   // dataset join 帶 granularity 條件——多粒度時不得配錯 dataset hash（P1-②）
@@ -568,7 +581,7 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                          AND sd.batch_version = dc.batch_version
                          AND sd.granularity = dc.granularity
                        WHERE dc.import_batch_id = ${B}::uuid
-                         AND dc.batch_version = ${lit(frozenBv)}::int
+                         AND dc.batch_version = ${lit(srcMeta.bv)}::int
                        ORDER BY dc.data_coverage_id`);
   const mappings = q(`SELECT e.payload->>'source_code' AS source_code,
                              e.payload->>'version_no' AS version_no,
@@ -577,7 +590,9 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                              e.payload->>'target_code' AS target_code,
                              e.payload->>'target_name' AS target_name,
                              COALESCE(e.payload->>'created_by_name','') AS created_by_name,
+                             COALESCE(e.payload->>'created_by','') AS created_by_id,
                              COALESCE(e.payload->>'approved_by_name','') AS approved_by_name,
+                             COALESCE(e.payload->>'approved_by','') AS approved_by_id,
                              COALESCE(e.payload->>'approved_at','') AS approved_at
                         FROM calculation_manifest_entry e
                        WHERE e.manifest_id = ${M}::uuid AND e.object_type='MAPPING_RULE'
@@ -589,11 +604,14 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                              COALESCE(a.evidence_ref,'') AS evidence_ref,
                              COALESCE(a.judgment_reason,'') AS judgment_reason,
                              COALESCE(a.language_tag,'') AS language_tag,
-                             COALESCE(e.payload->>'prepared_by_name','') AS prepared_by,
+                             COALESCE(e.payload->>'prepared_by_name','')
+                               || '〔' || COALESCE(e.payload->>'prepared_by','') || '〕' AS prepared_by,
                              COALESCE(e.payload->>'prepared_at','') AS prepared_at,
-                             COALESCE(e.payload->>'reviewed_by_name','') AS reviewed_by,
+                             COALESCE(e.payload->>'reviewed_by_name','')
+                               || '〔' || COALESCE(e.payload->>'reviewed_by','') || '〕' AS reviewed_by,
                              COALESCE(e.payload->>'reviewed_at','') AS reviewed_at,
-                             COALESCE(e.payload->>'approved_by_name','') AS approved_by,
+                             COALESCE(e.payload->>'approved_by_name','')
+                               || '〔' || COALESCE(e.payload->>'approved_by','') || '〕' AS approved_by,
                              COALESCE(e.payload->>'approved_at','') AS approved_at
                         FROM calculation_manifest_entry e
                         JOIN adjustment a ON a.adjustment_id = e.object_id
@@ -637,14 +655,16 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
 
   const sections: Section[] = [
     { name: "source", title: "來源", headers: ["類型", "識別", "欄位A", "欄位B", "欄位C", "欄位D", "欄位E"],
-      rows: [["批次", j.import_batch_id, `v${batch.batch_version}`, `sha=${batch.file_sha256}`],
+      rows: [["批次", srcMeta.batch_id, `v${srcMeta.bv}`, `sha=${srcMeta.file_sha}`],
         ...srcTb.map((l) => ["TB科目", l.code, l.name, l.debit, l.credit]),
         ...coverage.map((c) => ["涵蓋", c.id, c.account_scope, c.granularity,
           c.completeness_status, `dataset=${c.dataset_id}`, c.dataset_sha])] },
     { name: "mapping", title: "映射",
       headers: ["來源科目", "版本", "生效", "失效", "集團科目", "集團科目名稱", "建立者", "批准者", "批准時間"],
       rows: mappings.map((m) => [m.source_code, `v${m.version_no}`, m.eff_from, m.eff_to,
-        m.target_code, m.target_name, m.created_by_name, m.approved_by_name, m.approved_at]) },
+        m.target_code, m.target_name,
+        `${m.created_by_name}〔${m.created_by_id}〕`,
+        `${m.approved_by_name}〔${m.approved_by_id}〕`, m.approved_at]) },
     { name: "adjustment", title: "調整", headers: ["調整", "欄位", "值"],
       rows: adjustments.flatMap((a) => {
         const id8 = a.adjustment_id.slice(0, 8);
@@ -815,10 +835,18 @@ function recordPkgInfraFailure(j: ClaimedPkg, cls: JobErrorClass, message: strin
   }
 }
 
+const RENDERERS: Record<string, (j: ClaimedPkg) => BuiltPackage> = {
+  "html-3": buildPackage,
+  // 舊版（html-1／html-2）已停止支援：進行中的舊版工作不得以新版內容冒充舊版登記
+};
+
 function runPackage(c: ClaimedCore): void {
   const j = loadPkgDetail(c);
   try {
-    const built = buildPackage(j);
+    const render = RENDERERS[j.render_version];
+    if (!render)
+      throw new Error(`UNSUPPORTED_RENDER_VERSION:${j.render_version}`);
+    const built = render(j);
     const key = artifactObjectKey(j.tenant_id, j.package_id, j.render_version);
     stagePut(key, built.html, built.artifactSha256);
     heartbeat(j);

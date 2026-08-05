@@ -891,6 +891,8 @@ expect_err "契約 C：source_document 不可修改" \
 expect_err "契約 C：來源實體與批次不同租戶 → 拒絕" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
    VALUES ('22222222-2222-2222-2222-222222222222','$B2',9,'BALANCE','h',1)" "不同租戶"
+expect_err "0018③：上傳後批次來源身分欄位凍結（file_sha256 不可改寫）" \
+  "$T1 UPDATE import_batch SET file_sha256='tampered' WHERE import_batch_id='$B2'" "已凍結"
 expect_err "0016①：來源集合封存——已驗證批次不得追加來源實體（同 run 同包內容才成立）" \
   "$T1 INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
    VALUES ('11111111-1111-1111-1111-111111111111','$B1','late.pdf','h','k9',1)" "已封存"

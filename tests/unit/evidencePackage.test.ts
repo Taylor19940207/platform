@@ -67,7 +67,7 @@ test("0017③：canonical JSON 消除分隔符注入——舊管線串接的碰�
 });
 
 test("0017 P2：完整度規則——UNKNOWN 降 UNKNOWN、PARTIAL 保級併列；render 已升 html-2", () => {
-  assert.equal(RENDER_VERSION, "html-2");
+  assert.equal(RENDER_VERSION, "html-3");
   const cov: CoverageRow[] = [
     { id: "c-p", accountScope: "500", granularity: "JOURNAL", completeness: "PARTIAL" },
     { id: "c-u", accountScope: "600", granularity: "DOCUMENT", completeness: "UNKNOWN" },

@@ -126,6 +126,10 @@ try {
   check("追溯判定 12/12 科目範圍均明示 BALANCE（驗收 #6）",
     (html.match(/<td>BALANCE（餘額級）<\/td>/g) ?? []).length === 12
     && !html.includes("JOURNAL級") && !html.includes("憑證級"));
+  check("完整度＝提供者聲明（fixture #completeness=COMPLETE），trace 12＋coverage 1 列",
+    (html.match(/<td>COMPLETE<\/td>/g) ?? []).length === 13);
+  check("actor 以「姓名〔穩定 ID〕」呈現（同名者可辨）",
+    html.includes(`職員甲〔${U_JIA}〕`) && html.includes(`資深乙〔${U_YI}〕`));
 
   // ── 冪等三情形 ──
   const again = await post(bing, "/b07/package", { run: RUN, request_key: K(4) });
@@ -174,15 +178,30 @@ try {
     && pkgField(P5, "package_content_hash") !== pkgField(P1, "package_content_hash"),
     pkgField(P5, "status"));
 
+  // ── P1-②：renderer 版本分流——舊版進行中工作不得以新版內容冒充舊版 ──
+  const PH1 = "ee440000-0000-0000-0000-000000000001";
+  sql(`INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
+       SELECT '${PH1}', tenant_id, engagement_id, calculation_run_id,
+              'ee440000-0000-0000-0000-0000000000aa', 'manual-h1', audit_cutoff_event_id,
+              'html-1', created_by
+         FROM evidence_package WHERE package_id='${P1}'`);
+  sql(`INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+       VALUES ('${T1}','EVIDENCE_PACKAGE','${PH1}',1,'html-1','manual-h1')`);
+  check("html-1 進行中工作 → FAILED（UNSUPPORTED_RENDER_VERSION，不以 html-3 內容冒充）",
+    await waitFor(() => pkgField(PH1, "status") === "FAILED")
+    && pkgField(PH1, "failure_reason_code") === "UNSUPPORTED_RENDER_VERSION",
+    pkgField(PH1, "failure_reason_code"));
+
   // ── 契約 B：staging 物件預置異內容 → 確定性 ARTIFACT_CONFLICT ──
   const P3 = "ee330000-0000-0000-0000-000000000003";
   const cut = sql(`SELECT audit_cutoff_event_id FROM evidence_package WHERE package_id='${P1}'`);
-  putObject(artifactObjectKey(T1, P3, "html-2"), Buffer.from("tampered artifact"));
+  putObject(artifactObjectKey(T1, P3, "html-3"), Buffer.from("tampered artifact"));
   sql(`INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
         request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
-       VALUES ('${P3}','${T1}','${ENG_A}','${RUN}','${K(6)}','manual',${cut},'html-2','${U_JIA}')`);
+       VALUES ('${P3}','${T1}','${ENG_A}','${RUN}','${K(6)}','manual',${cut},'html-3','${U_JIA}')`);
   sql(`INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
-       VALUES ('${T1}','EVIDENCE_PACKAGE','${P3}',1,'html-2','manual-k3')`);
+       VALUES ('${T1}','EVIDENCE_PACKAGE','${P3}',1,'html-3','manual-k3')`);
   check("staging 異內容 → Package FAILED（ARTIFACT_CONFLICT，契約 B）",
     await waitFor(() => pkgField(P3, "status") === "FAILED")
     && pkgField(P3, "failure_reason_code") === "ARTIFACT_CONFLICT",

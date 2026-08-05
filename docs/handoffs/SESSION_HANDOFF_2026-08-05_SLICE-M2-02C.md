@@ -68,3 +68,21 @@ R5／R7 掛載；明示重產 UI；staging 孤兒清理排程；retention（D-26
 
 **測試 420 → 423（單元 50、端到端 182），全綠。02C 至此正式關閉。**
 下一個 session 從「里程碑 2 離開條件盤點」開始。
+
+開始盤點時一併閱讀 `docs/FUTURE_DISCUSSIONS.md`，但不要把觀察中議題直接擴成新範圍。
+目前 `DISC-001` 記錄「控制強度與事務所實用性的平衡」：既定計畫不變；待職員與税理士
+能走通上傳至正式交付的完整流程後，以實際完成時間、角色切換、阻擋與恢復情況重開討論。
+
+## 2026-08-05 第三輪收口（0018；三項 P1＋一項 P2）
+
+| # | 缺口 | 修正 |
+|---|---|---|
+| ① | G-01 通過即記 `COMPLETE`——平衡只證明「收到的資料內部平衡」，不證明「應有資料全部收到」；證據包過度宣稱 | 撤銷推定：完整度只接受**提供者顯式聲明**（檔內 `#completeness=COMPLETE/PARTIAL`，聲明受 file hash 涵蓋；未聲明＝UNKNOWN）。Case-001 fixtures 加入合成聲明——不用平衡替代 |
+| ② | render 升版但 worker 不分流——GENERATING 的 html-1 工作會被以新版內容產生卻登記舊版 | **renderer map fail closed**：worker 只接受明確支援版本（現為 html-3）；未知／停止支援 → `UNSUPPORTED_RENDER_VERSION` FAILED。端到端：html-1 進行中工作在新 worker 下 FAILED，不冒充 |
+| ③ | 來源節仍讀 current import_batch、缺 SOURCE_TB entry 時回退 current；`fn_import_batch_guard` 同狀態放行使 ACCEPTED 批次身分欄可被改寫 | SOURCE_TB payload 凍結 `batch_id＋batch_version＋file_sha256＋lines`；worker 缺／重複 entry 或缺 meta 一律 fail closed 不回退；來源節完全讀 Manifest；migration **0018**：批次離開 DRAFT 後來源身分欄位凍結（計算讀取端相容舊 array payload） |
+| P2 | HTML 只顯示姓名，同名者不可辨 | actor 一律「姓名〔穩定 ID〕」（皆出自凍結 payload）——輸出改變依規則升 **html-3** |
+
+連帶：02B 的 payload 竄改測試路徑隨新 payload 形狀改為 `{lines,0,debit}`
+（該測試轉綠也反向驗證了 SOURCE_TB meta 結構已生效）。
+
+**測試 423 → 427（DB 192、端到端 185），全綠。**

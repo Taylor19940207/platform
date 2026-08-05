@@ -1246,8 +1246,12 @@ account_code,account_name,debit,credit
               '|sha=' || (SELECT COALESCE(file_sha256,'') FROM import_batch WHERE import_batch_id = :'b'::uuid) ||
               '|' || (SELECT COALESCE(string_agg(account_code||':'||debit::text||':'||credit::text,
                         ';' ORDER BY account_code),'') FROM _tb),
-            (SELECT COALESCE(jsonb_agg(jsonb_build_object('code',account_code,'name',account_name,
-               'debit',debit::text,'credit',credit::text) ORDER BY account_code),'[]'::jsonb) FROM _tb);
+            jsonb_build_object(
+              'batch_id', :'b',
+              'batch_version', (SELECT batch_version FROM import_batch WHERE import_batch_id = :'b'::uuid),
+              'file_sha256', (SELECT COALESCE(file_sha256,'') FROM import_batch WHERE import_batch_id = :'b'::uuid),
+              'lines', (SELECT COALESCE(jsonb_agg(jsonb_build_object('code',account_code,'name',account_name,
+                'debit',debit::text,'credit',credit::text) ORDER BY account_code),'[]'::jsonb) FROM _tb));
           INSERT INTO _entries
             SELECT 'MAPPING_RULE', m.mapping_rule_id, NULL, 'MAPPING_VERSION_NO', m.version_no::text,
               'MAPPING|'||m.source_account_code||'|v'||m.version_no||'|'||

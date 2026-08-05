@@ -4,9 +4,11 @@
 export type EvidencePackageStatus = "GENERATING" | "READY" | "FAILED";
 
 /** 底稿渲染版本：入 Package 與 object key——render 升版＝明示重產的正當理由。 */
-export const RENDER_VERSION = "html-2";
-// html-2（0017）：canonical 改為 JSON 序列化（消除分隔符注入碰撞）、追溯列加完整度、
-// 人名改讀 Manifest 凍結快照——canonical 規則改變＝render 升版，跨部署重產不歧義。
+export const RENDER_VERSION = "html-3";
+// html-2（0017）：canonical JSON、追溯完整度欄、人名凍結快照。
+// html-3（0018）：來源節完全讀 Manifest（SOURCE_TB payload 凍結 batch meta）、
+// actor 顯示「姓名〔穩定 ID〕」——輸出內容改變＝render 升版；worker 依版本分流，
+// 未支援版本 fail closed（不得以新版內容冒充舊版登記）。
 
 const LEGAL: Record<EvidencePackageStatus, EvidencePackageStatus[]> = {
   GENERATING: ["READY", "FAILED"],
@@ -28,6 +30,7 @@ export const PKG_REASON = {
   UPSTREAM_VERIFY_FAILED: "產包前驗證失敗：上游凍結資料損壞或不一致（契約 D），不得包裝為證據",
   CUTOFF_EVENT_MISSING: "找不到該 run 的 calculation_run.completed 事件（audit cutoff）",
   CONTROL_TOTAL_MISMATCH: "控制總額勾稽不一致（G-09）",
+  UNSUPPORTED_RENDER_VERSION: "worker 不支援此 render 版本——不得以其他版本內容冒充登記；請明示重產（新 package＋現行版本）",
   INFRA_RETRY_EXHAUSTED: "基礎設施故障重試耗盡；可明示重新產包（新 package）",
   NON_RETRYABLE_SYSTEM: "系統性錯誤；請通報維運後明示重新產包（新 package）",
 } as const;
@@ -44,7 +47,8 @@ export function pkgReasonCodeOf(message: string): PkgReasonCode | null {
 export function isDeterministicPkgFailure(message: string): boolean {
   const code = pkgReasonCodeOf(message);
   return code === "UPSTREAM_VERIFY_FAILED" || code === "ARTIFACT_CONFLICT"
-      || code === "CUTOFF_EVENT_MISSING" || code === "CONTROL_TOTAL_MISMATCH";
+      || code === "CUTOFF_EVENT_MISSING" || code === "CONTROL_TOTAL_MISMATCH"
+      || code === "UNSUPPORTED_RENDER_VERSION";
 }
 
 /** 契約 B：staging 物件已存在時的裁決。 */

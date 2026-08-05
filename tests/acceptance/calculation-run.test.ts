@@ -221,7 +221,7 @@ try {
 
   // 10b 單獨竄改 payload（canonical 完好）→ v2 hash 仍偵測（0013①）
   sql(`ALTER TABLE calculation_manifest_entry DISABLE TRIGGER trg_cme_immutable`);
-  sql(`UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{0,debit}','"999999.00"')
+  sql(`UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{lines,0,debit}','"999999.00"')
        WHERE object_type='SOURCE_TB' AND manifest_id =
          (SELECT manifest_id FROM calculation_run WHERE calculation_run_id='${RUN2}')`);
   sql(`ALTER TABLE calculation_manifest_entry ENABLE TRIGGER trg_cme_immutable`);
