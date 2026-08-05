@@ -149,6 +149,16 @@ try {
     && pkgField(P2, "artifact_sha256") === pkgField(P1, "artifact_sha256"),
     `${pkgField(P2, "status")}`);
 
+  // ── P1-④：人名屬 Manifest 凍結快照——改名後重產 hash 不得漂移 ──
+  sql(`UPDATE app_user SET display_name='資深乙（婚後改姓）' WHERE user_id='${U_YI}'`);
+  await post(jia, "/b07/package", { run: RUN, request_key: K(9) });
+  const P6 = sql(`SELECT package_id FROM evidence_package WHERE request_key='${K(9)}'`);
+  check("人名凍結：display_name 變更後重產，package hash 不漂移（P1-④）",
+    await waitFor(() => pkgField(P6, "status") === "READY")
+    && pkgField(P6, "package_content_hash") === pkgField(P1, "package_content_hash")
+    && pkgField(P6, "artifact_sha256") === pkgField(P1, "artifact_sha256"),
+    pkgField(P6, "status"));
+
   // ── P1-③ 漂移測試：canonical 與 HTML 同源——任一顯示欄位改變必使 section／package hash 改變 ──
   sql(`ALTER TABLE adjustment DISABLE TRIGGER USER`);
   sql(`UPDATE adjustment SET legal_basis='母公司折舊政策 v4（變更）' WHERE adjustment_id='${ADJ}'`);
@@ -167,12 +177,12 @@ try {
   // ── 契約 B：staging 物件預置異內容 → 確定性 ARTIFACT_CONFLICT ──
   const P3 = "ee330000-0000-0000-0000-000000000003";
   const cut = sql(`SELECT audit_cutoff_event_id FROM evidence_package WHERE package_id='${P1}'`);
-  putObject(artifactObjectKey(T1, P3, "html-1"), Buffer.from("tampered artifact"));
+  putObject(artifactObjectKey(T1, P3, "html-2"), Buffer.from("tampered artifact"));
   sql(`INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
         request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
-       VALUES ('${P3}','${T1}','${ENG_A}','${RUN}','${K(6)}','manual',${cut},'html-1','${U_JIA}')`);
+       VALUES ('${P3}','${T1}','${ENG_A}','${RUN}','${K(6)}','manual',${cut},'html-2','${U_JIA}')`);
   sql(`INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
-       VALUES ('${T1}','EVIDENCE_PACKAGE','${P3}',1,'html-1','manual-k3')`);
+       VALUES ('${T1}','EVIDENCE_PACKAGE','${P3}',1,'html-2','manual-k3')`);
   check("staging 異內容 → Package FAILED（ARTIFACT_CONFLICT，契約 B）",
     await waitFor(() => pkgField(P3, "status") === "FAILED")
     && pkgField(P3, "failure_reason_code") === "ARTIFACT_CONFLICT",

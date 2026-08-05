@@ -1191,8 +1191,12 @@ account_code,account_name,debit,credit
             SELECT DISTINCT ON (mr.source_account_code)
                    mr.mapping_rule_id, mr.source_account_code, mr.version_no,
                    mr.effective_from, mr.effective_to,
-                   mr.target_account_id, a.code AS target_code, a.name AS target_name
+                   mr.target_account_id, a.code AS target_code, a.name AS target_name,
+                   mr.created_by, cu.display_name AS created_by_name,
+                   mr.approved_by, au.display_name AS approved_by_name, mr.approved_at
               FROM mapping_rule mr JOIN account a ON a.account_id = mr.target_account_id
+              JOIN app_user cu ON cu.user_id = mr.created_by
+              JOIN app_user au ON au.user_id = mr.approved_by
              WHERE mr.engagement_id = :'e'::uuid AND mr.approved_at IS NOT NULL
                AND (mr.effective_from IS NULL OR mr.effective_from <= :'pe'::date)
                AND (mr.effective_to   IS NULL OR mr.effective_to   >= :'pe'::date)
@@ -1206,6 +1210,9 @@ account_code,account_name,debit,credit
 
           CREATE TEMP TABLE _adj ON COMMIT DROP AS
             SELECT je.adjustment_id, je.business_version, adj.title,
+                   adj.prepared_by, pu.display_name AS prepared_by_name, adj.prepared_at,
+                   adj.reviewed_by, ru.display_name AS reviewed_by_name, adj.reviewed_at,
+                   adj.approved_by, qu.display_name AS approved_by_name, adj.approved_at,
                    jsonb_agg(jsonb_build_object('line_no', jl.line_no, 'account_id', jl.account_id,
                      'code', a.code, 'name', a.name,
                      'debit', jl.debit::text, 'credit', jl.credit::text) ORDER BY jl.line_no) AS lines,
@@ -1215,8 +1222,14 @@ account_code,account_name,debit,credit
               JOIN journal_line jl ON jl.entry_id = je.entry_id
               JOIN account a ON a.account_id = jl.account_id
               JOIN adjustment adj ON adj.adjustment_id = je.adjustment_id
+              JOIN app_user pu ON pu.user_id = adj.prepared_by
+              JOIN app_user ru ON ru.user_id = adj.reviewed_by
+              JOIN app_user qu ON qu.user_id = adj.approved_by
              WHERE je.engagement_id = :'e'::uuid AND je.period_revision_id = :'pr'::uuid
-             GROUP BY je.adjustment_id, je.business_version, adj.title;
+             GROUP BY je.adjustment_id, je.business_version, adj.title,
+                      adj.prepared_by, pu.display_name, adj.prepared_at,
+                      adj.reviewed_by, ru.display_name, adj.reviewed_at,
+                      adj.approved_by, qu.display_name, adj.approved_at;
 
           CREATE TEMP TABLE _entries (
             object_type text, object_id uuid, concurrency_version int,
@@ -1243,13 +1256,19 @@ account_code,account_name,debit,credit
               jsonb_build_object('source_code',m.source_account_code,'version_no',m.version_no,
                 'effective_from',m.effective_from,'effective_to',m.effective_to,
                 'target_account_id',m.target_account_id,'target_code',m.target_code,
-                'target_name',m.target_name)
+                'target_name',m.target_name,
+                'created_by',m.created_by,'created_by_name',m.created_by_name,
+                'approved_by',m.approved_by,'approved_by_name',m.approved_by_name,
+                'approved_at',m.approved_at)
             FROM _map m;
           INSERT INTO _entries
             SELECT 'ADJUSTMENT', a.adjustment_id, NULL, 'BUSINESS_VERSION', a.business_version::text,
               'ADJUSTMENT|'||a.adjustment_id||'|bv'||a.business_version||'|'||a.canon_lines,
               jsonb_build_object('adjustment_id',a.adjustment_id,'business_version',a.business_version,
-                'title',a.title,'lines',a.lines)
+                'title',a.title,'lines',a.lines,
+                'prepared_by',a.prepared_by,'prepared_by_name',a.prepared_by_name,'prepared_at',a.prepared_at,
+                'reviewed_by',a.reviewed_by,'reviewed_by_name',a.reviewed_by_name,'reviewed_at',a.reviewed_at,
+                'approved_by',a.approved_by,'approved_by_name',a.approved_by_name,'approved_at',a.approved_at)
             FROM _adj a;
           INSERT INTO _entries
             SELECT 'CHART_OF_ACCOUNTS', c.coa_id, NULL, 'COA_VERSION', c.version_no::text,

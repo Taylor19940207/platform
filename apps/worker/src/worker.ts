@@ -28,7 +28,7 @@ import { classifyError, verdictFor, type JobErrorClass }
 import { reasonCodeOf, isDeterministicRunFailure, RUN_REASON }
   from "../../../packages/domain/src/calculationRun.ts";
 import { PKG_REASON, pkgReasonCodeOf, isDeterministicPkgFailure, stagingVerdict,
-  artifactObjectKey, resolveTraceability } from "../../../packages/domain/src/evidencePackage.ts";
+  artifactObjectKey, resolveTraceability, sectionCanonical } from "../../../packages/domain/src/evidencePackage.ts";
 import { putObject } from "../../../packages/database/src/objectstore.ts";
 import { config } from "../../../packages/config/src/index.ts";
 
@@ -221,7 +221,7 @@ function commitResult(j: Claimed, r: ReturnType<typeof evaluate>): void {
            ${lineRows}
         ) AS v(source_row_id, account_code, account_name, debit, credit, content_sha256);
         INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-        VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version}, 'BALANCE', 'UNKNOWN');
+        VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version}, 'BALANCE', 'COMPLETE');
         INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version,
                 detected_identity, match_result, evidence_kind, detection_rule_version)
         VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version},
@@ -530,10 +530,6 @@ interface BuiltPackage {
   artifactSha256: string;
 }
 
-/** 逐節 canonical＝標頭＋全部顯示列——HTML 由同一份 rows 渲染，內容不可能漂移出 hash。 */
-const sectionCanonical = (s: Section): string =>
-  [s.headers.join("|"), ...s.rows.map((r) => r.join("|"))].join("\n");
-
 function renderSection(s: Section, hash: string): string {
   const pad = (r: string[]) => [...r, ...Array(Math.max(0, s.headers.length - r.length)).fill("")];
   return `<h2>${esc2(s.title)}（§hash ${esc2(hash.slice(0, 12))}）</h2>
@@ -555,6 +551,9 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
 
   const batch = q(`SELECT batch_version::text, COALESCE(file_sha256,'') AS file_sha256
                      FROM import_batch WHERE import_batch_id = ${B}::uuid`)[0];
+  // 凍結來源的 batch_version：讀 Manifest SOURCE_TB entry（不信任任何 current 值）
+  const frozenBv = q(`SELECT domain_version_value AS bv FROM calculation_manifest_entry
+                       WHERE manifest_id = ${M}::uuid AND object_type='SOURCE_TB'`)[0]?.bv ?? batch.batch_version;
   const srcTb = q(`SELECT x->>'code' AS code, COALESCE(x->>'name','') AS name,
                           x->>'debit' AS debit, x->>'credit' AS credit
                      FROM calculation_manifest_entry e, jsonb_array_elements(e.payload) x
@@ -569,6 +568,7 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                          AND sd.batch_version = dc.batch_version
                          AND sd.granularity = dc.granularity
                        WHERE dc.import_batch_id = ${B}::uuid
+                         AND dc.batch_version = ${lit(frozenBv)}::int
                        ORDER BY dc.data_coverage_id`);
   const mappings = q(`SELECT e.payload->>'source_code' AS source_code,
                              e.payload->>'version_no' AS version_no,
@@ -576,12 +576,10 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                              COALESCE(e.payload->>'effective_to','-') AS eff_to,
                              e.payload->>'target_code' AS target_code,
                              e.payload->>'target_name' AS target_name,
-                             cu.display_name AS created_by_name,
-                             au.display_name AS approved_by_name, mr.approved_at::text AS approved_at
+                             COALESCE(e.payload->>'created_by_name','') AS created_by_name,
+                             COALESCE(e.payload->>'approved_by_name','') AS approved_by_name,
+                             COALESCE(e.payload->>'approved_at','') AS approved_at
                         FROM calculation_manifest_entry e
-                        JOIN mapping_rule mr ON mr.mapping_rule_id = e.object_id
-                        JOIN app_user cu ON cu.user_id = mr.created_by
-                        JOIN app_user au ON au.user_id = mr.approved_by
                        WHERE e.manifest_id = ${M}::uuid AND e.object_type='MAPPING_RULE'
                        ORDER BY e.payload->>'source_code'`);
   const adjustments = q(`SELECT e.object_id::text AS adjustment_id,
@@ -591,14 +589,14 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                              COALESCE(a.evidence_ref,'') AS evidence_ref,
                              COALESCE(a.judgment_reason,'') AS judgment_reason,
                              COALESCE(a.language_tag,'') AS language_tag,
-                             pu.display_name AS prepared_by, a.prepared_at::text AS prepared_at,
-                             ru.display_name AS reviewed_by, a.reviewed_at::text AS reviewed_at,
-                             qu.display_name AS approved_by, a.approved_at::text AS approved_at
+                             COALESCE(e.payload->>'prepared_by_name','') AS prepared_by,
+                             COALESCE(e.payload->>'prepared_at','') AS prepared_at,
+                             COALESCE(e.payload->>'reviewed_by_name','') AS reviewed_by,
+                             COALESCE(e.payload->>'reviewed_at','') AS reviewed_at,
+                             COALESCE(e.payload->>'approved_by_name','') AS approved_by,
+                             COALESCE(e.payload->>'approved_at','') AS approved_at
                         FROM calculation_manifest_entry e
                         JOIN adjustment a ON a.adjustment_id = e.object_id
-                        JOIN app_user pu ON pu.user_id = a.prepared_by
-                        JOIN app_user ru ON ru.user_id = a.reviewed_by
-                        JOIN app_user qu ON qu.user_id = a.approved_by
                        WHERE e.manifest_id = ${M}::uuid AND e.object_type='ADJUSTMENT'
                        ORDER BY e.object_id`);
   const manifest = q(`SELECT calculation_scope, hash_algorithm, canonicalization_version,
@@ -634,7 +632,8 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
     .map((code) => ({ outputCode: code, sourceCodes: byTarget.get(code) ?? [] }));
   const trace = resolveTraceability(outputs, coverage.map((c) => ({
     id: c.id, accountScope: c.account_scope,
-    granularity: c.granularity as "BALANCE" | "JOURNAL" | "SUBLEDGER" | "DOCUMENT" })));
+    granularity: c.granularity as "BALANCE" | "JOURNAL" | "SUBLEDGER" | "DOCUMENT",
+    completeness: c.completeness_status as "COMPLETE" | "PARTIAL" | "UNKNOWN" })));
 
   const sections: Section[] = [
     { name: "source", title: "來源", headers: ["類型", "識別", "欄位A", "欄位B", "欄位C", "欄位D", "欄位E"],
@@ -669,8 +668,9 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
     { name: "control_exceptions", title: "控制例外", headers: ["項目"],
       rows: [["未折算（NO_FX，折算屬 MVP 3）"], ["無正式覆核與期間批准（PREVIEW）"], ["其餘控制例外＝未評估"]] },
     { name: "traceability", title: "追溯判定（逐科目範圍；AC-AUD-001）",
-      headers: ["集團科目", "data_coverage_id", "追溯等級"],
-      rows: trace.map((t) => [t.outputCode, t.coverageIds.join("；") || "—", TRACE_LABEL[t.level]]) },
+      headers: ["集團科目", "data_coverage_id", "追溯等級", "完整度"],
+      rows: trace.map((t) => [t.outputCode, t.coverageIds.join("；") || "—",
+        TRACE_LABEL[t.level], t.completeness]) },
     { name: "events", title: `事件時間軸（≤ cutoff ${j.audit_cutoff_event_id}）`,
       headers: ["#", "事件", "物件類型", "物件"],
       rows: events.map((e) => [e.id, e.event_type, e.object_type, e.object_id.slice(0, 8)]) },
@@ -678,7 +678,7 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
       rows: docs.map((d) => [d.file_name, d.content_sha256, d.object_key, d.byte_size]) },
   ];
   const hashed = sections.map((s) => ({ name: s.name, count: s.rows.length,
-    hash: sha256hex(sectionCanonical(s)) }));
+    hash: sha256hex(sectionCanonical(s.headers, s.rows)) }));
   // aggregate 公式與 0016 READY 守衛一致：section|hash 依節名 byte 序聚合
   const packageContentHash = sha256hex(
     [...hashed].sort((a, b) => (a.name < b.name ? -1 : 1))

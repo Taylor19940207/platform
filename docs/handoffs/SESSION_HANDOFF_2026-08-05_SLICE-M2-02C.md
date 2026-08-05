@@ -52,3 +52,19 @@ R5／R7 掛載；明示重產 UI；staging 孤兒清理排程；retention（D-26
 | P2 | `audit_event_id`（bigint）經 `Number()`——超出 JS 安全整數會錯指 cutoff | API 與 worker 一律十進位字串傳遞＋`::bigint` |
 
 **測試 414 → 420（單元 48、DB 整合 191、端到端 181），全綠。02C 正式關閉。**
+
+## 2026-08-05 final hardening（0017；第二輪逐行審查四項 P1＋一項 P2）
+
+| # | 缺口 | 修正 |
+|---|---|---|
+| ① | canonical／HTML 大改但 `render_version` 仍 html-1——跨部署重產同 run 可得不同 hash | 升 **html-2**（canonical JSON＋完整度欄＋凍結人名——canonical 規則改變＝render 升版） |
+| ② | coverage 只按 batch_id 查詢，多版本會混入；guard 未限定版本 | worker 以 **Manifest SOURCE_TB entry 的 batch_version** 定位；0017 guard：Dataset／Coverage 版本必須等於批次當前版本 |
+| ③ | `\|`＋換行串接可碰撞（`["a\|b","c"]`＝`["a","b\|c"]`） | canonical 改 **JSON 序列化**（domain `sectionCanonical`，worker 共用）；注入碰撞單元測試 |
+| ④ | 映射／調整人名即時讀 `app_user.display_name`——改名即 hash 漂移 | Manifest 建立時凍結 **actor ID＋當時顯示名稱＋時間** 進 entry payload；worker 只讀凍結快照，app_user JOIN 移除；端到端證明改名後重產 hash 不漂移 |
+| P2 | `resolveTraceability` 忽略 completeness——PARTIAL／UNKNOWN 照樣顯示高等級 | 規則寫死：**UNKNOWN 完整度 → 等級降 UNKNOWN；PARTIAL 保級但併列呈現**；追溯列加「完整度」欄；匯入 worker 對通過 G-01 的整份 TB 記 `COMPLETE`（餘額級完整性已驗證） |
+
+過程教訓：python 字串替換未命中時靜默跳過——`data_coverage` 的 COMPLETE 改寫首輪沒生效，
+由端到端 12/12 BALANCE 轉紅抓回。**改字串前先 grep 錨點。**
+
+**測試 420 → 423（單元 50、端到端 182），全綠。02C 至此正式關閉。**
+下一個 session 從「里程碑 2 離開條件盤點」開始。

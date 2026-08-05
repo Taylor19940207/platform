@@ -4,7 +4,9 @@
 export type EvidencePackageStatus = "GENERATING" | "READY" | "FAILED";
 
 /** 底稿渲染版本：入 Package 與 object key——render 升版＝明示重產的正當理由。 */
-export const RENDER_VERSION = "html-1";
+export const RENDER_VERSION = "html-2";
+// html-2（0017）：canonical 改為 JSON 序列化（消除分隔符注入碰撞）、追溯列加完整度、
+// 人名改讀 Manifest 凍結快照——canonical 規則改變＝render 升版，跨部署重產不歧義。
 
 const LEGAL: Record<EvidencePackageStatus, EvidencePackageStatus[]> = {
   GENERATING: ["READY", "FAILED"],
@@ -66,9 +68,17 @@ export const PACKAGE_SECTIONS = [
 export type Granularity = "BALANCE" | "JOURNAL" | "SUBLEDGER" | "DOCUMENT";
 const GRAN_ORDER: Record<Granularity, number> = { BALANCE: 0, JOURNAL: 1, SUBLEDGER: 2, DOCUMENT: 3 };
 
-export interface CoverageRow { id: string; accountScope: string; granularity: Granularity }
+export type Completeness = "COMPLETE" | "PARTIAL" | "UNKNOWN";
+const COMP_ORDER: Record<Completeness, number> = { UNKNOWN: 0, PARTIAL: 1, COMPLETE: 2 };
+
+export interface CoverageRow {
+  id: string; accountScope: string; granularity: Granularity; completeness: Completeness;
+}
 export interface TraceInput { outputCode: string; sourceCodes: string[] }
-export interface TraceResult { outputCode: string; coverageIds: string[]; level: Granularity | "UNKNOWN" }
+export interface TraceResult {
+  outputCode: string; coverageIds: string[];
+  level: Granularity | "UNKNOWN"; completeness: Completeness;
+}
 
 /**
  * 輸出科目 → 來源科目（映射 lineage）→ coverage → 等級。
@@ -80,17 +90,33 @@ export interface TraceResult { outputCode: string; coverageIds: string[]; level:
 export function resolveTraceability(outputs: TraceInput[], coverages: CoverageRow[]): TraceResult[] {
   return outputs.map((o) => {
     if (o.sourceCodes.length === 0)
-      return { outputCode: o.outputCode, coverageIds: [], level: "UNKNOWN" };
+      return { outputCode: o.outputCode, coverageIds: [], level: "UNKNOWN", completeness: "UNKNOWN" };
     const perSource = o.sourceCodes.map((src) => {
       const specific = coverages.filter((c) => c.accountScope === src);
       return specific.length ? specific : coverages.filter((c) => c.accountScope === "*");
     });
     if (perSource.some((f) => f.length === 0))
-      return { outputCode: o.outputCode, coverageIds: [], level: "UNKNOWN" };
-    const ids = [...new Set(perSource.flat().map((c) => c.id))].sort();
+      return { outputCode: o.outputCode, coverageIds: [], level: "UNKNOWN", completeness: "UNKNOWN" };
+    const involved = perSource.flat();
+    const ids = [...new Set(involved.map((c) => c.id))].sort();
+    // 完整度＝所有涉及 coverage 的最弱值；UNKNOWN 完整度不得宣稱任何等級（降 UNKNOWN），
+    // PARTIAL 保留等級但必須併列呈現（0017 P2 規則）
+    const compNum = Math.min(...involved.map((c) => COMP_ORDER[c.completeness]));
+    const completeness = (Object.keys(COMP_ORDER) as Completeness[])
+      .find((x) => COMP_ORDER[x] === compNum)!;
+    if (completeness === "UNKNOWN")
+      return { outputCode: o.outputCode, coverageIds: ids, level: "UNKNOWN", completeness };
     const levelNum = Math.min(...perSource.map((f) => Math.max(...f.map((c) => GRAN_ORDER[c.granularity]))));
     const level = (Object.keys(GRAN_ORDER) as Granularity[])
       .find((g) => GRAN_ORDER[g] === levelNum)!;
-    return { outputCode: o.outputCode, coverageIds: ids, level };
+    return { outputCode: o.outputCode, coverageIds: ids, level, completeness };
   });
+}
+
+/**
+ * 逐節 canonical＝canonical JSON（0017 P1-③）：JSON escaping 消除分隔符注入——
+ * ["a|b","c"] 與 ["a","b|c"] 必得不同 canonical。HTML 由同一份 rows 渲染。
+ */
+export function sectionCanonical(headers: string[], rows: string[][]): string {
+  return JSON.stringify([headers, ...rows]);
 }

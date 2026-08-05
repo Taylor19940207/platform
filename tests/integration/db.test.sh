@@ -878,8 +878,8 @@ expect_err "INV-18：包工作主體屬其他租戶 → 拒絕" \
    VALUES ('22222222-2222-2222-2222-222222222222','EVIDENCE_PACKAGE','$PKG1',1,'html-1','ek2')" "不屬於本租戶"
 # 契約 C：來源實體不可變前提
 expect_ok "契約 C 前置：coverage 與 document 各一列（B2 未封存）" \
-  "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B2',8,'BALANCE','UNKNOWN');
+  "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, account_scope, granularity, completeness_status)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',1,'prep','BALANCE','UNKNOWN');
    INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
    VALUES ('11111111-1111-1111-1111-111111111111','$B2','tb.csv','h','k0',1)"
 expect_err "契約 C：source_dataset 不可修改" \
@@ -901,9 +901,9 @@ n=$(APP_C <<<"$T2 SELECT count(*) FROM evidence_package")
 expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
    VALUES ('11111111-1111-1111-1111-111111111111','$B2',1,'BALANCE','h2',2)" "duplicate key"
-expect_ok "冪等：不同 batch_version 視為不同資料集" \
+expect_err "0017②：來源實體版本必須等於批次當前版本（Manifest 依 batch_version 定位）" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B2',2,'BALANCE','h3',2)"
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',2,'BALANCE','h3',2)" "必須等於批次當前版本"
 expect_ok "冪等：data_coverage 首筆" \
   "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
    VALUES ('11111111-1111-1111-1111-111111111111','$B2',1,'BALANCE','UNKNOWN')"
