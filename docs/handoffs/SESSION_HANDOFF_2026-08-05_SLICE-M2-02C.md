@@ -40,3 +40,15 @@ R5／R7 掛載；明示重產 UI；staging 孤兒清理排程；retention（D-26
 
 **測試 369 → 414（單元 46、DB 整合 188、端到端 180），全綠。**
 **里程碑 2 的 02 系列收官。**下一步：里程碑 2 檢視 → 決定下一刀。
+
+## 2026-08-05 收口章節（逐行審查四項 P1＋一項 P2）——02C 正式關閉
+
+| # | 缺口 | 修正 |
+|---|---|---|
+| ① | 來源列不可修改但「來源集合」未封存：批次驗證完成後仍可新增 source_document／coverage／dataset——同 run 再產包得到不同內容 | migration **0016**：封存點＝批次離開 DRAFT／UPLOADED／VALIDATING（鎖批次列，0014 並發紀律同式）；「同 run＋cutoff＋render → 同 hash」自此有結構性保證 |
+| ② | 逐科目追溯實為「第一筆 coverage 套全部科目」；dataset join 漏 granularity 條件 | domain `resolveTraceability`：輸出科目 → 映射來源 → coverage（**精確 scope 優先於 wildcard、弱鏈決定等級、無來源＝UNKNOWN 誠實標示**）；混合 scope／granularity 單元測試；join 補 granularity |
+| ③ | 逐節 hash 未涵蓋名稱、法源、附件、判斷理由等實際顯示內容——canonical 與 HTML 兩套內容可漂移 | buildPackage 重構：**同一份 canonical rows 同時產生 hash 與 HTML**（渲染器只吃 rows）；端到端漂移測試：改法源一欄 → adjustment 節 hash 與 package hash 均改變 |
+| ④ | GENERATING／FAILED 互斥漏 MIME、byte size、completed_at 等欄位；READY 未驗固定章節與 aggregate | 0016 補全三態欄位互斥；READY 於 **DB 重算 aggregate**（`section|hash` 依 COLLATE "C" 聚合）並驗固定 10 節——直接 SQL 無法造出「不完整但看似 READY」的包 |
+| P2 | `audit_event_id`（bigint）經 `Number()`——超出 JS 安全整數會錯指 cutoff | API 與 worker 一律十進位字串傳遞＋`::bigint` |
+
+**測試 414 → 420（單元 48、DB 整合 191、端到端 181），全綠。02C 正式關閉。**

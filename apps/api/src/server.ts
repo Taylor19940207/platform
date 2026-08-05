@@ -1507,17 +1507,17 @@ account_code,account_name,debit,credit
           INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
             request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
           VALUES (:'p'::uuid, :'t'::uuid, :'e'::uuid, :'r'::uuid,
-            :'rk'::uuid, :'rch', ${Number(cutoff.id)}, :'rv', :'u'::uuid);
+            :'rk'::uuid, :'rch', :'cut'::bigint, :'rv', :'u'::uuid);
           INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version,
             rule_version, idempotency_key, max_attempts)
           VALUES (:'t'::uuid, 'EVIDENCE_PACKAGE', :'p'::uuid, 1, :'rv', :'ik', ${config.jobMaxAttempts});
           INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
           VALUES (:'t'::uuid, 'DOMAIN_EVENT', 'evidence_package.created', :'u'::uuid,
             'evidence_package', :'p'::uuid,
-            jsonb_build_object('run', :'r', 'cutoff', ${Number(cutoff.id)}, 'render', :'rv'));
+            jsonb_build_object('run', :'r', 'cutoff', (:'cut')::bigint, 'render', :'rv'));
           COMMIT;`,
           { p: pkgId, t: s.tenantId, e: run.engagement_id, r: run.calculation_run_id,
-            rk: requestKey, rch, rv: RENDER_VERSION, u: s.userId, ik },
+            rk: requestKey, rch, rv: RENDER_VERSION, u: s.userId, ik, cut: cutoff.id },
           { tenantId: s.tenantId });
       } catch (e) {
         const msg = String(e);

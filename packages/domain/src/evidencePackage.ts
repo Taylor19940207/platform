@@ -54,3 +54,43 @@ export function stagingVerdict(existingSha256: string, wantSha256: string): "REU
 export function artifactObjectKey(tenantId: string, packageId: string, renderVersion: string): string {
   return `${tenantId}/evidence/${packageId}/${renderVersion}.html`;
 }
+
+/** 固定章節集合：READY 守衛（0016）與 worker 共用同一份清單。 */
+export const PACKAGE_SECTIONS = [
+  "source", "mapping", "adjustment", "calculation", "rule_versions",
+  "process_level", "control_exceptions", "traceability", "events", "attachments",
+] as const;
+
+// ── 逐科目範圍追溯（AC-AUD-001）：依實際 lineage 解析，不得把單一 coverage 套全部 ──
+
+export type Granularity = "BALANCE" | "JOURNAL" | "SUBLEDGER" | "DOCUMENT";
+const GRAN_ORDER: Record<Granularity, number> = { BALANCE: 0, JOURNAL: 1, SUBLEDGER: 2, DOCUMENT: 3 };
+
+export interface CoverageRow { id: string; accountScope: string; granularity: Granularity }
+export interface TraceInput { outputCode: string; sourceCodes: string[] }
+export interface TraceResult { outputCode: string; coverageIds: string[]; level: Granularity | "UNKNOWN" }
+
+/**
+ * 輸出科目 → 來源科目（映射 lineage）→ coverage → 等級。
+ * scope 語意（本刀）：`*`＝全部；否則為單一來源科目代碼的精確匹配，**精確優先於 wildcard**。
+ * 等級＝各來源「可用最高等級」中的**最低**——輸出範圍不得宣稱高於任一來源的實際涵蓋
+ * （AC-AUD-001／INV-23 精神：弱鏈決定等級）。
+ * 無 TB 來源（純調整科目）或來源無 coverage → `UNKNOWN`（誠實標示，不猜測）。
+ */
+export function resolveTraceability(outputs: TraceInput[], coverages: CoverageRow[]): TraceResult[] {
+  return outputs.map((o) => {
+    if (o.sourceCodes.length === 0)
+      return { outputCode: o.outputCode, coverageIds: [], level: "UNKNOWN" };
+    const perSource = o.sourceCodes.map((src) => {
+      const specific = coverages.filter((c) => c.accountScope === src);
+      return specific.length ? specific : coverages.filter((c) => c.accountScope === "*");
+    });
+    if (perSource.some((f) => f.length === 0))
+      return { outputCode: o.outputCode, coverageIds: [], level: "UNKNOWN" };
+    const ids = [...new Set(perSource.flat().map((c) => c.id))].sort();
+    const levelNum = Math.min(...perSource.map((f) => Math.max(...f.map((c) => GRAN_ORDER[c.granularity]))));
+    const level = (Object.keys(GRAN_ORDER) as Granularity[])
+      .find((g) => GRAN_ORDER[g] === levelNum)!;
+    return { outputCode: o.outputCode, coverageIds: ids, level };
+  });
+}

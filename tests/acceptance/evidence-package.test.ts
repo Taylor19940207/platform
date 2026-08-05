@@ -149,6 +149,21 @@ try {
     && pkgField(P2, "artifact_sha256") === pkgField(P1, "artifact_sha256"),
     `${pkgField(P2, "status")}`);
 
+  // ── P1-③ 漂移測試：canonical 與 HTML 同源——任一顯示欄位改變必使 section／package hash 改變 ──
+  sql(`ALTER TABLE adjustment DISABLE TRIGGER USER`);
+  sql(`UPDATE adjustment SET legal_basis='母公司折舊政策 v4（變更）' WHERE adjustment_id='${ADJ}'`);
+  sql(`ALTER TABLE adjustment ENABLE TRIGGER USER`);
+  await post(jia, "/b07/package", { run: RUN, request_key: K(8) });
+  const P5 = sql(`SELECT package_id FROM evidence_package WHERE request_key='${K(8)}'`);
+  check("顯示欄位（法源）變更 → adjustment 節 hash 與 package hash 均改變（逐節 hash 涵蓋全部顯示內容）",
+    await waitFor(() => pkgField(P5, "status") === "READY")
+    && sql(`SELECT content_hash FROM evidence_package_index
+            WHERE package_id='${P5}' AND section='adjustment'`)
+       !== sql(`SELECT content_hash FROM evidence_package_index
+            WHERE package_id='${P1}' AND section='adjustment'`)
+    && pkgField(P5, "package_content_hash") !== pkgField(P1, "package_content_hash"),
+    pkgField(P5, "status"));
+
   // ── 契約 B：staging 物件預置異內容 → 確定性 ARTIFACT_CONFLICT ──
   const P3 = "ee330000-0000-0000-0000-000000000003";
   const cut = sql(`SELECT audit_cutoff_event_id FROM evidence_package WHERE package_id='${P1}'`);

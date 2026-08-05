@@ -28,7 +28,7 @@ import { classifyError, verdictFor, type JobErrorClass }
 import { reasonCodeOf, isDeterministicRunFailure, RUN_REASON }
   from "../../../packages/domain/src/calculationRun.ts";
 import { PKG_REASON, pkgReasonCodeOf, isDeterministicPkgFailure, stagingVerdict,
-  artifactObjectKey } from "../../../packages/domain/src/evidencePackage.ts";
+  artifactObjectKey, resolveTraceability } from "../../../packages/domain/src/evidencePackage.ts";
 import { putObject } from "../../../packages/database/src/objectstore.ts";
 import { config } from "../../../packages/config/src/index.ts";
 
@@ -522,12 +522,30 @@ const sha256hex = (b: Buffer | string): string =>
 const esc2 = (s: unknown) => String(s ?? "").replace(/[&<>"]/g,
   (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch] as string));
 
+interface Section { name: string; title: string; headers: string[]; rows: string[][] }
 interface BuiltPackage {
   sections: { name: string; count: number; hash: string }[];
   packageContentHash: string;
   html: Buffer;
   artifactSha256: string;
 }
+
+/** 逐節 canonical＝標頭＋全部顯示列——HTML 由同一份 rows 渲染，內容不可能漂移出 hash。 */
+const sectionCanonical = (s: Section): string =>
+  [s.headers.join("|"), ...s.rows.map((r) => r.join("|"))].join("\n");
+
+function renderSection(s: Section, hash: string): string {
+  const pad = (r: string[]) => [...r, ...Array(Math.max(0, s.headers.length - r.length)).fill("")];
+  return `<h2>${esc2(s.title)}（§hash ${esc2(hash.slice(0, 12))}）</h2>
+<table><tr>${s.headers.map((h) => `<th>${esc2(h)}</th>`).join("")}</tr>
+${s.rows.map((r) => `<tr>${pad(r).map((c) => `<td>${esc2(c)}</td>`).join("")}</tr>`).join("\n")}</table>`;
+}
+
+const TRACE_LABEL: Record<string, string> = {
+  BALANCE: "BALANCE（餘額級）", JOURNAL: "JOURNAL（分錄級）",
+  SUBLEDGER: "SUBLEDGER（明細級）", DOCUMENT: "DOCUMENT（憑證級）",
+  UNKNOWN: "UNKNOWN（無法判定）",
+};
 
 /** 交易外：全部讀不可變／凍結資料，不查 current（INV-29 同一精神）。 */
 function buildPackage(j: ClaimedPkg): BuiltPackage {
@@ -537,17 +555,19 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
 
   const batch = q(`SELECT batch_version::text, COALESCE(file_sha256,'') AS file_sha256
                      FROM import_batch WHERE import_batch_id = ${B}::uuid`)[0];
-  const srcTb = q(`SELECT x->>'code' AS code, x->>'name' AS name,
+  const srcTb = q(`SELECT x->>'code' AS code, COALESCE(x->>'name','') AS name,
                           x->>'debit' AS debit, x->>'credit' AS credit
                      FROM calculation_manifest_entry e, jsonb_array_elements(e.payload) x
                     WHERE e.manifest_id = ${M}::uuid AND e.object_type='SOURCE_TB'
                     ORDER BY x->>'code'`);
+  // dataset join 帶 granularity 條件——多粒度時不得配錯 dataset hash（P1-②）
   const coverage = q(`SELECT dc.data_coverage_id::text AS id, dc.account_scope, dc.granularity,
                              dc.completeness_status, sd.source_dataset_id::text AS dataset_id,
                              sd.content_sha256 AS dataset_sha
                         FROM data_coverage dc
                         JOIN source_dataset sd ON sd.import_batch_id = dc.import_batch_id
                          AND sd.batch_version = dc.batch_version
+                         AND sd.granularity = dc.granularity
                        WHERE dc.import_batch_id = ${B}::uuid
                        ORDER BY dc.data_coverage_id`);
   const mappings = q(`SELECT e.payload->>'source_code' AS source_code,
@@ -566,8 +586,11 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
                        ORDER BY e.payload->>'source_code'`);
   const adjustments = q(`SELECT e.object_id::text AS adjustment_id,
                              e.payload->>'business_version' AS business_version,
-                             e.payload->>'title' AS title, e.payload->'lines' AS lines,
-                             a.legal_basis, a.evidence_ref, a.judgment_reason, a.language_tag,
+                             e.payload->>'title' AS title, (e.payload->'lines')::text AS lines,
+                             COALESCE(a.legal_basis,'') AS legal_basis,
+                             COALESCE(a.evidence_ref,'') AS evidence_ref,
+                             COALESCE(a.judgment_reason,'') AS judgment_reason,
+                             COALESCE(a.language_tag,'') AS language_tag,
                              pu.display_name AS prepared_by, a.prepared_at::text AS prepared_at,
                              ru.display_name AS reviewed_by, a.reviewed_at::text AS reviewed_at,
                              qu.display_name AS approved_by, a.approved_at::text AS approved_at
@@ -588,51 +611,81 @@ function buildPackage(j: ClaimedPkg): BuiltPackage {
   const objIds = [j.calculation_run_id, j.import_batch_id,
     ...q(`SELECT DISTINCT object_id::text AS id FROM calculation_manifest_entry
            WHERE manifest_id = ${M}::uuid AND object_id IS NOT NULL`).map((r) => r.id)];
+  // audit_event_id 為 bigint：一律以十進位字串傳遞並 ::bigint，不經 Number()（P2）
   const events = q(`SELECT audit_event_id::text AS id, event_type, object_type,
-                           object_id::text AS object_id, occurred_at::text AS occurred_at
+                           object_id::text AS object_id
                       FROM audit_event
                      WHERE tenant_id = ${T}::uuid AND kind='DOMAIN_EVENT'
-                       AND audit_event_id <= ${Number(j.audit_cutoff_event_id)}
+                       AND audit_event_id <= ${lit(j.audit_cutoff_event_id)}::bigint
                        AND object_id IN (${objIds.map(lit).join("::uuid,")}::uuid)
                      ORDER BY audit_event_id`);
   const docs = q(`SELECT file_name, content_sha256, object_key, byte_size::text AS byte_size
                     FROM source_document WHERE import_batch_id = ${B}::uuid
                    ORDER BY source_document_id`);
-  // 追溯判定：逐輸出科目範圍 account_code → data_coverage_id → granularity（AC-AUD-001）
-  const cov0 = coverage[0];
-  const outputAccounts = [...new Set(snapshot.map((s) => s.account_code))].sort();
-  const trace = outputAccounts.map((code) => ({
-    code, coverageId: cov0?.id ?? "-", level: cov0?.granularity ?? "UNKNOWN" }));
 
-  const canon = {
-    source: [`batch=${j.import_batch_id}|v${batch.batch_version}|sha=${batch.file_sha256}`,
-      ...srcTb.map((l) => `${l.code}:${l.debit}:${l.credit}`),
-      ...coverage.map((c2) => `COVERAGE|${c2.id}|${c2.account_scope}|${c2.granularity}|${c2.completeness_status}|dataset=${c2.dataset_id}|${c2.dataset_sha}`)].join("\n"),
-    mapping: mappings.map((m) => `${m.source_code}|v${m.version_no}|${m.eff_from}|${m.eff_to}|${m.target_code}|by=${m.created_by_name}|appr=${m.approved_by_name}@${m.approved_at}`).join("\n"),
-    adjustment: adjustments.map((a) => `${a.adjustment_id}|bv${a.business_version}|${a.title}|` +
-      `prep=${a.prepared_by}@${a.prepared_at}|rev=${a.reviewed_by}@${a.reviewed_at}|appr=${a.approved_by}@${a.approved_at}|${JSON.stringify(a.lines)}`).join("\n"),
-    calculation: [`frozen=${manifest.frozen_set_content_hash}`, `result=${j.result_content_hash}`,
-      ...snapshot.map((s) => `${s.posting_layer}|${s.account_code}|${s.debit}|${s.credit}`)].join("\n"),
-    rule_versions: `engine=calc-engine-1|canonicalization=${manifest.canonicalization_version}|detect=detect-r1|RuleVersion=未實作（如實標示）`,
-    process_level: `PREVIEW|期間包批准未完成|月次／季次流程分級未實作（如實標示）`,
-    control_exceptions: `未折算（NO_FX，折算屬 MVP 3）|無正式覆核與期間批准（PREVIEW）|其餘控制例外＝未評估`,
-    traceability: trace.map((t) => `${t.code}->coverage:${t.coverageId}->${t.level}`).join("\n"),
-    events: events.map((e) => `${e.id}|${e.event_type}|${e.object_type}|${e.object_id}`).join("\n"),
-    attachments: docs.map((d) => `${d.file_name}|${d.content_sha256}|${d.object_key}|${d.byte_size}`).join("\n"),
-  };
-  const sections = Object.entries(canon).map(([name, text]) => ({
-    name, hash: sha256hex(text),
-    count: name === "source" ? srcTb.length : name === "mapping" ? mappings.length
-      : name === "adjustment" ? adjustments.length : name === "calculation" ? snapshot.length
-      : name === "traceability" ? trace.length : name === "events" ? events.length
-      : name === "attachments" ? docs.length : 1,
-  }));
+  // 追溯判定：真實 lineage——輸出科目 → 映射來源科目 → coverage（精確優先、弱鏈決定等級）
+  const tbCodes = new Set(srcTb.map((l) => l.code));
+  const byTarget = new Map<string, string[]>();
+  for (const m of mappings) {
+    if (!tbCodes.has(m.source_code)) continue;
+    byTarget.set(m.target_code, [...(byTarget.get(m.target_code) ?? []), m.source_code]);
+  }
+  const outputs = [...new Set(snapshot.map((s) => s.account_code))].sort()
+    .map((code) => ({ outputCode: code, sourceCodes: byTarget.get(code) ?? [] }));
+  const trace = resolveTraceability(outputs, coverage.map((c) => ({
+    id: c.id, accountScope: c.account_scope,
+    granularity: c.granularity as "BALANCE" | "JOURNAL" | "SUBLEDGER" | "DOCUMENT" })));
+
+  const sections: Section[] = [
+    { name: "source", title: "來源", headers: ["類型", "識別", "欄位A", "欄位B", "欄位C", "欄位D", "欄位E"],
+      rows: [["批次", j.import_batch_id, `v${batch.batch_version}`, `sha=${batch.file_sha256}`],
+        ...srcTb.map((l) => ["TB科目", l.code, l.name, l.debit, l.credit]),
+        ...coverage.map((c) => ["涵蓋", c.id, c.account_scope, c.granularity,
+          c.completeness_status, `dataset=${c.dataset_id}`, c.dataset_sha])] },
+    { name: "mapping", title: "映射",
+      headers: ["來源科目", "版本", "生效", "失效", "集團科目", "集團科目名稱", "建立者", "批准者", "批准時間"],
+      rows: mappings.map((m) => [m.source_code, `v${m.version_no}`, m.eff_from, m.eff_to,
+        m.target_code, m.target_name, m.created_by_name, m.approved_by_name, m.approved_at]) },
+    { name: "adjustment", title: "調整", headers: ["調整", "欄位", "值"],
+      rows: adjustments.flatMap((a) => {
+        const id8 = a.adjustment_id.slice(0, 8);
+        return [[id8, "標題", `${a.title}（bv${a.business_version}）`],
+          [id8, "法源／政策", a.legal_basis], [id8, "附件", a.evidence_ref],
+          [id8, "判斷理由", a.judgment_reason], [id8, "語言標籤", a.language_tag],
+          [id8, "編製", `${a.prepared_by}＠${a.prepared_at}`],
+          [id8, "覆核", `${a.reviewed_by}＠${a.reviewed_at}`],
+          [id8, "批准", `${a.approved_by}＠${a.approved_at}`],
+          [id8, "分錄", a.lines]];
+      }) },
+    { name: "calculation", title: "計算", headers: ["層", "集團科目", "名稱", "借方", "貸方"],
+      rows: [["META", "frozen_set_content_hash", manifest.frozen_set_content_hash],
+        ["META", "result_content_hash", j.result_content_hash],
+        ...snapshot.map((s) => [s.posting_layer, s.account_code, s.account_name, s.debit, s.credit])] },
+    { name: "rule_versions", title: "規則版本", headers: ["項目"],
+      rows: [[`engine=calc-engine-1`], [`canonicalization=${manifest.canonicalization_version}`],
+        [`detect=detect-r1`], ["RuleVersion 實體＝未實作（如實標示）"]] },
+    { name: "process_level", title: "流程等級", headers: ["項目"],
+      rows: [["PREVIEW"], ["期間包批准＝未完成"], ["月次／季次流程分級＝未實作（如實標示）"]] },
+    { name: "control_exceptions", title: "控制例外", headers: ["項目"],
+      rows: [["未折算（NO_FX，折算屬 MVP 3）"], ["無正式覆核與期間批准（PREVIEW）"], ["其餘控制例外＝未評估"]] },
+    { name: "traceability", title: "追溯判定（逐科目範圍；AC-AUD-001）",
+      headers: ["集團科目", "data_coverage_id", "追溯等級"],
+      rows: trace.map((t) => [t.outputCode, t.coverageIds.join("；") || "—", TRACE_LABEL[t.level]]) },
+    { name: "events", title: `事件時間軸（≤ cutoff ${j.audit_cutoff_event_id}）`,
+      headers: ["#", "事件", "物件類型", "物件"],
+      rows: events.map((e) => [e.id, e.event_type, e.object_type, e.object_id.slice(0, 8)]) },
+    { name: "attachments", title: "附件索引", headers: ["檔名", "SHA-256", "object key", "bytes"],
+      rows: docs.map((d) => [d.file_name, d.content_sha256, d.object_key, d.byte_size]) },
+  ];
+  const hashed = sections.map((s) => ({ name: s.name, count: s.rows.length,
+    hash: sha256hex(sectionCanonical(s)) }));
+  // aggregate 公式與 0016 READY 守衛一致：section|hash 依節名 byte 序聚合
   const packageContentHash = sha256hex(
-    sections.map((s) => `${s.name}|${s.hash}`).sort().join("\n"));
+    [...hashed].sort((a, b) => (a.name < b.name ? -1 : 1))
+      .map((s) => `${s.name}|${s.hash}`).join("\n"));
 
   const warn = "DRAFT・UNREVIEWED・未折算（NO_FX）——非正式輸出，不得作為入帳或交付依據";
-  const th = (s: string[]) => `<tr>${s.map((x) => `<th>${esc2(x)}</th>`).join("")}</tr>`;
-  const td = (s: string[]) => `<tr>${s.map((x) => `<td>${esc2(x)}</td>`).join("")}</tr>`;
+  const td = (r: string[]) => `<tr>${r.map((x) => `<td>${esc2(x)}</td>`).join("")}</tr>`;
   const html = Buffer.from(`<!DOCTYPE html><html lang="zh-Hant"><meta charset="utf-8">
 <title>PREVIEW 證據包（run ${esc2(j.calculation_run_id.slice(0, 8))}）</title>
 <style>body{font-family:sans-serif;margin:24px;color:#1b1f24}table{border-collapse:collapse;margin:8px 0}
@@ -644,43 +697,17 @@ th,td{border:1px solid #ccc;padding:4px 8px;font-size:13px}h2{margin-top:24px}
 ${td(["result hash", j.result_content_hash])}${td(["package_content_hash", packageContentHash])}
 ${td(["render_version", j.render_version])}${td(["audit_cutoff_event_id", j.audit_cutoff_event_id])}
 ${td(["calculation_scope", manifest.calculation_scope])}</table>
-<h2>追溯等級總表（逐科目範圍；AC-AUD-001）</h2>
-<p>本包可反查至 <b>餘額級（BALANCE）</b>；依實際 DataCoverage 逐科目範圍判定如下——各範圍均不得宣稱高於所列等級。</p>
-<table>${th(["集團科目", "data_coverage_id", "追溯等級"])}
-${trace.map((t) => td([t.code, t.coverageId, t.level === "BALANCE" ? "BALANCE（餘額級）" : t.level])).join("")}</table>
-<h2>來源（§hash ${sections.find((s) => s.name === "source")!.hash.slice(0, 12)}）</h2>
-<table>${td(["ImportBatch", `${j.import_batch_id}（v${batch.batch_version}）`])}${td(["檔案 SHA-256", batch.file_sha256])}</table>
-<table>${th(["來源科目", "名稱", "借方", "貸方"])}${srcTb.map((l) => td([l.code, l.name ?? "", l.debit, l.credit])).join("")}</table>
-<table>${th(["DataCoverage", "範圍", "granularity", "完整度", "SourceDataset", "dataset SHA-256"])}
-${coverage.map((c2) => td([c2.id, c2.account_scope, c2.granularity, c2.completeness_status, c2.dataset_id, c2.dataset_sha])).join("")}</table>
-<h2>映射（§hash ${sections.find((s) => s.name === "mapping")!.hash.slice(0, 12)}）</h2>
-<table>${th(["來源科目", "版本", "生效", "失效", "集團科目", "建立者", "批准者", "批准時間"])}
-${mappings.map((m) => td([m.source_code, `v${m.version_no}`, m.eff_from, m.eff_to,
-  `${m.target_code} ${m.target_name}`, m.created_by_name, m.approved_by_name, m.approved_at])).join("")}</table>
-<h2>調整（§hash ${sections.find((s) => s.name === "adjustment")!.hash.slice(0, 12)}）</h2>
-${adjustments.map((a) => `<table>${td(["調整", `${a.title}（bv${a.business_version}）`])}
-${td(["法源／政策", a.legal_basis ?? ""])}${td(["附件", a.evidence_ref ?? ""])}
-${td(["判斷理由", a.judgment_reason ?? ""])}${td(["語言標籤", a.language_tag ?? ""])}
-${td(["編製", `${a.prepared_by}＠${a.prepared_at}`])}${td(["覆核", `${a.reviewed_by}＠${a.reviewed_at}`])}
-${td(["批准", `${a.approved_by}＠${a.approved_at}`])}${td(["分錄", JSON.stringify(a.lines)])}</table>`).join("")}
-<h2>計算（§hash ${sections.find((s) => s.name === "calculation")!.hash.slice(0, 12)}）</h2>
-<table>${th(["層", "集團科目", "名稱", "借方", "貸方"])}
-${snapshot.map((s) => td([s.posting_layer, s.account_code, s.account_name, s.debit, s.credit])).join("")}</table>
-<h2>規則版本</h2><p>${esc2(canon.rule_versions)}</p>
-<h2>流程等級</h2><p>${esc2(canon.process_level)}</p>
-<h2>控制例外</h2><p>${esc2(canon.control_exceptions)}</p>
-<h2>事件時間軸（≤ cutoff ${esc2(j.audit_cutoff_event_id)}）</h2>
-<table>${th(["#", "事件", "物件"])}${events.map((e) => td([e.id, e.event_type, `${e.object_type} ${e.object_id.slice(0, 8)}`])).join("")}</table>
-<h2>附件索引</h2>
-<table>${th(["檔名", "SHA-256", "object key", "bytes"])}${docs.map((d) => td([d.file_name, d.content_sha256, d.object_key, d.byte_size])).join("")}</table>
+<p>追溯等級依實際 DataCoverage <b>逐科目範圍</b>判定（見「追溯判定」節）；各範圍不得宣稱高於所列等級。</p>
+${sections.map((s, i) => renderSection(s, hashed[i].hash)).join("\n")}
 <h2>逐節 hash 對照表</h2>
-<table>${th(["節", "筆數", "content hash"])}${sections.map((s) => td([s.name, String(s.count), s.hash])).join("")}</table>
+<table><tr><th>節</th><th>筆數</th><th>content hash</th></tr>
+${hashed.map((s) => td([s.name, String(s.count), s.hash])).join("")}</table>
 <div class="warn">${esc2(warn)}</div></html>`, "utf8");
 
   // 契約 D-3（JS 端斷言）：artifact 必須內嵌與索引一致的逐節 hash
-  for (const s of sections)
+  for (const s of hashed)
     if (!html.includes(s.hash)) throw new Error(`UPSTREAM_VERIFY_FAILED:SECTION_HASH_NOT_EMBEDDED:${s.name}`);
-  return { sections, packageContentHash, html, artifactSha256: sha256hex(html) };
+  return { sections: hashed, packageContentHash, html, artifactSha256: sha256hex(html) };
 }
 
 /** 契約 B：write-once staging——已存在則核對 hash，同沿用、異即確定性失敗。 */
@@ -729,7 +756,7 @@ function commitPackage(j: ClaimedPkg, b: BuiltPackage, key: string): void {
         -- 契約 D-4：cutoff 事件屬於該 run
         SELECT fn_assert(EXISTS (
           SELECT 1 FROM audit_event
-           WHERE audit_event_id = ${Number(j.audit_cutoff_event_id)}
+           WHERE audit_event_id = ${lit(j.audit_cutoff_event_id)}::bigint
              AND event_type = 'calculation_run.completed'
              AND object_id = ${RUN}::uuid),
           'UPSTREAM_VERIFY_FAILED:CUTOFF_EVENT');

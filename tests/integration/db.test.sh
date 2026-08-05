@@ -53,16 +53,19 @@ INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id)
   ('99999999-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000001');
 INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id, declared_period_revision_id, uploaded_by, provided_by) VALUES
   ('00000000-0000-0000-0000-0000000000b1','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001');
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id, declared_period_revision_id, uploaded_by, provided_by, status) VALUES
+  ('00000000-0000-0000-0000-0000000000b2','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','UPLOADED');
 SQL
 ok "種子資料建立（2 租戶、1 案件、1 批次）"
 
 B1=00000000-0000-0000-0000-0000000000b1
+B2=00000000-0000-0000-0000-0000000000b2
 T1="SET app.tenant_id = '11111111-1111-1111-1111-111111111111';"
 T2="SET app.tenant_id = '22222222-2222-2222-2222-222222222222';"
 
 # ── RLS（§24.9／INV-18） ────────────────────────────
 n=$(APP_C <<<"$T1 SELECT count(*) FROM import_batch")
-[ "$n" = "1" ] && ok "RLS：T1 看得到自己的批次" || ng "RLS：T1 應看到 1 筆，得到 $n"
+[ "$n" = "2" ] && ok "RLS：T1 看得到自己的批次（B1＋B2）" || ng "RLS：T1 應看到 2 筆，得到 $n"
 n=$(APP_C <<<"$T2 SELECT count(*) FROM import_batch")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的批次" || ng "RLS：T2 應看到 0 筆，得到 $n"
 if APP_C >/dev/null 2>&1 <<<"$T2 INSERT INTO import_batch (tenant_id, engagement_id, declared_legal_entity_id, declared_period_revision_id) VALUES ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001')"
@@ -116,12 +119,12 @@ expect_err "確認紀錄不可 UPDATE" \
 # ── 不可變性與借貸平衡 ─────────────────────────────
 PSQL_C >/dev/null <<SQL
 INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
-VALUES ('77777777-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','h',2);
+VALUES ('77777777-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','$B2',1,'BALANCE','h',2);
 INSERT INTO source_ledger_line (tenant_id, source_dataset_id, import_batch_id, source_row_id, account_code, debit, credit, content_sha256) VALUES
- ('11111111-1111-1111-1111-111111111111','77777777-0000-0000-0000-000000000001','$B1','r1','1100',1000.00,0,'h1'),
- ('11111111-1111-1111-1111-111111111111','77777777-0000-0000-0000-000000000001','$B1','r2','4000',0,1000.00,'h2');
+ ('11111111-1111-1111-1111-111111111111','77777777-0000-0000-0000-000000000001','$B2','r1','1100',1000.00,0,'h1'),
+ ('11111111-1111-1111-1111-111111111111','77777777-0000-0000-0000-000000000001','$B2','r2','4000',0,1000.00,'h2');
 SQL
-bal=$(PSQL_C <<<"SELECT fn_tb_balance('$B1')")
+bal=$(PSQL_C <<<"SELECT fn_tb_balance('$B2')")
 [ "$bal" = "0.00" ] && ok "G-01：借貸平衡函式（差額 0.00）" || ng "借貸平衡：期望 0.00 得到 $bal"
 expect_err "SourceLedgerLine 不可變（更正走新批次）" \
   "UPDATE source_ledger_line SET debit=999 WHERE source_row_id='r1'" "不可變"
@@ -831,13 +834,19 @@ expect_err "request_key 唯一於（tenant, key）" \
         request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
    VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
            'ee220000-0000-0000-0000-0000000000a1','pch1',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001')" "duplicate key"
-expect_ok "索引：GENERATING 期間可寫入" \
+expect_ok "索引：GENERATING 期間可寫入（固定 10 節）" \
   "$T1 INSERT INTO evidence_package_index (tenant_id, package_id, section, item_count, content_hash)
-   VALUES ('11111111-1111-1111-1111-111111111111','$PKG1','source',1,'h1')"
+   SELECT '11111111-1111-1111-1111-111111111111','$PKG1', s, 1, 'h-'||s
+     FROM unnest(ARRAY['source','mapping','adjustment','calculation','rule_versions',
+                       'process_level','control_exceptions','traceability','events','attachments']) AS s"
 expect_err "契約 A：READY 必須齊備 artifact 與內容 hash" \
   "$T1 UPDATE evidence_package SET status='READY' WHERE package_id='$PKG1'" "齊備"
-expect_ok "GENERATING → READY（齊備）" \
-  "$T1 UPDATE evidence_package SET status='READY', package_content_hash='pc', artifact_object_key='k',
+expect_err "0016④：READY 的 package_content_hash 必須等於索引 aggregate（DB 重算）" \
+  "$T1 UPDATE evidence_package SET status='READY', package_content_hash='wrong', artifact_object_key='k',
+       artifact_sha256='as', artifact_mime_type='text/html', artifact_byte_size=10 WHERE package_id='$PKG1'" "aggregate 不符"
+AGG=$(PSQL_C <<<"SELECT encode(sha256(convert_to(string_agg(section||'|'||content_hash, E'\n' ORDER BY section COLLATE \"C\"),'UTF8')),'hex') FROM evidence_package_index WHERE package_id='$PKG1'")
+expect_ok "GENERATING → READY（齊備＋aggregate 相符）" \
+  "$T1 UPDATE evidence_package SET status='READY', package_content_hash='$AGG', artifact_object_key='k',
        artifact_sha256='as', artifact_mime_type='text/html', artifact_byte_size=10 WHERE package_id='$PKG1'"
 expect_err "終態後索引封存" \
   "$T1 INSERT INTO evidence_package_index (tenant_id, package_id, section, item_count, content_hash)
@@ -852,6 +861,9 @@ expect_err "FAILED 必須帶機器代碼與原因" \
    VALUES ('$PKG2','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
            'ee220000-0000-0000-0000-0000000000a2','pch2',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001');
    UPDATE evidence_package SET status='FAILED' WHERE package_id='$PKG2'" "機器代碼"
+expect_err "0016④：READY 需要固定章節集合（缺節被拒）" \
+  "$T1 UPDATE evidence_package SET status='READY', package_content_hash='x', artifact_object_key='k',
+       artifact_sha256='as', artifact_mime_type='text/html', artifact_byte_size=10 WHERE package_id='$PKG2'" "固定章節集合"
 expect_err "契約 A：FAILED 不得帶 artifact" \
   "$T1 UPDATE evidence_package SET status='FAILED', failure_reason_code='X', failure_reason='y',
        artifact_sha256='s' WHERE package_id='$PKG2'" "互斥"
@@ -865,36 +877,39 @@ expect_err "INV-18：包工作主體屬其他租戶 → 拒絕" \
   "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
    VALUES ('22222222-2222-2222-2222-222222222222','EVIDENCE_PACKAGE','$PKG1',1,'html-1','ek2')" "不屬於本租戶"
 # 契約 C：來源實體不可變前提
-expect_ok "契約 C 前置：coverage 與 document 各一列" \
+expect_ok "契約 C 前置：coverage 與 document 各一列（B2 未封存）" \
   "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B1',8,'BALANCE','UNKNOWN');
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',8,'BALANCE','UNKNOWN');
    INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B1','tb.csv','h','k0',1)"
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2','tb.csv','h','k0',1)"
 expect_err "契約 C：source_dataset 不可修改" \
-  "$T1 UPDATE source_dataset SET row_count=99 WHERE import_batch_id='$B1'" "不可變"
+  "$T1 UPDATE source_dataset SET row_count=99 WHERE import_batch_id='$B2'" "不可變"
 expect_err "契約 C：data_coverage 不可修改" \
-  "$T1 UPDATE data_coverage SET completeness_status='COMPLETE' WHERE import_batch_id='$B1'" "不可變"
+  "$T1 UPDATE data_coverage SET completeness_status='COMPLETE' WHERE import_batch_id='$B2'" "不可變"
 expect_err "契約 C：source_document 不可修改" \
-  "$T1 UPDATE source_document SET file_name='x' WHERE import_batch_id='$B1'" "不可變"
+  "$T1 UPDATE source_document SET file_name='x' WHERE import_batch_id='$B2'" "不可變"
 expect_err "契約 C：來源實體與批次不同租戶 → 拒絕" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
-   VALUES ('22222222-2222-2222-2222-222222222222','$B1',9,'BALANCE','h',1)" "不同租戶"
+   VALUES ('22222222-2222-2222-2222-222222222222','$B2',9,'BALANCE','h',1)" "不同租戶"
+expect_err "0016①：來源集合封存——已驗證批次不得追加來源實體（同 run 同包內容才成立）" \
+  "$T1 INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1','late.pdf','h','k9',1)" "已封存"
 n=$(APP_C <<<"$T2 SELECT count(*) FROM evidence_package")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的證據包" || ng "RLS：evidence_package 洩漏 $n 筆"
 
 # 衍生資料的自然唯一性（冪等第二道防線）
 expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','h2',2)" "duplicate key"
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',1,'BALANCE','h2',2)" "duplicate key"
 expect_ok "冪等：不同 batch_version 視為不同資料集" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B1',2,'BALANCE','h3',2)"
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',2,'BALANCE','h3',2)"
 expect_ok "冪等：data_coverage 首筆" \
   "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','UNKNOWN')"
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',1,'BALANCE','UNKNOWN')"
 expect_err "冪等：data_coverage 同鍵不得重複" \
   "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-   VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'BALANCE','COMPLETE')" "duplicate key"
+   VALUES ('11111111-1111-1111-1111-111111111111','$B2',1,'BALANCE','COMPLETE')" "duplicate key"
 expect_ok "冪等：source_identity_assessment 首筆（batch_version=1, detect-r1）" \
   "$T1 INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version,
         detected_identity, match_result, evidence_kind, detection_rule_version)
