@@ -27,6 +27,9 @@ import { classifyError, verdictFor, type JobErrorClass }
   from "../../../packages/domain/src/backgroundJob.ts";
 import { reasonCodeOf, isDeterministicRunFailure, RUN_REASON }
   from "../../../packages/domain/src/calculationRun.ts";
+import { PKG_REASON, pkgReasonCodeOf, isDeterministicPkgFailure, stagingVerdict,
+  artifactObjectKey } from "../../../packages/domain/src/evidencePackage.ts";
+import { putObject } from "../../../packages/database/src/objectstore.ts";
 import { config } from "../../../packages/config/src/index.ts";
 
 const INTERVAL = config.pollMs;
@@ -39,7 +42,7 @@ class BusinessRejection extends Error {}
 
 interface ClaimedCore {
   job_id: string; claim_token: string; attempt_count: number; max_attempts: number;
-  tenant_id: string; job_type: "IMPORT_VALIDATION" | "CALCULATION_RUN";
+  tenant_id: string; job_type: "IMPORT_VALIDATION" | "CALCULATION_RUN" | "EVIDENCE_PACKAGE";
   subject_id: string; subject_version: number;
 }
 interface Claimed extends ClaimedCore {
@@ -65,7 +68,7 @@ function claim(): ClaimedCore | null {
             attempt_count = j.attempt_count + 1
       WHERE j.job_id = (
         SELECT job_id FROM background_job
-         WHERE job_type IN ('IMPORT_VALIDATION','CALCULATION_RUN')
+         WHERE job_type IN ('IMPORT_VALIDATION','CALCULATION_RUN','EVIDENCE_PACKAGE')
            AND (status = 'QUEUED'
              OR (status = 'RETRY_WAIT' AND next_attempt_at <= now())
              OR (status = 'RUNNING'    AND lease_expires_at <= now()))
@@ -493,6 +496,318 @@ function runCalculation(c: ClaimedCore): void {
   }
 }
 
+// ═══════════ EVIDENCE_PACKAGE（SLICE-M2-02C） ═══════════
+// 契約：docs/slices/SLICE-M2-02C_預覽證據包.md（實作契約 A～D）
+//   交易外：讀不可變資料組節、計算逐節與整包 hash、渲染 HTML → staging（契約 B）
+//   終態交易：契約 D 驗證 → 索引＋artifact 登記＋Package READY＋Job 終態＋事件
+
+interface ClaimedPkg extends ClaimedCore {
+  package_id: string; calculation_run_id: string; manifest_id: string;
+  engagement_id: string; import_batch_id: string; render_version: string;
+  audit_cutoff_event_id: string; result_content_hash: string;
+}
+
+function loadPkgDetail(c: ClaimedCore): ClaimedPkg {
+  const [r] = query<Omit<ClaimedPkg, keyof ClaimedCore | "package_id">>(
+    `SELECT p.calculation_run_id, p.engagement_id, p.render_version,
+            p.audit_cutoff_event_id, r.manifest_id, r.import_batch_id, r.result_content_hash
+       FROM evidence_package p
+       JOIN calculation_run r ON r.calculation_run_id = p.calculation_run_id
+      WHERE p.package_id = ${lit(c.subject_id)}::uuid`, {}, { asRuntime: false });
+  return { ...c, ...r, package_id: c.subject_id };
+}
+
+const sha256hex = (b: Buffer | string): string =>
+  createHash("sha256").update(b).digest("hex");
+const esc2 = (s: unknown) => String(s ?? "").replace(/[&<>"]/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch] as string));
+
+interface BuiltPackage {
+  sections: { name: string; count: number; hash: string }[];
+  packageContentHash: string;
+  html: Buffer;
+  artifactSha256: string;
+}
+
+/** 交易外：全部讀不可變／凍結資料，不查 current（INV-29 同一精神）。 */
+function buildPackage(j: ClaimedPkg): BuiltPackage {
+  const q = <T = Record<string, string>>(sql: string) => query<T>(sql, {}, { asRuntime: false });
+  const M = lit(j.manifest_id); const RUN = lit(j.calculation_run_id);
+  const B = lit(j.import_batch_id); const T = lit(j.tenant_id);
+
+  const batch = q(`SELECT batch_version::text, COALESCE(file_sha256,'') AS file_sha256
+                     FROM import_batch WHERE import_batch_id = ${B}::uuid`)[0];
+  const srcTb = q(`SELECT x->>'code' AS code, x->>'name' AS name,
+                          x->>'debit' AS debit, x->>'credit' AS credit
+                     FROM calculation_manifest_entry e, jsonb_array_elements(e.payload) x
+                    WHERE e.manifest_id = ${M}::uuid AND e.object_type='SOURCE_TB'
+                    ORDER BY x->>'code'`);
+  const coverage = q(`SELECT dc.data_coverage_id::text AS id, dc.account_scope, dc.granularity,
+                             dc.completeness_status, sd.source_dataset_id::text AS dataset_id,
+                             sd.content_sha256 AS dataset_sha
+                        FROM data_coverage dc
+                        JOIN source_dataset sd ON sd.import_batch_id = dc.import_batch_id
+                         AND sd.batch_version = dc.batch_version
+                       WHERE dc.import_batch_id = ${B}::uuid
+                       ORDER BY dc.data_coverage_id`);
+  const mappings = q(`SELECT e.payload->>'source_code' AS source_code,
+                             e.payload->>'version_no' AS version_no,
+                             COALESCE(e.payload->>'effective_from','-') AS eff_from,
+                             COALESCE(e.payload->>'effective_to','-') AS eff_to,
+                             e.payload->>'target_code' AS target_code,
+                             e.payload->>'target_name' AS target_name,
+                             cu.display_name AS created_by_name,
+                             au.display_name AS approved_by_name, mr.approved_at::text AS approved_at
+                        FROM calculation_manifest_entry e
+                        JOIN mapping_rule mr ON mr.mapping_rule_id = e.object_id
+                        JOIN app_user cu ON cu.user_id = mr.created_by
+                        JOIN app_user au ON au.user_id = mr.approved_by
+                       WHERE e.manifest_id = ${M}::uuid AND e.object_type='MAPPING_RULE'
+                       ORDER BY e.payload->>'source_code'`);
+  const adjustments = q(`SELECT e.object_id::text AS adjustment_id,
+                             e.payload->>'business_version' AS business_version,
+                             e.payload->>'title' AS title, e.payload->'lines' AS lines,
+                             a.legal_basis, a.evidence_ref, a.judgment_reason, a.language_tag,
+                             pu.display_name AS prepared_by, a.prepared_at::text AS prepared_at,
+                             ru.display_name AS reviewed_by, a.reviewed_at::text AS reviewed_at,
+                             qu.display_name AS approved_by, a.approved_at::text AS approved_at
+                        FROM calculation_manifest_entry e
+                        JOIN adjustment a ON a.adjustment_id = e.object_id
+                        JOIN app_user pu ON pu.user_id = a.prepared_by
+                        JOIN app_user ru ON ru.user_id = a.reviewed_by
+                        JOIN app_user qu ON qu.user_id = a.approved_by
+                       WHERE e.manifest_id = ${M}::uuid AND e.object_type='ADJUSTMENT'
+                       ORDER BY e.object_id`);
+  const manifest = q(`SELECT calculation_scope, hash_algorithm, canonicalization_version,
+                             frozen_set_content_hash
+                        FROM calculation_input_manifest WHERE manifest_id = ${M}::uuid`)[0];
+  const snapshot = q(`SELECT posting_layer, account_code, account_name,
+                             debit::text AS debit, credit::text AS credit
+                        FROM balance_snapshot_line WHERE calculation_run_id = ${RUN}::uuid
+                       ORDER BY account_code, posting_layer`);
+  const objIds = [j.calculation_run_id, j.import_batch_id,
+    ...q(`SELECT DISTINCT object_id::text AS id FROM calculation_manifest_entry
+           WHERE manifest_id = ${M}::uuid AND object_id IS NOT NULL`).map((r) => r.id)];
+  const events = q(`SELECT audit_event_id::text AS id, event_type, object_type,
+                           object_id::text AS object_id, occurred_at::text AS occurred_at
+                      FROM audit_event
+                     WHERE tenant_id = ${T}::uuid AND kind='DOMAIN_EVENT'
+                       AND audit_event_id <= ${Number(j.audit_cutoff_event_id)}
+                       AND object_id IN (${objIds.map(lit).join("::uuid,")}::uuid)
+                     ORDER BY audit_event_id`);
+  const docs = q(`SELECT file_name, content_sha256, object_key, byte_size::text AS byte_size
+                    FROM source_document WHERE import_batch_id = ${B}::uuid
+                   ORDER BY source_document_id`);
+  // 追溯判定：逐輸出科目範圍 account_code → data_coverage_id → granularity（AC-AUD-001）
+  const cov0 = coverage[0];
+  const outputAccounts = [...new Set(snapshot.map((s) => s.account_code))].sort();
+  const trace = outputAccounts.map((code) => ({
+    code, coverageId: cov0?.id ?? "-", level: cov0?.granularity ?? "UNKNOWN" }));
+
+  const canon = {
+    source: [`batch=${j.import_batch_id}|v${batch.batch_version}|sha=${batch.file_sha256}`,
+      ...srcTb.map((l) => `${l.code}:${l.debit}:${l.credit}`),
+      ...coverage.map((c2) => `COVERAGE|${c2.id}|${c2.account_scope}|${c2.granularity}|${c2.completeness_status}|dataset=${c2.dataset_id}|${c2.dataset_sha}`)].join("\n"),
+    mapping: mappings.map((m) => `${m.source_code}|v${m.version_no}|${m.eff_from}|${m.eff_to}|${m.target_code}|by=${m.created_by_name}|appr=${m.approved_by_name}@${m.approved_at}`).join("\n"),
+    adjustment: adjustments.map((a) => `${a.adjustment_id}|bv${a.business_version}|${a.title}|` +
+      `prep=${a.prepared_by}@${a.prepared_at}|rev=${a.reviewed_by}@${a.reviewed_at}|appr=${a.approved_by}@${a.approved_at}|${JSON.stringify(a.lines)}`).join("\n"),
+    calculation: [`frozen=${manifest.frozen_set_content_hash}`, `result=${j.result_content_hash}`,
+      ...snapshot.map((s) => `${s.posting_layer}|${s.account_code}|${s.debit}|${s.credit}`)].join("\n"),
+    rule_versions: `engine=calc-engine-1|canonicalization=${manifest.canonicalization_version}|detect=detect-r1|RuleVersion=未實作（如實標示）`,
+    process_level: `PREVIEW|期間包批准未完成|月次／季次流程分級未實作（如實標示）`,
+    control_exceptions: `未折算（NO_FX，折算屬 MVP 3）|無正式覆核與期間批准（PREVIEW）|其餘控制例外＝未評估`,
+    traceability: trace.map((t) => `${t.code}->coverage:${t.coverageId}->${t.level}`).join("\n"),
+    events: events.map((e) => `${e.id}|${e.event_type}|${e.object_type}|${e.object_id}`).join("\n"),
+    attachments: docs.map((d) => `${d.file_name}|${d.content_sha256}|${d.object_key}|${d.byte_size}`).join("\n"),
+  };
+  const sections = Object.entries(canon).map(([name, text]) => ({
+    name, hash: sha256hex(text),
+    count: name === "source" ? srcTb.length : name === "mapping" ? mappings.length
+      : name === "adjustment" ? adjustments.length : name === "calculation" ? snapshot.length
+      : name === "traceability" ? trace.length : name === "events" ? events.length
+      : name === "attachments" ? docs.length : 1,
+  }));
+  const packageContentHash = sha256hex(
+    sections.map((s) => `${s.name}|${s.hash}`).sort().join("\n"));
+
+  const warn = "DRAFT・UNREVIEWED・未折算（NO_FX）——非正式輸出，不得作為入帳或交付依據";
+  const th = (s: string[]) => `<tr>${s.map((x) => `<th>${esc2(x)}</th>`).join("")}</tr>`;
+  const td = (s: string[]) => `<tr>${s.map((x) => `<td>${esc2(x)}</td>`).join("")}</tr>`;
+  const html = Buffer.from(`<!DOCTYPE html><html lang="zh-Hant"><meta charset="utf-8">
+<title>PREVIEW 證據包（run ${esc2(j.calculation_run_id.slice(0, 8))}）</title>
+<style>body{font-family:sans-serif;margin:24px;color:#1b1f24}table{border-collapse:collapse;margin:8px 0}
+th,td{border:1px solid #ccc;padding:4px 8px;font-size:13px}h2{margin-top:24px}
+.warn{background:#fff3e0;border:2px solid #d9a05b;padding:12px;font-weight:700}</style>
+<div class="warn">${esc2(warn)}</div>
+<h1>預覽證據包（底稿）</h1>
+<table>${td(["run", j.calculation_run_id])}${td(["manifest frozen hash", manifest.frozen_set_content_hash])}
+${td(["result hash", j.result_content_hash])}${td(["package_content_hash", packageContentHash])}
+${td(["render_version", j.render_version])}${td(["audit_cutoff_event_id", j.audit_cutoff_event_id])}
+${td(["calculation_scope", manifest.calculation_scope])}</table>
+<h2>追溯等級總表（逐科目範圍；AC-AUD-001）</h2>
+<p>本包可反查至 <b>餘額級（BALANCE）</b>；依實際 DataCoverage 逐科目範圍判定如下——各範圍均不得宣稱高於所列等級。</p>
+<table>${th(["集團科目", "data_coverage_id", "追溯等級"])}
+${trace.map((t) => td([t.code, t.coverageId, t.level === "BALANCE" ? "BALANCE（餘額級）" : t.level])).join("")}</table>
+<h2>來源（§hash ${sections.find((s) => s.name === "source")!.hash.slice(0, 12)}）</h2>
+<table>${td(["ImportBatch", `${j.import_batch_id}（v${batch.batch_version}）`])}${td(["檔案 SHA-256", batch.file_sha256])}</table>
+<table>${th(["來源科目", "名稱", "借方", "貸方"])}${srcTb.map((l) => td([l.code, l.name ?? "", l.debit, l.credit])).join("")}</table>
+<table>${th(["DataCoverage", "範圍", "granularity", "完整度", "SourceDataset", "dataset SHA-256"])}
+${coverage.map((c2) => td([c2.id, c2.account_scope, c2.granularity, c2.completeness_status, c2.dataset_id, c2.dataset_sha])).join("")}</table>
+<h2>映射（§hash ${sections.find((s) => s.name === "mapping")!.hash.slice(0, 12)}）</h2>
+<table>${th(["來源科目", "版本", "生效", "失效", "集團科目", "建立者", "批准者", "批准時間"])}
+${mappings.map((m) => td([m.source_code, `v${m.version_no}`, m.eff_from, m.eff_to,
+  `${m.target_code} ${m.target_name}`, m.created_by_name, m.approved_by_name, m.approved_at])).join("")}</table>
+<h2>調整（§hash ${sections.find((s) => s.name === "adjustment")!.hash.slice(0, 12)}）</h2>
+${adjustments.map((a) => `<table>${td(["調整", `${a.title}（bv${a.business_version}）`])}
+${td(["法源／政策", a.legal_basis ?? ""])}${td(["附件", a.evidence_ref ?? ""])}
+${td(["判斷理由", a.judgment_reason ?? ""])}${td(["語言標籤", a.language_tag ?? ""])}
+${td(["編製", `${a.prepared_by}＠${a.prepared_at}`])}${td(["覆核", `${a.reviewed_by}＠${a.reviewed_at}`])}
+${td(["批准", `${a.approved_by}＠${a.approved_at}`])}${td(["分錄", JSON.stringify(a.lines)])}</table>`).join("")}
+<h2>計算（§hash ${sections.find((s) => s.name === "calculation")!.hash.slice(0, 12)}）</h2>
+<table>${th(["層", "集團科目", "名稱", "借方", "貸方"])}
+${snapshot.map((s) => td([s.posting_layer, s.account_code, s.account_name, s.debit, s.credit])).join("")}</table>
+<h2>規則版本</h2><p>${esc2(canon.rule_versions)}</p>
+<h2>流程等級</h2><p>${esc2(canon.process_level)}</p>
+<h2>控制例外</h2><p>${esc2(canon.control_exceptions)}</p>
+<h2>事件時間軸（≤ cutoff ${esc2(j.audit_cutoff_event_id)}）</h2>
+<table>${th(["#", "事件", "物件"])}${events.map((e) => td([e.id, e.event_type, `${e.object_type} ${e.object_id.slice(0, 8)}`])).join("")}</table>
+<h2>附件索引</h2>
+<table>${th(["檔名", "SHA-256", "object key", "bytes"])}${docs.map((d) => td([d.file_name, d.content_sha256, d.object_key, d.byte_size])).join("")}</table>
+<h2>逐節 hash 對照表</h2>
+<table>${th(["節", "筆數", "content hash"])}${sections.map((s) => td([s.name, String(s.count), s.hash])).join("")}</table>
+<div class="warn">${esc2(warn)}</div></html>`, "utf8");
+
+  // 契約 D-3（JS 端斷言）：artifact 必須內嵌與索引一致的逐節 hash
+  for (const s of sections)
+    if (!html.includes(s.hash)) throw new Error(`UPSTREAM_VERIFY_FAILED:SECTION_HASH_NOT_EMBEDDED:${s.name}`);
+  return { sections, packageContentHash, html, artifactSha256: sha256hex(html) };
+}
+
+/** 契約 B：write-once staging——已存在則核對 hash，同沿用、異即確定性失敗。 */
+function stagePut(key: string, html: Buffer, wantSha: string): void {
+  try { putObject(key, html); } catch (e) {
+    if (!String(e).includes("不可覆寫")) throw e;
+    const existing = getObject(key);
+    if (stagingVerdict(sha256hex(existing), wantSha) === "CONFLICT")
+      throw new Error("ARTIFACT_CONFLICT：staging 物件已存在且內容不符");
+  }
+}
+
+function commitPackage(j: ClaimedPkg, b: BuiltPackage, key: string): void {
+  const P = lit(j.package_id); const M = lit(j.manifest_id); const RUN = lit(j.calculation_run_id);
+  const idxRows = b.sections.map((s) =>
+    `(${lit(j.tenant_id)}::uuid, ${P}::uuid, ${lit(s.name)}, ${s.count}, ${lit(s.hash)})`).join(",\n");
+  exec(`BEGIN;
+        ${fenceSql(j)}
+        WITH pkglock AS (
+          SELECT status FROM evidence_package WHERE package_id = ${P}::uuid FOR UPDATE)
+        SELECT fn_assert((SELECT status = 'GENERATING' FROM pkglock), 'PKG_NOT_GENERATING');
+        -- 契約 D-1：Manifest 逐筆＋集合 hash（02B 同式，版本感知）
+        SELECT fn_assert(NOT EXISTS (
+          SELECT 1 FROM calculation_manifest_entry e
+            JOIN calculation_input_manifest m ON m.manifest_id = e.manifest_id
+           WHERE e.manifest_id = ${M}::uuid
+             AND encode(sha256(convert_to(
+                   CASE WHEN m.canonicalization_version = 'sqlcanon-1'
+                        THEN e.content_canonical
+                        ELSE e.content_canonical || E'\n' || e.payload::text END,'UTF8')),'hex')
+                 <> e.content_hash),
+          'UPSTREAM_VERIFY_FAILED:MANIFEST_ENTRY_HASH');
+        SELECT fn_assert(
+          (SELECT frozen_set_content_hash FROM calculation_input_manifest WHERE manifest_id = ${M}::uuid)
+          = encode(sha256(convert_to((SELECT string_agg(content_hash, E'\n' ORDER BY content_canonical)
+              FROM calculation_manifest_entry WHERE manifest_id = ${M}::uuid),'UTF8')),'hex'),
+          'UPSTREAM_VERIFY_FAILED:MANIFEST_SET_HASH');
+        -- 契約 D-2：快照重算 ＝ run.result_content_hash
+        SELECT fn_assert(
+          (SELECT result_content_hash FROM calculation_run WHERE calculation_run_id = ${RUN}::uuid)
+          = (SELECT encode(sha256(convert_to(COALESCE(string_agg(
+               posting_layer||'|'||account_code||'|'||debit::text||'|'||credit::text,
+               E'\n' ORDER BY posting_layer, account_code),''),'UTF8')),'hex')
+               FROM balance_snapshot_line WHERE calculation_run_id = ${RUN}::uuid),
+          'UPSTREAM_VERIFY_FAILED:SNAPSHOT_HASH_MISMATCH');
+        -- 契約 D-4：cutoff 事件屬於該 run
+        SELECT fn_assert(EXISTS (
+          SELECT 1 FROM audit_event
+           WHERE audit_event_id = ${Number(j.audit_cutoff_event_id)}
+             AND event_type = 'calculation_run.completed'
+             AND object_id = ${RUN}::uuid),
+          'UPSTREAM_VERIFY_FAILED:CUTOFF_EVENT');
+        INSERT INTO evidence_package_index (tenant_id, package_id, section, item_count, content_hash)
+        VALUES ${idxRows};
+        UPDATE evidence_package SET status='READY',
+               package_content_hash=${lit(b.packageContentHash)},
+               artifact_object_key=${lit(key)}, artifact_sha256=${lit(b.artifactSha256)},
+               artifact_mime_type='text/html; charset=utf-8', artifact_byte_size=${b.html.length}
+         WHERE package_id = ${P}::uuid;
+        UPDATE background_job SET status='COMPLETED'
+         WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid;
+        ${eventSql(j.tenant_id, "evidence_package.completed", j.package_id,
+          { run: j.calculation_run_id, package_content_hash: b.packageContentHash }, "done", "evidence_package")}
+        COMMIT;`, {}, { asRuntime: false });
+}
+
+function commitPkgVerdictFailure(j: ClaimedPkg, message: string): void {
+  const code = pkgReasonCodeOf(message) ?? "UPSTREAM_VERIFY_FAILED";
+  const human = `${PKG_REASON[code]}（${message.slice(0, 300)}）`;
+  exec(`BEGIN;
+        ${fenceSql(j)}
+        UPDATE evidence_package SET status='FAILED',
+               failure_reason_code=${lit(code)}, failure_reason=${lit(human)}
+         WHERE package_id = ${lit(j.package_id)}::uuid AND status='GENERATING';
+        UPDATE background_job SET status='COMPLETED', last_error_class='BUSINESS_VALIDATION',
+               last_error_message=${lit(human.slice(0, 500))}
+         WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid;
+        ${eventSql(j.tenant_id, "evidence_package.failed", j.package_id,
+          { code, reason: human.slice(0, 300) }, "fail", "evidence_package")}
+        COMMIT;`, {}, { asRuntime: false });
+  console.warn(`[worker] package ${j.package_id.slice(0, 8)} 確定性失敗（${code}）`);
+}
+
+function recordPkgInfraFailure(j: ClaimedPkg, cls: JobErrorClass, message: string): void {
+  const v = verdictFor(cls, j.attempt_count, j.max_attempts, config.jobBackoffSeconds);
+  if (v.next !== "FAILED") { recordJobFailure(j, cls, message); return; }
+  const code = cls === "NON_RETRYABLE_SYSTEM" ? "NON_RETRYABLE_SYSTEM" : "INFRA_RETRY_EXHAUSTED";
+  const msg = message.slice(0, 500);
+  try {
+    exec(`BEGIN;
+          ${fenceSql(j)}
+          UPDATE background_job SET status='FAILED', last_error_class=${lit(cls)}::job_error_class,
+                 last_error_message=${lit(msg)}
+           WHERE job_id = ${lit(j.job_id)}::uuid AND claim_token = ${lit(j.claim_token)}::uuid;
+          UPDATE evidence_package SET status='FAILED',
+                 failure_reason_code=${lit(code)},
+                 failure_reason=${lit(`${PKG_REASON[code as "INFRA_RETRY_EXHAUSTED"]}（${msg.slice(0, 200)}）`)}
+           WHERE package_id = ${lit(j.package_id)}::uuid AND status='GENERATING';
+          ${eventSql(j.tenant_id, "evidence_package.failed", j.package_id,
+            { code, reason: msg.slice(0, 200), attempts: j.attempt_count }, "fail", "evidence_package")}
+          COMMIT;`, {}, { asRuntime: false });
+    console.error(`[worker] package ${j.package_id.slice(0, 8)} 終止（${code}）`);
+  } catch (e2) {
+    console.warn(`[worker] package 失敗寫回落空（${String(e2).slice(0, 120)}），交由下一個認領者`);
+  }
+}
+
+function runPackage(c: ClaimedCore): void {
+  const j = loadPkgDetail(c);
+  try {
+    const built = buildPackage(j);
+    const key = artifactObjectKey(j.tenant_id, j.package_id, j.render_version);
+    stagePut(key, built.html, built.artifactSha256);
+    heartbeat(j);
+    commitPackage(j, built, key);
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("LEASE_LOST")) { recordJobFailure(j, "LEASE_LOST", msg); return; }
+    if (isDeterministicPkgFailure(msg)) {
+      try { commitPkgVerdictFailure(j, msg); }
+      catch (e2) { recordPkgInfraFailure(j, classifyError(e2), String(e2)); }
+      return;
+    }
+    recordPkgInfraFailure(j, classifyError(e), msg);
+  }
+}
+
 function runJob(j: Claimed): void {
   try {
     const r = evaluate(j);        // 交易外；無 DB 效果
@@ -516,6 +831,9 @@ function tick(): void {
       if (c.job_type === "CALCULATION_RUN") {
         console.log(`[worker] 計算執行 ${c.subject_id.slice(0, 8)}…（第 ${c.attempt_count} 次）`);
         runCalculation(c);
+      } else if (c.job_type === "EVIDENCE_PACKAGE") {
+        console.log(`[worker] 產生證據包 ${c.subject_id.slice(0, 8)}…（第 ${c.attempt_count} 次）`);
+        runPackage(c);
       } else {
         console.log(`[worker] 驗證批次 ${c.subject_id.slice(0, 8)}…（第 ${c.attempt_count} 次）`);
         runJob(loadImportDetail(c));

@@ -795,6 +795,93 @@ else
                                        || ng "0014① 競態b：失敗原因不符：$out"
 fi
 
+# ── SLICE-M2-02C：EvidencePackage（migrations/0015；契約 A～C） ──
+PKG1=ee220000-0000-0000-0000-000000000001
+PKG2=ee220000-0000-0000-0000-000000000002
+CUT=$(PSQL_C <<<"INSERT INTO audit_event (tenant_id, kind, event_type, object_type, object_id)
+  VALUES ('11111111-1111-1111-1111-111111111111','DOMAIN_EVENT','calculation_run.completed','calculation_run','$RUNA')
+  RETURNING audit_event_id")
+expect_ok "Package 建立（GENERATING；cutoff＝該 run 的 completed 事件）" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
+   VALUES ('$PKG1','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
+           'ee220000-0000-0000-0000-0000000000a1','pch1',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001')"
+expect_err "契約 A：GENERATING 內容欄位必須全空" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by, artifact_sha256)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
+           gen_random_uuid(),'x',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001','sha')" "全空"
+expect_err "非 COMPLETED run 不可產包" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNC',
+           gen_random_uuid(),'x',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001')" "RUN_NOT_COMPLETED"
+expect_err "cutoff 必須是該 run 的 completed 事件" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
+           gen_random_uuid(),'x',1,'html-1','aaaaaaaa-0000-0000-0000-000000000001')" "completed 事件"
+expect_err "重產必須引用同一 run 的既有 Package" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by, regenerated_from_id)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUND',
+           gen_random_uuid(),'x',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001','$PKG1')" "同一 run"
+expect_err "request_key 唯一於（tenant, key）" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
+   VALUES (gen_random_uuid(),'11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
+           'ee220000-0000-0000-0000-0000000000a1','pch1',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001')" "duplicate key"
+expect_ok "索引：GENERATING 期間可寫入" \
+  "$T1 INSERT INTO evidence_package_index (tenant_id, package_id, section, item_count, content_hash)
+   VALUES ('11111111-1111-1111-1111-111111111111','$PKG1','source',1,'h1')"
+expect_err "契約 A：READY 必須齊備 artifact 與內容 hash" \
+  "$T1 UPDATE evidence_package SET status='READY' WHERE package_id='$PKG1'" "齊備"
+expect_ok "GENERATING → READY（齊備）" \
+  "$T1 UPDATE evidence_package SET status='READY', package_content_hash='pc', artifact_object_key='k',
+       artifact_sha256='as', artifact_mime_type='text/html', artifact_byte_size=10 WHERE package_id='$PKG1'"
+expect_err "終態後索引封存" \
+  "$T1 INSERT INTO evidence_package_index (tenant_id, package_id, section, item_count, content_hash)
+   VALUES ('11111111-1111-1111-1111-111111111111','$PKG1','late',1,'h2')" "封存"
+expect_err "終態不可修改（重產＝新 package）" \
+  "$T1 UPDATE evidence_package SET package_content_hash='pc2' WHERE package_id='$PKG1'" "終態"
+expect_err "索引不可修改" \
+  "$T1 UPDATE evidence_package_index SET content_hash='x' WHERE package_id='$PKG1'" "不可變"
+expect_err "FAILED 必須帶機器代碼與原因" \
+  "$T1 INSERT INTO evidence_package (package_id, tenant_id, engagement_id, calculation_run_id,
+        request_key, request_content_hash, audit_cutoff_event_id, render_version, created_by)
+   VALUES ('$PKG2','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','$RUNA',
+           'ee220000-0000-0000-0000-0000000000a2','pch2',$CUT,'html-1','aaaaaaaa-0000-0000-0000-000000000001');
+   UPDATE evidence_package SET status='FAILED' WHERE package_id='$PKG2'" "機器代碼"
+expect_err "契約 A：FAILED 不得帶 artifact" \
+  "$T1 UPDATE evidence_package SET status='FAILED', failure_reason_code='X', failure_reason='y',
+       artifact_sha256='s' WHERE package_id='$PKG2'" "互斥"
+expect_ok "GENERATING → FAILED（帶代碼與原因）" \
+  "$T1 UPDATE evidence_package SET status='FAILED', failure_reason_code='UPSTREAM_VERIFY_FAILED',
+       failure_reason='上游驗證失敗' WHERE package_id='$PKG2'"
+expect_ok "BackgroundJob 支援 EVIDENCE_PACKAGE 型別" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('11111111-1111-1111-1111-111111111111','EVIDENCE_PACKAGE','$PKG1',1,'html-1','ek1')"
+expect_err "INV-18：包工作主體屬其他租戶 → 拒絕" \
+  "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
+   VALUES ('22222222-2222-2222-2222-222222222222','EVIDENCE_PACKAGE','$PKG1',1,'html-1','ek2')" "不屬於本租戶"
+# 契約 C：來源實體不可變前提
+expect_ok "契約 C 前置：coverage 與 document 各一列" \
+  "$T1 INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1',8,'BALANCE','UNKNOWN');
+   INSERT INTO source_document (tenant_id, import_batch_id, file_name, content_sha256, object_key, byte_size)
+   VALUES ('11111111-1111-1111-1111-111111111111','$B1','tb.csv','h','k0',1)"
+expect_err "契約 C：source_dataset 不可修改" \
+  "$T1 UPDATE source_dataset SET row_count=99 WHERE import_batch_id='$B1'" "不可變"
+expect_err "契約 C：data_coverage 不可修改" \
+  "$T1 UPDATE data_coverage SET completeness_status='COMPLETE' WHERE import_batch_id='$B1'" "不可變"
+expect_err "契約 C：source_document 不可修改" \
+  "$T1 UPDATE source_document SET file_name='x' WHERE import_batch_id='$B1'" "不可變"
+expect_err "契約 C：來源實體與批次不同租戶 → 拒絕" \
+  "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
+   VALUES ('22222222-2222-2222-2222-222222222222','$B1',9,'BALANCE','h',1)" "不同租戶"
+n=$(APP_C <<<"$T2 SELECT count(*) FROM evidence_package")
+[ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的證據包" || ng "RLS：evidence_package 洩漏 $n 筆"
+
 # 衍生資料的自然唯一性（冪等第二道防線）
 expect_err "冪等：同批次同版本同粒度不得有第二個 source_dataset" \
   "$T1 INSERT INTO source_dataset (tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)

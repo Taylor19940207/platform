@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、十四份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
+7. `packages/domain/src/importBatch.ts`、十五份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
 8. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
 
 CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時閱讀，不得取代已合併的 v1.2／v1.1 正式基線。工程細節以 repo 內 Markdown 與現行程式為準，PDF 供閱讀。
@@ -40,9 +40,9 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
 里程碑 1、`SLICE-M2-01` 科目映射切片與 `SLICE-M2-02A` 調整生命週期切片均已完成。
-現有 14 份 migration；完整實跑結果為 **369/369**（單元 43、DB 整合 165、端到端 161）。
+現有 15 份 migration；完整實跑結果為 **414/414**（單元 46、DB 整合 188、端到端 180）。
 
-**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8096）
+**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8098）
 與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，
 跑完以 `pnpm db:seed` 還原。
 
@@ -69,8 +69,18 @@ ADJUSTMENT 兩層，`NO_FX` 未折算）＋ B-06 骨架；Case-001 調整後集�
 詳 `docs/slices/SLICE-M2-02B_PREVIEW_CalculationRun與輸入凍結.md` 與
 `docs/handoffs/SESSION_HANDOFF_2026-08-05_SLICE-M2-02B.md`。
 
-下一刀：`SLICE-M2-02C 預覽證據包`（前置的 `mapping_rule` 事件原子化已於 2026-08-05
-完成）。每一刀都先做一頁切片與驗收清單，不擴寫大型規格，不修改兩份正式基線。
+`SLICE-M2-02C 預覽證據包`已完成（2026-08-05；前置的 `mapping_rule` 事件原子化同日完成）：
+切片文件經兩輪走查（非同步產包、artifact 保存與下載驗 hash、重產契約、audit cutoff、
+逐科目範圍追溯、實作契約 A～D）後實作——非同步產包（GENERATING→READY／FAILED）、
+HTML artifact 一次生成保存（staging 安全重試）、`package_content_hash` 與 `artifact_sha256`
+皆確定性（同 run＋同 cutoff＋同 render 重產完全一致）、Case-001 追溯判定 12/12 科目範圍
+明示 BALANCE、契約 D 上游驗證（損壞不包裝）、來源三表補不可變。
+詳 `docs/slices/SLICE-M2-02C_預覽證據包.md` 與
+`docs/handoffs/SESSION_HANDOFF_2026-08-05_SLICE-M2-02C.md`。
+
+**里程碑 2 的 02 系列（映射→調整→計算→證據包）至此收官。**下一步先做里程碑 2 檢視，
+再決定下一刀（候選：折算 MVP 3、正式交付能力、或 B-00 待辦整合）；照例先做一頁切片
+與驗收清單，不擴寫大型規格，不修改兩份正式基線。
 
 ## 第一次回覆使用者時
 

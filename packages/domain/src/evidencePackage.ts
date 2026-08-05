@@ -1,0 +1,56 @@
+// 預覽證據包（SLICE-M2-02C；手冊 AC-AUD-001、設計書 §26.9）。
+// 與 migrations/0015 的觸發器同語意：應用層先判定，DB 是最後防線。
+
+export type EvidencePackageStatus = "GENERATING" | "READY" | "FAILED";
+
+/** 底稿渲染版本：入 Package 與 object key——render 升版＝明示重產的正當理由。 */
+export const RENDER_VERSION = "html-1";
+
+const LEGAL: Record<EvidencePackageStatus, EvidencePackageStatus[]> = {
+  GENERATING: ["READY", "FAILED"],
+  READY: [],            // 終態：重產＝新 package（regenerated_from_id），原包永久保留
+  FAILED: [],
+};
+
+export function legalPackageTransition(from: EvidencePackageStatus, to: EvidencePackageStatus): boolean {
+  return LEGAL[from].includes(to);
+}
+
+export const PKG_REASON = {
+  RUN_NOT_COMPLETED: "只有 COMPLETED 的 PREVIEW run 可產生證據包",
+  ROLE_REQUIRED: "產生／下載預覽證據包需 R2、R3 或 R4 角色（§24.6 權限矩陣）",
+  REQUEST_KEY_REUSED: "相同 request key 但請求內容不同——冪等鍵不得重用於不同請求",
+  PACKAGE_NOT_READY: "Package 尚未 READY，不可下載（GENERATING／FAILED）",
+  ARTIFACT_HASH_MISMATCH: "已保存 artifact 與登記雜湊不符——內容完整性失敗，不得提供下載",
+  ARTIFACT_CONFLICT: "staging 物件已存在且內容不符——確定性完整性失敗（契約 B）",
+  UPSTREAM_VERIFY_FAILED: "產包前驗證失敗：上游凍結資料損壞或不一致（契約 D），不得包裝為證據",
+  CUTOFF_EVENT_MISSING: "找不到該 run 的 calculation_run.completed 事件（audit cutoff）",
+  CONTROL_TOTAL_MISMATCH: "控制總額勾稽不一致（G-09）",
+  INFRA_RETRY_EXHAUSTED: "基礎設施故障重試耗盡；可明示重新產包（新 package）",
+  NON_RETRYABLE_SYSTEM: "系統性錯誤；請通報維運後明示重新產包（新 package）",
+} as const;
+
+export type PkgReasonCode = keyof typeof PKG_REASON;
+
+export function pkgReasonCodeOf(message: string): PkgReasonCode | null {
+  for (const code of Object.keys(PKG_REASON) as PkgReasonCode[])
+    if (message.includes(code)) return code;
+  return null;
+}
+
+/** 契約 D／B 的確定性失敗：結論不重試（Package FAILED＋Job COMPLETED）。 */
+export function isDeterministicPkgFailure(message: string): boolean {
+  const code = pkgReasonCodeOf(message);
+  return code === "UPSTREAM_VERIFY_FAILED" || code === "ARTIFACT_CONFLICT"
+      || code === "CUTOFF_EVENT_MISSING" || code === "CONTROL_TOTAL_MISMATCH";
+}
+
+/** 契約 B：staging 物件已存在時的裁決。 */
+export function stagingVerdict(existingSha256: string, wantSha256: string): "REUSE" | "CONFLICT" {
+  return existingSha256 === wantSha256 ? "REUSE" : "CONFLICT";
+}
+
+/** 契約 B：object key 由 package_id＋render_version 確定性產生。 */
+export function artifactObjectKey(tenantId: string, packageId: string, renderVersion: string): string {
+  return `${tenantId}/evidence/${packageId}/${renderVersion}.html`;
+}
