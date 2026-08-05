@@ -50,6 +50,42 @@
    R5 授權範圍下載與 R7 能力為**本刀尚未掛載的基線能力**，明示留後續。
 9. 不建立 DeliveryRecord、不產生 delivery_quality（INV-27／09；02B 護欄 4 延續）。
 
+## 實作契約（走查第二輪寫死）
+
+**A. Package 狀態機（最小三態）**
+
+    GENERATING ──worker 終態交易──▶ READY
+               ──重試耗盡／確定性失敗──▶ FAILED
+
+- `GENERATING`：artifact／內容 hash／完成時間**全空**（互斥守衛）；基礎設施重試期間維持此態。
+- `READY`：artifact、索引、`package_content_hash`＋`artifact_sha256` **全部齊備**；**只有 READY 可下載**。
+- `FAILED`：機器代碼＋人可讀原因齊備，**不得帶 artifact**；重試耗盡與 Job 同交易轉入。
+- 不可變語意＝「身分欄位不可變、只允許受控終態遷移、終態不可變」——不是建立後禁止一切 UPDATE。
+
+**B. staging 安全重試**（ObjectStore 為 write-once）
+
+- object key 由 `package_id ＋ render_version` **確定性產生**。
+- put：不存在則寫入；**已存在則讀回核對 `artifact_sha256`**——相同即安全沿用（worker 在
+  「物件已寫、DB 未提交」崩潰後，重領者據此完成登記）；**不同＝確定性完整性失敗 → FAILED**。
+- DB 登記交易仍以 claim-token fencing 保護。
+
+**C. 來源實體不可變前提補齊**（本刀 migration 順手收）
+
+`SourceDataset`／`DataCoverage`／`SourceDocument` 目前**沒有** UPDATE／DELETE 禁止觸發器，
+「不可變資料」的宣稱與現況不符。本刀 migration 補：三表 UPDATE／DELETE 禁止、
+tenant 與 ImportBatch 歸屬守衛；`DataCoverage` 的 canonical hash 凍結進 Package——
+否則產包**之前**仍可能讀到被改寫的 coverage／附件索引。
+
+**D. 產包前驗證（不只 G-09）**
+
+worker 於終態交易內逐項驗證，任一不符 → Package `FAILED`（確定性失敗，不重試）——
+**不得把已損壞的上游資料包裝成證據**：
+
+1. Manifest entry 逐筆 hash 與 frozen-set hash（02B 同式）；
+2. 快照重算 hash ＝ run 的 `result_content_hash`；
+3. artifact 內容索引的逐節 hash 與內容一致；
+4. `audit_cutoff_event_id` 恰好屬於該 run（`calculation_run.completed` 且 object_id＝run）。
+
 ## 包內容（各節與來源；全部凍結／不可變資料，不查 current）
 
 | 節 | 內容 | 來源 |
@@ -82,8 +118,11 @@
 | 10 | Package／索引不可 UPDATE／DELETE；GENERATING 互斥（內容欄位空）；終態互斥；歸屬守衛（package↔run 同租戶案件）＋RLS＋封存語意（終態後不得追加索引列） |
 | 11 | 批准鏈完整：調整節三個不同自然人；映射節批准人≠建立者 |
 | 12 | 不存在 DeliveryRecord／delivery_quality 寫入路徑；產包後全庫掃描無交付紀錄 |
-| 13 | 產包上游竄改（停用觸發器改快照）不影響已產包 artifact 與 hash（包自持凍結內容——實測） |
+| 13 | 產包**後**上游竄改不影響已產包 artifact 與 hash（包自持凍結內容——實測）；產包**前**上游損壞（快照重算≠result hash 等契約 D 四項）→ Package `FAILED`，不包裝損壞資料（實測） |
 | 14 | 拒絕與失敗保存機器代碼＋客戶可理解原因 |
+| 15 | Package 狀態機（契約 A）：GENERATING 內容全空互斥、READY 齊備、FAILED 帶代碼不帶 artifact；只有 READY 可下載（非 READY 下載 → 409）；重試期間維持 GENERATING，耗盡與 Job 同交易轉 FAILED |
+| 16 | staging 安全重試（契約 B）：確定性 object key；預置同內容物件 → 沿用完成登記；預置異內容物件 → 確定性完整性失敗 FAILED（雙情形實測） |
+| 17 | 來源實體不可變（契約 C）：SourceDataset／DataCoverage／SourceDocument 三表 UPDATE／DELETE 被 DB 拒絕＋歸屬守衛（DB 測試） |
 
 ## 明確不做（BACKLOG 或後續刀）
 
