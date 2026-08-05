@@ -168,6 +168,21 @@ try {
     pvMar.includes("6401") && pvMar.includes("21,700,000"));
   check("生效日解析：2026-04 期起用 v2（600 併入 6602：1,850,000；6401 消失）",
     !pvApr.includes("6401") && pvApr.includes("1,850,000"));
+
+  // ── 事件原子化（BACKLOG 2026-08-04）：資料與事件不存在單邊 ──
+  check("事件原子化：每列 mapping_rule 皆有 drafted 事件、每個已批准列皆有 approved 事件",
+    sql(`SELECT count(*) FROM mapping_rule mr WHERE NOT EXISTS (
+           SELECT 1 FROM audit_event e WHERE e.event_type='mapping_rule.drafted'
+             AND e.object_id = mr.mapping_rule_id)`) === "0"
+    && sql(`SELECT count(*) FROM mapping_rule mr WHERE mr.approved_at IS NOT NULL AND NOT EXISTS (
+           SELECT 1 FROM audit_event e WHERE e.event_type='mapping_rule.approved'
+             AND e.object_id = mr.mapping_rule_id)`) === "0");
+  const someApproved = sql(`SELECT mapping_rule_id FROM mapping_rule
+    WHERE approved_at IS NOT NULL ORDER BY created_at LIMIT 1`);
+  check("重複批准 → 404/409，且 approved 事件不重複",
+    [404, 409].includes(await post(senior, "/b04/approve", { batch: B1, rule: someApproved }))
+    && sql(`SELECT count(*) FROM audit_event WHERE event_type='mapping_rule.approved'
+            AND object_id='${someApproved}'`) === "1");
 } finally {
   api.kill(); worker.kill();
 }

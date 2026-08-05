@@ -508,19 +508,24 @@ account_code,account_name,debit,credit
         return send(403, page("拒絕", b04CtxBar(g.b, "B-04"),
           `<h2>⛔ 歸屬違規：目標科目不屬於本案件的科目表</h2><p>此次嘗試已寫入稽核軌跡。</p>`));
       }
-      const next = query<{ v: string }>(
-        `SELECT COALESCE(MAX(version_no), 0) + 1 AS v FROM mapping_rule
-          WHERE engagement_id = :'e'::uuid AND source_account_code = :'sc'`,
-        { e: g.b.engagement_id, sc: sourceCode }, { tenantId: s.tenantId })[0].v;
-      const [row] = query<{ mapping_rule_id: string }>(
-        `INSERT INTO mapping_rule (tenant_id, engagement_id, source_account_code,
-                target_account_id, version_no, created_by)
-         VALUES (:'t'::uuid, :'e'::uuid, :'sc', :'a'::uuid, ${Number(next)}, :'u'::uuid)
-         RETURNING mapping_rule_id`,
-        { t: s.tenantId, e: g.b.engagement_id, sc: sourceCode, a: target, u: s.userId },
+      // 狀態異動與 DomainEvent 同一 statement（事件原子化）：事件寫入失敗＝整句回滾，
+      // 不存在「映射已生效而事件不存在」（BACKLOG 2026-08-04 條目）
+      const ruleId = randomUUID();
+      exec(`WITH ins AS (
+              INSERT INTO mapping_rule (mapping_rule_id, tenant_id, engagement_id,
+                     source_account_code, target_account_id, version_no, created_by)
+              VALUES (:'m'::uuid, :'t'::uuid, :'e'::uuid, :'sc', :'a'::uuid,
+                      (SELECT COALESCE(MAX(version_no), 0) + 1 FROM mapping_rule
+                        WHERE engagement_id = :'e'::uuid AND source_account_code = :'sc'),
+                      :'u'::uuid)
+              RETURNING mapping_rule_id, version_no)
+            INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
+            SELECT :'t'::uuid, 'DOMAIN_EVENT', 'mapping_rule.drafted', :'u'::uuid,
+                   'mapping_rule', ins.mapping_rule_id,
+                   jsonb_build_object('source_code', :'sc', 'target', :'a', 'version', ins.version_no)
+              FROM ins`,
+        { m: ruleId, t: s.tenantId, e: g.b.engagement_id, sc: sourceCode, a: target, u: s.userId },
         { tenantId: s.tenantId });
-      audit(s.tenantId, "DOMAIN_EVENT", "mapping_rule.drafted", s.userId,
-        "mapping_rule", row.mapping_rule_id, { source_code: sourceCode, target, version: Number(next) });
       return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
     }
 
@@ -546,10 +551,25 @@ account_code,account_name,debit,credit
         return send(403, page("拒絕", b04CtxBar(g.b, "B-04"),
           "<h2>⛔ SOD：建立者不得批准自己建立的映射版本</h2><p>此次嘗試已寫入稽核軌跡。</p>"));
       }
-      exec(`UPDATE mapping_rule SET approved_by = :'u'::uuid, approved_at = now()
-             WHERE mapping_rule_id = :'m'::uuid`,
-        { u: s.userId, m: ruleId }, { tenantId: s.tenantId });
-      audit(s.tenantId, "DOMAIN_EVENT", "mapping_rule.approved", s.userId, "mapping_rule", ruleId, {});
+      // 批准與事件同一 statement；併發下 UPDATE 落空（已被批准）→ fn_assert 整句回滾
+      try {
+        exec(`WITH upd AS (
+                UPDATE mapping_rule SET approved_by = :'u'::uuid, approved_at = now()
+                 WHERE mapping_rule_id = :'m'::uuid AND approved_at IS NULL
+                 RETURNING mapping_rule_id),
+              ev AS (
+                INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
+                SELECT :'t'::uuid, 'DOMAIN_EVENT', 'mapping_rule.approved', :'u'::uuid,
+                       'mapping_rule', upd.mapping_rule_id, '{}'::jsonb
+                  FROM upd)
+              SELECT fn_assert(EXISTS (SELECT 1 FROM upd), 'ALREADY_APPROVED')`,
+          { u: s.userId, m: ruleId, t: s.tenantId }, { tenantId: s.tenantId });
+      } catch (e) {
+        if (String(e).includes("ALREADY_APPROVED"))
+          return send(409, page("拒絕", b04CtxBar(g.b, "B-04"),
+            "<h2>⛔ 草稿已被批准或不存在（併發）</h2>"));
+        throw e;
+      }
       return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
     }
 

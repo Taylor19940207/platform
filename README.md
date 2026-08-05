@@ -30,7 +30,7 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 43 ＋ DB 整合 165 ＋ 端到端驗收 159（里程碑 1 之 20 ＋ 映射 25 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23），共 367 條
+pnpm test          # 單元 43 ＋ DB 整合 165 ＋ 端到端驗收 161（里程碑 1 之 20 ＋ 映射 27 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23），共 369 條
 ```
 
 **跑測試前先停掉 `pnpm dev`**：端到端測試會自己 spawn API（8091～8096）與 worker，
@@ -67,6 +67,6 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 apps/        api（模組化單體宿主）｜worker（背景驗證）｜web（Next.js 佔位）
 packages/    domain（狀態機）｜database（migration＋轉接層）｜auth｜contracts｜config
 scripts/     dev.mjs｜env.sh（傳輸層）｜sandbox/（非主流程）
-tests/       unit｜integration（DB 守衛 165 條）｜acceptance（端到端 159 條）｜fixtures/case-001
+tests/       unit｜integration（DB 守衛 165 條）｜acceptance（端到端 161 條）｜fixtures/case-001
 docs/        GOVERNANCE｜BACKLOG｜adr/｜slices/
 ```
