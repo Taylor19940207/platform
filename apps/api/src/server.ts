@@ -245,40 +245,125 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       }, null, 2));
     }
 
-    // ── B-00 個人工作台（只顯示被指派的案件——WKB-a） ──
+    // ── B-00 個人工作台（M2-04）──
+    // 佇列依「所需業務角色 × 該案件有效指派」過濾（engagement_id 明確匹配、未撤銷）；
+    // 租戶層角色（R6 等，engagement_id IS NULL）不取得任何客戶工作存取權（WKB-a）。
     if (url.pathname === "/") {
-      const engagements = query<{ engagement_id: string; name: string }>(
+      const engFor = (roles: string[]) => query<{ engagement_id: string; name: string }>(
         `SELECT DISTINCT ce.engagement_id, ce.name FROM client_engagement ce
-           JOIN role_assignment ra ON (ra.engagement_id = ce.engagement_id OR ra.engagement_id IS NULL)
-          WHERE ra.user_id = :'u'::uuid AND ra.revoked_at IS NULL ORDER BY ce.name`,
+           JOIN role_assignment ra ON ra.engagement_id = ce.engagement_id
+          WHERE ra.user_id = :'u'::uuid AND ra.revoked_at IS NULL
+            AND ra.role IN (${roles.map((r) => `'${r}'`).join(",")})
+          ORDER BY ce.name`,
         { u: s.userId }, { tenantId: s.tenantId });
-      const assignedIds = new Set(engagements.map((e) => e.engagement_id));
-      const batches = query<Record<string, string>>(
-        `SELECT DISTINCT ib.import_batch_id, ib.created_at, ce.name AS client, le.name AS entity,
+      const bizEng = engFor(["R1", "R2", "R3", "R4", "R5", "R7"]);
+      const inList = (rows: { engagement_id: string }[]) =>
+        rows.length ? rows.map((r) => `'${r.engagement_id}'`).join(",")
+                    : "'00000000-0000-0000-0000-000000000000'";
+      const r2In = inList(engFor(["R2"]));
+      const r3In = inList(engFor(["R3"]));
+      const r4In = inList(engFor(["R4"]));
+      const bizIn = inList(bizEng);
+      const bizIds = new Set(bizEng.map((e2) => e2.engagement_id));
+
+      // 佇列 1：待身分確認（R2；PENDING_CONFIRMATION 且非 QUARANTINED／SUPERSEDED）
+      const qIdentity = query<Record<string, string>>(
+        `SELECT ib.import_batch_id, ib.batch_version, ce.name AS client, le.name AS entity,
+                rp.label AS period, ib.status
+           FROM import_batch ib
+           JOIN client_engagement ce ON ce.engagement_id = ib.engagement_id
+           JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
+           JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
+           JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
+          WHERE ib.identity_status = 'PENDING_CONFIRMATION'
+            AND ib.status NOT IN ('QUARANTINED','SUPERSEDED')
+            AND ib.engagement_id IN (${r2In})
+          ORDER BY ib.created_at DESC LIMIT 20`, {}, { tenantId: s.tenantId });
+      const adjQ = (where: string, engIn: string) => query<Record<string, string>>(
+        `SELECT a.adjustment_id, a.title, a.status, ce.name AS client, ru.name AS entity,
+                rp.label AS period, last.reason_category
+           FROM adjustment a
+           JOIN client_engagement ce ON ce.engagement_id = a.engagement_id
+           JOIN period_revision pr ON pr.period_revision_id = a.period_revision_id
+           JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
+           JOIN reporting_unit ru ON ru.reporting_unit_id = rp.reporting_unit_id
+           LEFT JOIN LATERAL (SELECT milestone, reason_category
+                  FROM adjustment_version_snapshot v WHERE v.adjustment_id = a.adjustment_id
+                 ORDER BY v.business_version DESC, v.occurred_at DESC LIMIT 1) last ON true
+          WHERE ${where} AND a.engagement_id IN (${engIn})
+          ORDER BY a.updated_at DESC LIMIT 20`, {}, { tenantId: s.tenantId });
+      // 佇列 2：待覆核（R3；SOD-01：不含自己編製）
+      const qReview = adjQ(`a.status = 'PENDING_REVIEW' AND a.prepared_by <> :'u2'::uuid`
+        .replace(":'u2'", `'${s.userId}'`), r3In);
+      // 佇列 3：待批准（R4；AC-WFL-001 ≠編製人 ∧ SOD-02 ≠覆核人——完整三人分離）
+      const qApprove = adjQ(
+        `a.status = 'PENDING_APPROVAL' AND a.prepared_by <> '${s.userId}' AND a.reviewed_by <> '${s.userId}'`,
+        r4In);
+      // 佇列 4：被退回／待補證據（自己編製、DRAFTING、最新里程碑 RETURNED）
+      const qReturned = adjQ(
+        `a.status = 'DRAFTING' AND a.prepared_by = '${s.userId}' AND last.milestone = 'RETURNED'`,
+        bizIn);
+      // 佇列 5：未完成草稿（自己的 DRAFTING 調整＋未批准映射草稿）
+      const qDraftAdj = adjQ(`a.status = 'DRAFTING' AND a.prepared_by = '${s.userId}'`, bizIn);
+      const qDraftMap = query<Record<string, string>>(
+        `SELECT mr.mapping_rule_id, mr.source_account_code, ce.name AS client
+           FROM mapping_rule mr JOIN client_engagement ce ON ce.engagement_id = mr.engagement_id
+          WHERE mr.created_by = :'u'::uuid AND mr.approved_at IS NULL
+            AND mr.engagement_id IN (${bizIn})
+          ORDER BY mr.created_at DESC LIMIT 20`, { u: s.userId }, { tenantId: s.tenantId });
+
+      const batches = bizEng.length ? query<Record<string, string>>(
+        `SELECT ib.import_batch_id, ib.created_at, ce.name AS client, le.name AS entity,
                 rp.label AS period, ib.status, ib.identity_status, ib.file_name, ib.quarantine_reason
            FROM import_batch ib
            JOIN client_engagement ce ON ce.engagement_id = ib.engagement_id
            JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
            JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
            JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
-           JOIN role_assignment ra ON (ra.engagement_id = ib.engagement_id OR ra.engagement_id IS NULL)
-                AND ra.user_id = :'u'::uuid AND ra.revoked_at IS NULL
-          ORDER BY ib.created_at DESC LIMIT 50`,
-        { u: s.userId }, { tenantId: s.tenantId });
-      // 選單只列被指派案件底下的法人與期間（前端便利；權威判定在 validateContext）
+          WHERE ib.engagement_id IN (${bizIn})
+          ORDER BY ib.created_at DESC LIMIT 50`, {}, { tenantId: s.tenantId }) : [];
       const les = query<Record<string, string>>(
         `SELECT legal_entity_id, name, engagement_id FROM legal_entity`, {}, { tenantId: s.tenantId })
-        .filter((r) => assignedIds.has(r.engagement_id));
+        .filter((r) => bizIds.has(r.engagement_id));
       const prs = query<Record<string, string>>(
         `SELECT pr.period_revision_id, rp.label, rp.engagement_id FROM period_revision pr
-           JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id`, {}, { tenantId: s.tenantId })
-        .filter((r) => assignedIds.has(r.engagement_id));
-      // B-00 每列固定四欄：客戶／法人／期間／狀態（WKB-c）
+           JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id`,
+        {}, { tenantId: s.tenantId }).filter((r) => bizIds.has(r.engagement_id));
+
+      const four = (r: Record<string, string>) =>
+        `<td>${esc(r.client)}</td><td>${esc(r.entity)}</td><td>${esc(r.period)}</td>`;
+      const qSec = (title: string, rows: string[], count: number) =>
+        `<h3>${esc(title)}（${count}）</h3>` + (count
+          ? `<table><tr><th>客戶</th><th>法人</th><th>期間</th><th>狀態</th><th>項目</th><th></th></tr>${rows.join("")}</table>`
+          : `<p class="note">無</p>`);
       return send(200, page("B-00 個人工作台",
         `<span>畫面 <b>B-00 個人工作台</b></span><span>使用者 <b>${esc(s.userId.slice(-4))}</b></span>`,
-        `<h2>上傳試算表（TB）</h2>
+        `<h2>等我處理的事項</h2>
+         ${qSec("待身分確認", qIdentity.map((r) => `<tr>${four(r)}
+            <td><span class="badge st-PENDING_CONFIRMATION">待確認</span></td>
+            <td>批次 ${r.import_batch_id.slice(0, 8)}（v${r.batch_version}）</td>
+            <td><a href="/b03/identity?batch=${r.import_batch_id}">開啟確認頁</a></td></tr>`), qIdentity.length)}
+         ${qSec("待覆核", qReview.map((r) => `<tr>${four(r)}
+            <td><span class="badge st-UPLOADED">待覆核</span></td><td>${esc(r.title)}</td>
+            <td><a href="/b05?adj=${r.adjustment_id}">開啟 B-05</a></td></tr>`), qReview.length)}
+         ${qSec("待批准", qApprove.map((r) => `<tr>${four(r)}
+            <td><span class="badge st-UPLOADED">待批准</span></td><td>${esc(r.title)}</td>
+            <td><a href="/b05?adj=${r.adjustment_id}">開啟 B-05</a></td></tr>`), qApprove.length)}
+         ${qSec("被退回／待補證據", qReturned.map((r) => `<tr>${four(r)}
+            <td><span class="badge st-QUARANTINED">被退回</span></td>
+            <td>${esc(r.title)}（${esc(r.reason_category ?? "")}）</td>
+            <td><a href="/b05?adj=${r.adjustment_id}">開啟 B-05</a></td></tr>`), qReturned.length)}
+         ${qSec("未完成草稿", [
+            ...qDraftAdj.map((r) => `<tr>${four(r)}
+              <td><span class="badge st-UPLOADED">草稿</span></td><td>${esc(r.title)}</td>
+              <td><a href="/b05?adj=${r.adjustment_id}">開啟 B-05</a></td></tr>`),
+            ...qDraftMap.map((r) => `<tr><td>${esc(r.client)}</td><td>—（案件層）</td><td>—</td>
+              <td><span class="badge st-UPLOADED">映射草稿</span></td><td>${esc(r.source_account_code)}</td>
+              <td><a href="/b04?batch=">開啟 B-04</a></td></tr>`),
+          ], qDraftAdj.length + qDraftMap.length)}
+         <h2>上傳試算表（TB）</h2>
          <form class="up" method="post" action="/upload">
-           客戶 <select name="engagement">${engagements.map((r) => `<option value="${r.engagement_id}">${esc(r.name)}</option>`).join("")}</select>
+           客戶 <select name="engagement">${bizEng.map((r) => `<option value="${r.engagement_id}">${esc(r.name)}</option>`).join("")}</select>
            法人 <select name="legal_entity">${les.map((r) => `<option value="${r.legal_entity_id}">${esc(r.name)}</option>`).join("")}</select>
            期間 <select name="period_revision">${prs.map((r) => `<option value="${r.period_revision_id}">${esc(r.label)}</option>`).join("")}</select><br>
            <textarea name="csv" rows="6" cols="80"
@@ -297,9 +382,14 @@ account_code,account_name,debit,credit
            <td>${esc(b.file_name)}</td><td class="note">${esc(b.quarantine_reason ?? "")}</td>
            <td>${b.status === "VALIDATED" && b.identity_status === "MATCHED"
              ? `<form method="post" action="/b04/accept" style="margin:0"><input type="hidden" name="batch" value="${b.import_batch_id}"><button>接受</button></form>`
+             : b.status === "VALIDATED" && b.identity_status === "MANUALLY_RESOLVED"
+             ? `<form method="post" action="/b04/accept" style="margin:0"><input type="hidden" name="batch" value="${b.import_batch_id}"><button>接受</button></form>`
+             : b.status === "VALIDATED" && b.identity_status === "PENDING_CONFIRMATION"
+             ? `<a href="/b03/identity?batch=${b.import_batch_id}">身分確認</a>`
              : b.status === "ACCEPTED" ? `<a href="/b04?batch=${b.import_batch_id}">B-04 映射</a>` : ""}</td></tr>`).join("")}
-         </table><p class="note">此頁只顯示您被指派的案件；未指派案件的名稱與數量不會出現（WKB-a）。</p>`));
+         </table><p class="note">此頁只顯示您具業務角色且被指派之案件；未指派案件的名稱與數量不會出現（WKB-a）。</p>`));
     }
+
 
     // ── 上傳（POST /upload；走查骨架用 urlencoded 表單。分段續傳 A7/A8 屬下一里程碑） ──
     if (url.pathname === "/upload" && req.method === "POST") {
@@ -1130,6 +1220,138 @@ account_code,account_name,debit,credit
         { ...snap.params, ...evA.params, ...evM.params, u: s.userId, e: r.engagement_id,
           pr: r.period_revision_id, ed: r.period_end }, { tenantId: s.tenantId });
       return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
+    }
+
+    // ═══════════ SLICE-M2-04：B-03 身分確認（UNVERIFIABLE 人工確認） ═══════════
+    // 明確案件指派的業務角色（不含租戶層 NULL 指派——R6 不得取得客戶工作存取權）
+    const explicitRolesOf = (engagementId: string): Set<string> =>
+      new Set(query<{ role: string }>(
+        `SELECT role FROM role_assignment
+          WHERE user_id = :'u'::uuid AND revoked_at IS NULL AND engagement_id = :'e'::uuid`,
+        { u: s.userId, e: engagementId }, { tenantId: s.tenantId }).map((r) => r.role));
+    const loadBatchFull = (batchId: string) => query<Record<string, string>>(
+      `SELECT ib.import_batch_id, ib.engagement_id, ib.status, ib.identity_status,
+              ib.batch_version, ib.uploaded_by, ib.current_identity_assessment_id,
+              ib.file_sha256, ce.name AS client, le.name AS entity,
+              le.authoritative_code, rp.label AS period
+         FROM import_batch ib
+         JOIN client_engagement ce ON ce.engagement_id = ib.engagement_id
+         JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
+         JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
+         JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
+        WHERE ib.import_batch_id = :'b'::uuid`,
+      { b: batchId }, { tenantId: s.tenantId })[0];
+
+    if (url.pathname === "/b03/identity" && req.method === "GET") {
+      const b = loadBatchFull(url.searchParams.get("batch") ?? "");
+      if (!b) return send(404, page("404", "", "<h2>批次不存在</h2>"));
+      const roles = explicitRolesOf(b.engagement_id);
+      if (!roles.has("R2") && !roles.has("R3") && !roles.has("R4")) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "identity.view.denied", s.userId,
+          "import_batch", b.import_batch_id, { reason: "無該案件業務角色指派" });
+        return send(403, page("拒絕", "<b>⛔</b>", "<h2>⛔ 未被指派此案件</h2><p>此次嘗試已寫入稽核軌跡。</p>"));
+      }
+      const assessments = query<Record<string, string>>(
+        `SELECT assessment_id, evidence_kind, match_result, detected_identity::text AS detected,
+                detection_rule_version, assessed_at::text AS assessed_at
+           FROM source_identity_assessment WHERE import_batch_id = :'b'::uuid
+          ORDER BY assessed_at, assessment_id`,
+        { b: b.import_batch_id }, { tenantId: s.tenantId });
+      const ctx = `<span>畫面 <b>B-03 身分確認</b></span><span>客戶 <b>${esc(b.client)}</b></span>
+        <span>法人 <b>${esc(b.entity)}</b></span><span>期間 <b>${esc(b.period)}</b></span>
+        <span>批次 <b>${b.import_batch_id.slice(0, 8)}（v${b.batch_version}）</b></span>`;
+      const confirmable = b.status === "VALIDATED" && b.identity_status === "PENDING_CONFIRMATION";
+      return send(200, page("B-03 身分確認", ctx,
+        `<h2>宣告目標</h2>
+         <table><tr><th>客戶</th><th>法人</th><th>法人權威代碼</th><th>期間</th><th>批次版本</th><th>檔案 SHA-256</th></tr>
+         <tr><td>${esc(b.client)}</td><td>${esc(b.entity)}</td><td>${esc(b.authoritative_code ?? "—")}</td>
+         <td>${esc(b.period)}</td><td>v${esc(b.batch_version)}</td><td class="note">${esc(b.file_sha256 ?? "")}</td></tr></table>
+         <h2>偵測證據（全部評估，含歷史）</h2>
+         <table><tr><th>current</th><th>證據強度</th><th>偵測值</th><th>判定</th><th>規則版本</th><th>別名表版本</th><th>評估時間</th></tr>
+         ${assessments.map((a) => `<tr>
+           <td>${a.assessment_id === b.current_identity_assessment_id ? "✓ current" : "（歷史）"}</td>
+           <td>${esc(a.evidence_kind)}</td><td class="note">${esc(a.detected)}</td>
+           <td><span class="badge st-${a.match_result === "MATCH" ? "MATCHED" : a.match_result === "CONFLICT" ? "CONFLICT" : "PENDING_CONFIRMATION"}">${a.match_result}</span></td>
+           <td>${esc(a.detection_rule_version)}</td><td>—（本刀無別名表）</td>
+           <td class="note">${esc(a.assessed_at.slice(0, 19))}</td></tr>`).join("")}
+         </table>
+         ${b.identity_status === "CONFLICT"
+           ? `<p>⛔ <b>CONFLICT 不提供人工豁免</b>（§25.5）。出路只有三條：修正宣告目標、
+              重新上傳正確檔案、或以新版識別規則重新偵測。</p>`
+           : b.identity_status === "MANUALLY_RESOLVED"
+           ? `<p>✅ 已人工確認（MANUALLY_RESOLVED）。可回 <a href="/">B-00</a> 執行接受（G-01 判定式）。</p>`
+           : confirmable ? `
+         <h2>人工確認（資料接受角色 R2；上傳者不得確認自己——SOD-07）</h2>
+         <form class="up" method="post" action="/b03/identity/confirm">
+           <input type="hidden" name="batch" value="${b.import_batch_id}">
+           <input type="hidden" name="assessment_id" value="${b.current_identity_assessment_id}">
+           確認理由（必填）<br><textarea name="reason" rows="3" cols="70"
+             placeholder="例：已向客戶電話確認為 A 商事株式会社之試算表"></textarea><br>
+           證據參照（選填）<input name="evidence_ref" size="40"><br>
+           <button>確認歸屬（寫入不可變紀錄）</button>
+           <span class="note">確認不會自動接受——接受仍須另行執行並通過 G-01 三條件（CTX-g）</span>
+         </form>` : `<p class="note">批次目前為 ${esc(b.status)}／${esc(b.identity_status)}，不在可確認狀態。</p>`}
+         <p><a href="/">回 B-00</a></p>`));
+    }
+
+    if (url.pathname === "/b03/identity/confirm" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const b = loadBatchFull(f["batch"] ?? "");
+      if (!b) return send(404, page("404", "", "<h2>批次不存在</h2>"));
+      const roles = explicitRolesOf(b.engagement_id);
+      if (!roles.has("R2")) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "identity.confirm.denied", s.userId,
+          "import_batch", b.import_batch_id, { code: "ROLE_REQUIRED", reason: "確認需該案件的有效 R2 指派（資料接受角色）" });
+        return send(403, page("拒絕", "<b>⛔</b>", "<h2>⛔ 確認需該案件的有效 R2 指派</h2>"));
+      }
+      if (b.uploaded_by === s.userId) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "identity.confirm.denied", s.userId,
+          "import_batch", b.import_batch_id,
+          { code: "SOD_07", reason: "上傳者不得確認自己上傳的批次（角色切換無效）" });
+        return send(403, page("拒絕", "<b>⛔</b>",
+          "<h2>⛔ SOD-07：上傳者不得確認自己上傳的批次</h2><p>與當下角色無關。此次嘗試已寫入稽核軌跡。</p>"));
+      }
+      // 一般欄位驗證錯誤：409＋機器代碼，不寫 CVA（§25.18）
+      if (!(f["reason"] ?? "").trim())
+        return send(409, page("欄位錯誤", "<b>⛔</b>",
+          "<h2>REASON_REQUIRED</h2><p>確認理由為必填。</p>"));
+      if (b.status !== "VALIDATED" || b.identity_status !== "PENDING_CONFIRMATION") {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "identity.confirm.rejected", s.userId,
+          "import_batch", b.import_batch_id,
+          { code: "STATE_NOT_CONFIRMABLE", status: b.status, identity_status: b.identity_status });
+        return send(409, page("拒絕", "<b>⛔</b>",
+          `<h2>⛔ STATE_NOT_CONFIRMABLE</h2><p>需 VALIDATED＋PENDING_CONFIRMATION（目前 ${esc(b.status)}／${esc(b.identity_status)}）。</p>`));
+      }
+      if ((f["assessment_id"] ?? "") !== b.current_identity_assessment_id) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "identity.confirm.rejected", s.userId,
+          "import_batch", b.import_batch_id,
+          { code: "NOT_CURRENT_ASSESSMENT", selected: f["assessment_id"] ?? "" });
+        return send(409, page("拒絕", "<b>⛔</b>",
+          "<h2>⛔ NOT_CURRENT_ASSESSMENT</h2><p>只能確認 current assessment——重新解析後的舊評估不可沿用（CTX-e）。</p>"));
+      }
+      const ev = (f["evidence_ref"] ?? "").trim();
+      // 單一交易：Resolution＋MANUALLY_RESOLVED＋DomainEvent 同生共死（DB 守衛為最後防線）
+      exec(`BEGIN;
+        INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id,
+               batch_version, resolved_by, acting_role, reason, evidence_ref, detection_rule_version)
+        VALUES (:'t'::uuid, :'aid'::uuid, :'b'::uuid, ${Number(b.batch_version)}, :'u'::uuid, 'R2',
+               :'rs', ${ev ? ":'ev'" : "NULL"},
+               (SELECT detection_rule_version FROM source_identity_assessment WHERE assessment_id = :'aid'::uuid));
+        UPDATE import_batch SET identity_status = 'MANUALLY_RESOLVED'
+         WHERE import_batch_id = :'b'::uuid;
+        INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
+        VALUES (:'t'::uuid, 'DOMAIN_EVENT', 'import_batch.identity_resolved', :'u'::uuid,
+               'import_batch', :'b'::uuid,
+               jsonb_build_object('assessment_id', :'aid', 'reason', :'rs',
+                 'evidence_ref', ${ev ? ":'ev'" : "NULL"},
+                 'detection_rule_version',
+                 (SELECT detection_rule_version FROM source_identity_assessment WHERE assessment_id = :'aid'::uuid),
+                 'alias_table_version', NULL));
+        COMMIT;`,
+        { t: s.tenantId, aid: b.current_identity_assessment_id, b: b.import_batch_id,
+          u: s.userId, rs: f["reason"].trim(), ...(ev ? { ev } : {}) },
+        { tenantId: s.tenantId });
+      return send(302, "", { location: `/b03/identity?batch=${b.import_batch_id}` });
     }
 
     // ═══════════ SLICE-M2-02B：B-06 PREVIEW CalculationRun ═══════════

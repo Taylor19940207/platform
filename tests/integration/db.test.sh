@@ -38,9 +38,13 @@ INSERT INTO tenant (tenant_id, name) VALUES
 SET app.tenant_id = '11111111-1111-1111-1111-111111111111';
 INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
   ('aaaaaaaa-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','staff@t1.jp','職員甲'),
-  ('aaaaaaaa-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','senior@t1.jp','資深乙');
+  ('aaaaaaaa-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','senior@t1.jp','資深乙'),
+  ('aaaaaaaa-0000-0000-0000-000000000003','11111111-1111-1111-1111-111111111111','manager@t1.jp','經理丙');
 INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES
   ('eeeeeeee-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','A 客戶案件');
+INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id) VALUES
+  ('11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000001','R2','eeeeeeee-0000-0000-0000-000000000001'),
+  ('11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000002','R2','eeeeeeee-0000-0000-0000-000000000001');
 INSERT INTO legal_entity (legal_entity_id, tenant_id, engagement_id, name, authoritative_code, country_code) VALUES
   ('cccccccc-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','A 株式会社','1234567890123','JP');
 INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, legal_entity_id, unit_scope, name) VALUES
@@ -73,48 +77,113 @@ then ng "RLS：T2 竟可寫入 T1 資料"; else ok "RLS：T2 無法寫入 T1 資
 n=$(APP_C 2>/dev/null <<<"SELECT count(*) FROM import_batch")
 [ "$n" = "0" ] && ok "RLS：未設定 tenant 時看不到任何資料" || ng "RLS：未設定 tenant 竟看到 $n 筆"
 
-# ── 主狀態機（§25.5） ───────────────────────────────
+# ── 主狀態機（§25.5）＋ identity 遷移白名單（0019） ────────
 expect_err "狀態機：DRAFT 不可直接跳 VALIDATED" \
   "UPDATE import_batch SET status='VALIDATED' WHERE import_batch_id='$B1'" "非法狀態遷移"
 expect_ok  "狀態機：DRAFT → UPLOADED" \
   "UPDATE import_batch SET status='UPLOADED', file_name='tb.csv', file_sha256='abc' WHERE import_batch_id='$B1'"
-expect_ok  "狀態機：UPLOADED → VALIDATING → VALIDATED" \
+expect_err "0019：identity 判定不得於 UPLOADED 階段寫入（僅 VALIDATING）" \
+  "UPDATE import_batch SET identity_status='MATCHED' WHERE import_batch_id='$B1'" "VALIDATING 階段"
+expect_ok  "狀態機：UPLOADED → VALIDATING；判定於 VALIDATING 寫入（worker 唯一合法路徑）" \
   "UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$B1';
+   UPDATE import_batch SET identity_status='MATCHED' WHERE import_batch_id='$B1';
    UPDATE import_batch SET status='VALIDATED' WHERE import_batch_id='$B1'"
+expect_err "0019：已判定不得改寫（MATCHED → CONFLICT 拒絕）" \
+  "UPDATE import_batch SET identity_status='CONFLICT' WHERE import_batch_id='$B1'" "非法 identity"
 
 # ── G-01／INV-28（CR-002） ──────────────────────────
-expect_err "INV-28：identity_status=NOT_CHECKED 不得 ACCEPTED" \
-  "UPDATE import_batch SET status='ACCEPTED', hash_verified=true WHERE import_batch_id='$B1'" "G-01/INV-28"
 expect_ok  "評估：權威識別符 CONFLICT 可寫入" \
   "INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
    VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'CONFLICT','AUTHORITATIVE_ID','r1')"
 expect_err "證據分級：模糊名稱不得產生 CONFLICT" \
   "INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
    VALUES ('11111111-1111-1111-1111-111111111111','$B1',1,'CONFLICT','FUZZY_NAME','r1')" "violates check"
-PSQL_C >/dev/null <<<"UPDATE import_batch SET identity_status='CONFLICT' WHERE import_batch_id='$B1'"
-expect_err "INV-28：identity_status=CONFLICT 不得 ACCEPTED（硬性、無豁免）" \
-  "UPDATE import_batch SET status='ACCEPTED', hash_verified=true WHERE import_batch_id='$B1'" "G-01/INV-28"
-PSQL_C >/dev/null <<<"UPDATE import_batch SET identity_status='MATCHED' WHERE import_batch_id='$B1'"
 expect_err "INV-28：MATCHED 但雜湊未驗證仍不得 ACCEPTED" \
   "UPDATE import_batch SET status='ACCEPTED', hash_verified=false WHERE import_batch_id='$B1'" "G-01/INV-28"
 expect_ok  "G-01：三條件齊備 → ACCEPTED 成功" \
   "UPDATE import_batch SET status='ACCEPTED', hash_verified=true WHERE import_batch_id='$B1'"
 expect_err "INV-08：SUPERSEDED 必須指向替代批次" \
   "UPDATE import_batch SET status='SUPERSEDED' WHERE import_batch_id='$B1'" "INV-08"
+# NOT_CHECKED／CONFLICT 阻擋——各用專用批次（identity 白名單下不可事後改寫）
+BN=00000000-0000-0000-0000-0000000000b3
+BC=00000000-0000-0000-0000-0000000000b4
+PSQL_C >/dev/null <<SQL
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id, declared_period_revision_id, uploaded_by, provided_by, file_name, file_sha256, status) VALUES
+  ('$BN','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','n.csv','hn','UPLOADED'),
+  ('$BC','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','c.csv','hc','UPLOADED');
+UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$BN';
+UPDATE import_batch SET status='VALIDATED'  WHERE import_batch_id='$BN';
+UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$BC';
+UPDATE import_batch SET identity_status='CONFLICT' WHERE import_batch_id='$BC';
+UPDATE import_batch SET status='VALIDATED'  WHERE import_batch_id='$BC';
+SQL
+expect_err "INV-28：identity_status=NOT_CHECKED 不得 ACCEPTED" \
+  "UPDATE import_batch SET status='ACCEPTED', hash_verified=true WHERE import_batch_id='$BN'" "G-01/INV-28"
+expect_err "INV-28：identity_status=CONFLICT 不得 ACCEPTED（硬性、無豁免）" \
+  "UPDATE import_batch SET status='ACCEPTED', hash_verified=true WHERE import_batch_id='$BC'" "G-01/INV-28"
 
-# ── SOD-07（CR-002，實例級） ─────────────────────────
-A1=$(PSQL_C <<<"SELECT assessment_id FROM source_identity_assessment WHERE import_batch_id='$B1' LIMIT 1")
+# ── SOD-07 ＋ 0019 Resolution 防繞過 ─────────────────
+BU=00000000-0000-0000-0000-0000000000b5
+BW=00000000-0000-0000-0000-0000000000b6
+AU=aa110000-0000-0000-0000-000000000001
+AU2=aa110000-0000-0000-0000-000000000002
+AM=aa110000-0000-0000-0000-000000000003
+AW=aa110000-0000-0000-0000-000000000004
+expect_ok "0019 前置：UNVERIFIABLE 批次（worker 路徑：VALIDATING 寫入評估＋current 指標）" \
+  "INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id, declared_period_revision_id, uploaded_by, provided_by, file_name, file_sha256, status) VALUES
+    ('$BU','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','u.csv','hu','UPLOADED');
+   UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$BU';
+   INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
+   VALUES ('$AU','11111111-1111-1111-1111-111111111111','$BU',1,'UNVERIFIABLE','NONE','r1');
+   UPDATE import_batch SET identity_status='PENDING_CONFIRMATION', current_identity_assessment_id='$AU' WHERE import_batch_id='$BU';
+   UPDATE import_batch SET status='VALIDATED' WHERE import_batch_id='$BU'"
+expect_err "0019：無 Resolution 不得直接改寫為 MANUALLY_RESOLVED" \
+  "UPDATE import_batch SET identity_status='MANUALLY_RESOLVED' WHERE import_batch_id='$BU'" "必須先有"
+PSQL_C >/dev/null <<<"INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
+   VALUES ('$AU2','11111111-1111-1111-1111-111111111111','$BU',1,'UNVERIFIABLE','NONE','r2')"
+expect_err "0019：非 current assessment 不可確認（重解析後舊評估不沿用）" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU2','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','x','r2')" "current"
+expect_err "0019：batch_version 三方不一致拒絕" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',2,'aaaaaaaa-0000-0000-0000-000000000002','R2','x','r1')" "三方不一致"
+PSQL_C >/dev/null <<<"INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
+   VALUES ('$AM','11111111-1111-1111-1111-111111111111','$BU',1,'MATCH','AUTHORITATIVE_ID','r3')"
+expect_err "0019：非 UNVERIFIABLE 評估不可人工確認" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AM','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','x','r1')" "UNVERIFIABLE"
+A1=$(PSQL_C <<<"SELECT assessment_id FROM source_identity_assessment WHERE import_batch_id='$B1' AND match_result='CONFLICT' LIMIT 1")
+expect_err "0019：assessment 屬其他批次拒絕" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$A1','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','x','r1')" "屬其他批次"
 expect_err "SOD-07：上傳者不得確認自己上傳的批次（角色切換無效）" \
   "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
-   VALUES ('11111111-1111-1111-1111-111111111111','$A1','$B1',1,'aaaaaaaa-0000-0000-0000-000000000001','R2','看起來沒問題','r1')" "SOD-07"
-expect_ok  "SOD-07：另一個自然人可以確認" \
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000001','R2','看起來沒問題','r1')" "SOD-07"
+expect_err "0019：無該案件有效 R2 指派者不可確認（資料接受角色）" \
   "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
-   VALUES ('11111111-1111-1111-1111-111111111111','$A1','$B1',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','已向客戶電話確認為 A 社','r1')"
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000003','R2','x','r1')" "R2 指派"
+expect_ok  "SOD-07：另一個自然人（乙，R2）可以確認" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','已向客戶電話確認為 A 社','r1')"
 expect_err "確認不可覆寫（同一評估只能有一筆）" \
   "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
-   VALUES ('11111111-1111-1111-1111-111111111111','$A1','$B1',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','改個理由','r1')" "duplicate key"
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','改個理由','r1')" "duplicate key"
 expect_err "確認紀錄不可 UPDATE" \
-  "UPDATE source_identity_resolution SET reason='改掉' WHERE assessment_id='$A1'" "不可變"
+  "UPDATE source_identity_resolution SET reason='改掉' WHERE assessment_id='$AU'" "不可變"
+expect_ok  "0019：有 Resolution 後 PENDING_CONFIRMATION → MANUALLY_RESOLVED" \
+  "UPDATE import_batch SET identity_status='MANUALLY_RESOLVED' WHERE import_batch_id='$BU'"
+expect_ok  "G-01：MANUALLY_RESOLVED＋雜湊 → ACCEPTED（確認與接受分離）" \
+  "UPDATE import_batch SET hash_verified=true WHERE import_batch_id='$BU';
+   UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id='$BU'"
+expect_err "0019：狀態白名單——VALIDATING 中的批次不可確認（需 VALIDATED）" \
+  "INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id, declared_period_revision_id, uploaded_by, provided_by, file_name, file_sha256, status) VALUES
+    ('$BW','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001','w.csv','hw','UPLOADED');
+   UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$BW';
+   INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
+   VALUES ('$AW','11111111-1111-1111-1111-111111111111','$BW',1,'UNVERIFIABLE','NONE','r1');
+   UPDATE import_batch SET identity_status='PENDING_CONFIRMATION', current_identity_assessment_id='$AW' WHERE import_batch_id='$BW';
+   INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AW','$BW',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','x','r1')" "不允許確認"
 
 # ── 不可變性與借貸平衡 ─────────────────────────────
 PSQL_C >/dev/null <<SQL

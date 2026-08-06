@@ -193,6 +193,7 @@ function evaluate(j: Claimed) {
  * 因此「批次卡在 VALIDATING」結構性不可能發生。
  */
 function commitResult(j: Claimed, r: ReturnType<typeof evaluate>): void {
+  const assessmentId = randomUUID();
   const quarantineReason =
     r.result === "CONFLICT"
       ? `身分不一致：宣告法人代碼 ${j.declared_code}，檔案內為 ${r.detectedCode}（CONFLICT，無人工豁免）`
@@ -226,12 +227,14 @@ function commitResult(j: Claimed, r: ReturnType<typeof evaluate>): void {
         ) AS v(source_row_id, account_code, account_name, debit, credit, content_sha256);
         INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
         VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version}, 'BALANCE', ${lit(r.completeness)});
-        INSERT INTO source_identity_assessment (tenant_id, import_batch_id, batch_version,
+        INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version,
                 detected_identity, match_result, evidence_kind, detection_rule_version)
-        VALUES (${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version},
+        VALUES (${lit(assessmentId)}::uuid, ${lit(j.tenant_id)}::uuid, ${lit(j.import_batch_id)}::uuid, ${j.batch_version},
                 ${lit(JSON.stringify(r.detectedCode ? [{ kind: "legal_entity_code", value: r.detectedCode }] : []))}::jsonb,
                 ${lit(r.result)}, ${lit(r.evidence)}, ${lit(RULE_VERSION)});
-        UPDATE import_batch SET identity_status=${lit(r.idStatus)}::identity_status
+        -- Assessment 與 current 指標同一交易（M2-04 決策 5：「仍有效」＝current 指標）
+        UPDATE import_batch SET identity_status=${lit(r.idStatus)}::identity_status,
+               current_identity_assessment_id=${lit(assessmentId)}::uuid
          WHERE import_batch_id = ${lit(j.import_batch_id)}::uuid;
         ${eventSql(j.tenant_id, "import_batch.identity_assessed", j.import_batch_id,
           { declared: j.declared_code, detected: r.detectedCode, evidence: r.evidence, result: r.result }, "identity")}
