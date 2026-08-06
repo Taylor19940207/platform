@@ -58,8 +58,10 @@ TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED
 - `docs/handoffs/SESSION_HANDOFF_2026-08-04.md`（里程碑 1 ＋ 映射切片）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-04_SLICE-M2-02A.md`（調整生命週期 ＋ 覆核回饋硬化）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-04_SLICE-M2-03.md`（背景工作可靠性）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-05_MILESTONE-2-EXIT-REVIEW.md`（最新接續入口：
-  里程碑 2 阻擋盤點、三項待修正判定、SLICE-M2-04 邊界）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-05_MILESTONE-2-EXIT-REVIEW.md`（里程碑 2 阻擋盤點、
+  三項待修正判定、SLICE-M2-04 邊界）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-06_SLICE-M2-04.md`（**最新接續入口**：B-00 五佇列
+  ＋ UNVERIFIABLE 人工確認；0019／0020 硬化與 **0021 關閉收口**；M2-04 已正式關閉）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -89,10 +91,14 @@ HTML artifact 一次生成保存（staging 安全重試）、`package_content_ha
 詳 `docs/slices/SLICE-M2-02C_預覽證據包.md` 與
 `docs/handoffs/SESSION_HANDOFF_2026-08-05_SLICE-M2-02C.md`。
 
-**里程碑 2 的 02 系列（映射→調整→計算→證據包）至此收官。**里程碑 2 離開條件盤點
-已完成（`docs/reviews/MILESTONE-2_EXIT_REVIEW.md`，提交 `6ab32d3`），目前尚不能宣告離開。
-下一刀定為 `SLICE-M2-04_B00待辦與身分確認`；動工前先依最新 handoff 修正盤點文件的三項
-判定，再寫一頁切片與驗收清單。不重開 02 系列、不擴寫大型規格、不修改兩份正式基線。
+**里程碑 2 的 02 系列（映射→調整→計算→證據包）已收官，`SLICE-M2-04` 亦已正式關閉**
+（0021 收口，520/520 連續兩輪全綠）。里程碑 2 離開條件盤點見
+`docs/reviews/MILESTONE-2_EXIT_REVIEW.md`（提交 `6ab32d3`），目前**尚不能宣告離開**。
+
+下一刀為 **§25.8 期間生命週期切片**（不預設 `OPEN→LOCKED` 簡化，依完整語意）；
+其後依序：多基礎／四類規則最小資料模型 → 自動保存／Session 恢復（NFR-UX-001）
+→ 重跑里程碑 2 離開複核。動工前先寫一頁切片與驗收清單。
+不重開已關閉切片、不擴寫大型規格、不修改兩份正式基線。
 
 ## 第一次回覆使用者時
 

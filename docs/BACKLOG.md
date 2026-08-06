@@ -21,3 +21,4 @@
 | 2026-08-04 | ~~`mapping_rule` 的 DomainEvent 仍在狀態異動的交易外~~ **→ 2026-08-05 已修**：drafted／approved 與狀態異動併入單一 statement（CTE），併發落空整句回滾；preview_generated／review_ready 為純事件（無配對狀態異動），單一 INSERT 本身即原子。驗收含「資料與事件無單邊」全表掃描與重複批准防重測試 | SLICE-M2-02A 覆核 | 不需改基線 |
 | 2026-08-04 | `import_batch` 的 DomainEvent 同樣在交易外（upload／accept／worker 的 quarantined／identity_assessed／validated）。~~併入 SLICE-M2-03 處理~~ **已完成**：上傳與結果寫入皆為單一交易，事件與狀態同進同出 | SLICE-M2-02A 覆核 | 已完成 |
 | 2026-08-05 | 事務所實際可用性驗證：控制強度、合法恢復路徑、角色切換與税理士批准效率；詳細討論框架見 `docs/FUTURE_DISCUSSIONS.md` DISC-001 | 產品定位討論；待真實使用者走查 | 不需改基線；先收集證據 |
+| 2026-08-06 | **DB 守衛例外 → HTTP 狀態的統一映射**（P2，不阻擋任何切片關閉）。應用層先檢查通過、但在 INSERT 前條件被併發改變時，DB 會安全拒絕，外層卻回 500 而非對應的 409。實例：`/b04/map` 看到 ACCEPTED 後、寫入前批次被轉 `SUPERSEDED`（0021 的 `SOURCE_BATCH_NOT_ACCEPTED`）。**資料不會被污染**——DB 是最後防線且已擋下；問題只在回應語意。應統一把 DB 守衛的穩定機器代碼映射為對應 HTTP 狀態，而非逐點補檢查 | SLICE-M2-04 關閉複核（0021） | 不需改基線 |
