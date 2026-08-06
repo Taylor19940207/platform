@@ -31,7 +31,7 @@ bash "$ROOT/packages/database/src/db-reset.sh" $DB >/dev/null 2>&1 || { echo "�
 ok "migration 可從零重建資料庫"
 
 # ── 種子 ─────────────────────────────────────────────
-PSQL_C <<'SQL' >/dev/null
+PSQL_C <<'SQL' >/dev/null || { ng "種子資料建立失敗（fail closed）"; exit 1; }
 INSERT INTO tenant (tenant_id, name) VALUES
   ('11111111-1111-1111-1111-111111111111','T1 事務所'),
   ('22222222-2222-2222-2222-222222222222','T2 事務所');
@@ -40,11 +40,16 @@ INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
   ('aaaaaaaa-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','staff@t1.jp','職員甲'),
   ('aaaaaaaa-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','senior@t1.jp','資深乙'),
   ('aaaaaaaa-0000-0000-0000-000000000003','11111111-1111-1111-1111-111111111111','manager@t1.jp','經理丙');
+INSERT INTO app_user (user_id, tenant_id, email, display_name, is_active) VALUES
+  ('aaaaaaaa-0000-0000-0000-000000000005','11111111-1111-1111-1111-111111111111','left@t1.jp','離職戊',false);
+INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
+  ('a2222222-0000-0000-0000-000000000009','22222222-2222-2222-2222-222222222222','staff@t2.jp','T2 職員');
 INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES
   ('eeeeeeee-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','A 客戶案件');
 INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id) VALUES
   ('11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000001','R2','eeeeeeee-0000-0000-0000-000000000001'),
-  ('11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000002','R2','eeeeeeee-0000-0000-0000-000000000001');
+  ('11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000002','R2','eeeeeeee-0000-0000-0000-000000000001'),
+  ('11111111-1111-1111-1111-111111111111','aaaaaaaa-0000-0000-0000-000000000005','R2','eeeeeeee-0000-0000-0000-000000000001');
 INSERT INTO legal_entity (legal_entity_id, tenant_id, engagement_id, name, authoritative_code, country_code) VALUES
   ('cccccccc-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','A 株式会社','1234567890123','JP');
 INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, legal_entity_id, unit_scope, name) VALUES
@@ -84,10 +89,24 @@ expect_ok  "狀態機：DRAFT → UPLOADED" \
   "UPDATE import_batch SET status='UPLOADED', file_name='tb.csv', file_sha256='abc' WHERE import_batch_id='$B1'"
 expect_err "0019：identity 判定不得於 UPLOADED 階段寫入（僅 VALIDATING）" \
   "UPDATE import_batch SET identity_status='MATCHED' WHERE import_batch_id='$B1'" "VALIDATING 階段"
-expect_ok  "狀態機：UPLOADED → VALIDATING；判定於 VALIDATING 寫入（worker 唯一合法路徑）" \
-  "UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$B1';
-   UPDATE import_batch SET identity_status='MATCHED' WHERE import_batch_id='$B1';
+expect_ok  "狀態機：UPLOADED → VALIDATING" \
+  "UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$B1'"
+expect_err "0020：判定未與 current 指標成對 → 拒絕（無 Assessment 的 MATCHED 不存在）" \
+  "UPDATE import_batch SET identity_status='MATCHED' WHERE import_batch_id='$B1'" "成對"
+AM1=a1110000-0000-0000-0000-000000000001
+APU1=a1110000-0000-0000-0000-000000000002
+PSQL_C <<SQL >/dev/null || { ng "B1 評估種子建立失敗（fail closed）"; exit 1; }
+INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version) VALUES
+  ('$AM1','11111111-1111-1111-1111-111111111111','$B1',1,'MATCH','AUTHORITATIVE_ID','m1'),
+  ('$APU1','11111111-1111-1111-1111-111111111111','$B1',1,'UNVERIFIABLE','NONE','m2');
+SQL
+expect_err "0020：判定與 assessment 結果不對應（MATCHED ↔ UNVERIFIABLE）" \
+  "UPDATE import_batch SET identity_status='MATCHED', current_identity_assessment_id='$APU1' WHERE import_batch_id='$B1'" "不對應"
+expect_ok  "判定於 VALIDATING 與 current 指標成對寫入（worker 唯一合法路徑）" \
+  "UPDATE import_batch SET identity_status='MATCHED', current_identity_assessment_id='$AM1' WHERE import_batch_id='$B1';
    UPDATE import_batch SET status='VALIDATED' WHERE import_batch_id='$B1'"
+expect_err "0020：判定後 current 指標不可改寫" \
+  "UPDATE import_batch SET current_identity_assessment_id='$APU1' WHERE import_batch_id='$B1'" "成對寫入"
 expect_err "0019：已判定不得改寫（MATCHED → CONFLICT 拒絕）" \
   "UPDATE import_batch SET identity_status='CONFLICT' WHERE import_batch_id='$B1'" "非法 identity"
 
@@ -114,7 +133,14 @@ INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_le
 UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$BN';
 UPDATE import_batch SET status='VALIDATED'  WHERE import_batch_id='$BN';
 UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='$BC';
-UPDATE import_batch SET identity_status='CONFLICT' WHERE import_batch_id='$BC';
+SQL
+expect_err "0020：current assessment 屬其他批次 → 拒絕" \
+  "UPDATE import_batch SET identity_status='CONFLICT', current_identity_assessment_id='$AM1' WHERE import_batch_id='$BC'" "歸屬違規"
+ACX=a1110000-0000-0000-0000-000000000003
+PSQL_C <<SQL >/dev/null || { ng "BC 評估種子建立失敗（fail closed）"; exit 1; }
+INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version, match_result, evidence_kind, detection_rule_version)
+VALUES ('$ACX','11111111-1111-1111-1111-111111111111','$BC',1,'CONFLICT','AUTHORITATIVE_ID','c1');
+UPDATE import_batch SET identity_status='CONFLICT', current_identity_assessment_id='$ACX' WHERE import_batch_id='$BC';
 UPDATE import_batch SET status='VALIDATED'  WHERE import_batch_id='$BC';
 SQL
 expect_err "INV-28：identity_status=NOT_CHECKED 不得 ACCEPTED" \
@@ -162,6 +188,21 @@ expect_err "SOD-07：上傳者不得確認自己上傳的批次（角色切換�
 expect_err "0019：無該案件有效 R2 指派者不可確認（資料接受角色）" \
   "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
    VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000003','R2','x','r1')" "R2 指派"
+expect_err "0020：acting_role 偽造為 R4 → 拒絕（資料接受角色＝R2）" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R4','x','r1')" "acting_role"
+expect_err "0020：理由全空白 → 拒絕（不可變紀錄必須有實質理由）" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','   ','r1')" "空"
+expect_err "0020：規則版本與所選 assessment 不符 → 拒絕" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','x','FAKE-RULE')" "規則版本"
+expect_err "0020：停用使用者不可確認（戊：仍有 R2 指派但 is_active=false）" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000005','R2','x','r1')" "啟用"
+expect_err "0020：他租戶使用者不可確認（resolved_by 屬 T2）" \
+  "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
+   VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'a2222222-0000-0000-0000-000000000009','R2','x','r1')" "啟用"
 expect_ok  "SOD-07：另一個自然人（乙，R2）可以確認" \
   "INSERT INTO source_identity_resolution (tenant_id, assessment_id, import_batch_id, batch_version, resolved_by, acting_role, reason, detection_rule_version)
    VALUES ('11111111-1111-1111-1111-111111111111','$AU','$BU',1,'aaaaaaaa-0000-0000-0000-000000000002','R2','已向客戶電話確認為 A 社','r1')"
@@ -250,12 +291,7 @@ expect_err "硬化：created_by 不可變更（草稿改建立者再自批＝同
 
 # ══ SLICE-M2-02A：Adjustment 生命週期（migration 0007）══════════
 # 三個守衛掛在三個不同遷移；此層驗證 DB 為最後防線——繞過應用層直接寫 SQL 同樣被擋。
-PSQL_C <<'SQL' >/dev/null
-SET app.tenant_id = '11111111-1111-1111-1111-111111111111';
-INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
-  ('aaaaaaaa-0000-0000-0000-000000000003','11111111-1111-1111-1111-111111111111','manager@t1.jp','經理丙');
-SQL
-ok "調整測試種子（第三個自然人：AC-WFL-001 需要三人互異）"
+# 第三個自然人（丙）已於主種子建立——AC-WFL-001 需要三人互異
 
 JIA=aaaaaaaa-0000-0000-0000-000000000001
 YI=aaaaaaaa-0000-0000-0000-000000000002
@@ -413,7 +449,7 @@ n=$(APP_C <<<"$T1 SELECT reviewed_by FROM adjustment WHERE adjustment_id='$ADJ3'
 
 # 缺口 5 實測重現：tenant_id 自填為 T1、engagement_id 指向 T2 的案件。
 # RLS 只比對列自己的 tenant_id，一般 FK 不保證父物件同租戶（INV-18）。
-PSQL_C <<'SQL' >/dev/null 2>&1
+PSQL_C <<'SQL' >/dev/null || { ng "跨租戶測試種子建立失敗（fail closed）"; exit 1; }
 SET app.tenant_id = '22222222-2222-2222-2222-222222222222';
 INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES
   ('e2222222-0000-0000-0000-000000000001','22222222-2222-2222-2222-222222222222','T2 案件');
@@ -442,7 +478,7 @@ expect_err "INV-18：快照 actor 屬其他租戶 → 拒絕" \
 
 # ══ 0009 同租戶跨案件錯配（同租戶 ≠ 同案件）══════════════════
 # 0008 的守衛只確認「都是 T1」。同一租戶底下的另一個案件仍可被錯配引用。
-PSQL_C <<'SQL' >/dev/null 2>&1
+PSQL_C <<'SQL' >/dev/null || { ng "同租戶第二案件種子建立失敗（fail closed）"; exit 1; }
 SET app.tenant_id = '11111111-1111-1111-1111-111111111111';
 INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, unit_scope, name) VALUES
   ('bbbbbbbb-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','LEGAL_ENTITY','另一案件單位');

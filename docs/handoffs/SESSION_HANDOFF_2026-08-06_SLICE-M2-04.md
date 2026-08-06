@@ -61,6 +61,34 @@
 - source_identity_assessment 冪等鍵含 detection_rule_version：同批次多筆評估
   必須用不同規則版本。
 
+## 複核硬化（0020，同日第二輪）
+
+使用者複核以回滾交易實測出 3 個 P1 產品缺口＋2 個測試可信度問題，全部修畢：
+
+1. **偽造 MATCHED**（`ACCEPTED|MATCHED|assessment=NULL` 曾可達成）→
+   `0020_assessment_resolution_consistency.sql`：判定必須與 current 指標
+   **同一次 UPDATE 成對寫入**；assessment 須存在且同租戶／批次／版本；結果對應
+   （MATCH↔MATCHED、UNVERIFIABLE↔PENDING_CONFIRMATION、CONFLICT↔CONFLICT）；
+   判定後指標凍結；ACCEPTED 時復驗 current assessment（縱深防禦）。
+2. **Resolution 歸因偽造**（`R4|reason=''|rule=FAKE-RULE` 曾可保存）→
+   guard 補：acting_role 必為 R2；reason 去空白非空；detection_rule_version
+   必等於所選 assessment；resolved_by 須同租戶且 `is_active`（app_user 列
+   `FOR UPDATE` 鎖住，停用不得與提交交錯）。
+3. **映射草稿一鍵回位斷鏈**（`/b04?batch=` 空連結、法人期間破折號）→
+   `mapping_rule.source_import_batch_id`（0020 新欄，INSERT 驗同租戶同案件、
+   UPDATE 不可變）；`/b04/map` 寫入；B-00 草稿列以來源批次帶出真實四欄脈絡
+   與可用連結；無來源批次的草稿如實顯示「—」不給假連結。
+4. **跨測試競態**（前一支驗收的殘留 worker 搶先認領 → job-reliability 28/29）→
+   全部 7 支驗收的 finally 等子行程真正退出（3 秒後 SIGKILL 保底）。
+5. **種子錯誤被吞**（重複插入丙的 duplicate key 印出後照樣 PASS）→ 移除重複
+   插入；所有種子 heredoc fail closed（`|| { ng …; exit 1; }`），不再吞退出碼。
+6. 佇列收緊：待身分確認直接要求 `status='VALIDATED'`（不再是負向排除）；
+   五佇列移除 `LIMIT 20`（超過 20 件不再靜默漏掉）。
+
+測試 487→**503**（DB 213：0020 成對性／不對應／跨批次／指標凍結／歸因五連發；
+端到端 55：映射草稿脈絡與回位、VALIDATING 不入佇列）。**連續兩輪全綠**，
+複核者的兩個回滾探測重放皆被 DB 拒絕。
+
 ## 尚未做（依定稿「明確不做」）
 
 背景工作技術進度／截止日／容量（B-00 P1）、唯讀「等待他人」區、自動保存與

@@ -111,6 +111,10 @@ try {
     home.includes("<th>客戶</th><th>法人</th><th>期間</th><th>狀態</th>"));
 } finally {
   api.kill(); worker.kill();
+  // 等子行程真正退出——殘留 worker 會搶先認領下一支測試的工作（跨測試競態）
+  await Promise.all([api, worker].map((p) => p && p.exitCode === null && p.signalCode === null
+    ? new Promise((res) => { const t = setTimeout(() => p.kill("SIGKILL"), 3000); p.once("exit", () => { clearTimeout(t); res(null); }); })
+    : null));
 }
 
 const fails = results.filter(([, ok]) => !ok).length;

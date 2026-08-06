@@ -243,6 +243,10 @@ try {
       AND event_type IN ('evidence_package.created','evidence_package.completed','evidence_package.failed')`)) === 3);
 } finally {
   worker?.kill(); api.kill();
+  // 等子行程真正退出——殘留 worker 會搶先認領下一支測試的工作（跨測試競態）
+  await Promise.all([api, worker].map((p) => p && p.exitCode === null && p.signalCode === null
+    ? new Promise((res) => { const t = setTimeout(() => p.kill("SIGKILL"), 3000); p.once("exit", () => { clearTimeout(t); res(null); }); })
+    : null));
 }
 
 const failed = results.filter(([, ok]) => !ok);

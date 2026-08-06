@@ -276,9 +276,9 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
            JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
            JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
           WHERE ib.identity_status = 'PENDING_CONFIRMATION'
-            AND ib.status NOT IN ('QUARANTINED','SUPERSEDED')
+            AND ib.status = 'VALIDATED'
             AND ib.engagement_id IN (${r2In})
-          ORDER BY ib.created_at DESC LIMIT 20`, {}, { tenantId: s.tenantId });
+          ORDER BY ib.created_at DESC`, {}, { tenantId: s.tenantId });
       const adjQ = (where: string, engIn: string) => query<Record<string, string>>(
         `SELECT a.adjustment_id, a.title, a.status, ce.name AS client, ru.name AS entity,
                 rp.label AS period, last.reason_category
@@ -291,7 +291,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
                   FROM adjustment_version_snapshot v WHERE v.adjustment_id = a.adjustment_id
                  ORDER BY v.business_version DESC, v.occurred_at DESC LIMIT 1) last ON true
           WHERE ${where} AND a.engagement_id IN (${engIn})
-          ORDER BY a.updated_at DESC LIMIT 20`, {}, { tenantId: s.tenantId });
+          ORDER BY a.updated_at DESC`, {}, { tenantId: s.tenantId });
       // 佇列 2：待覆核（R3；SOD-01：不含自己編製）
       const qReview = adjQ(`a.status = 'PENDING_REVIEW' AND a.prepared_by <> :'u2'::uuid`
         .replace(":'u2'", `'${s.userId}'`), r3In);
@@ -305,12 +305,19 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         bizIn);
       // 佇列 5：未完成草稿（自己的 DRAFTING 調整＋未批准映射草稿）
       const qDraftAdj = adjQ(`a.status = 'DRAFTING' AND a.prepared_by = '${s.userId}'`, bizIn);
+      // 映射草稿的四欄脈絡與一鍵回位來自不可變的來源批次（0020 source_import_batch_id）
       const qDraftMap = query<Record<string, string>>(
-        `SELECT mr.mapping_rule_id, mr.source_account_code, ce.name AS client
-           FROM mapping_rule mr JOIN client_engagement ce ON ce.engagement_id = mr.engagement_id
+        `SELECT mr.mapping_rule_id, mr.source_account_code, mr.source_import_batch_id,
+                ce.name AS client, COALESCE(le.name, '—') AS entity, COALESCE(rp.label, '—') AS period
+           FROM mapping_rule mr
+           JOIN client_engagement ce ON ce.engagement_id = mr.engagement_id
+           LEFT JOIN import_batch ib ON ib.import_batch_id = mr.source_import_batch_id
+           LEFT JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
+           LEFT JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
+           LEFT JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
           WHERE mr.created_by = :'u'::uuid AND mr.approved_at IS NULL
             AND mr.engagement_id IN (${bizIn})
-          ORDER BY mr.created_at DESC LIMIT 20`, { u: s.userId }, { tenantId: s.tenantId });
+          ORDER BY mr.created_at DESC`, { u: s.userId }, { tenantId: s.tenantId });
 
       const batches = bizEng.length ? query<Record<string, string>>(
         `SELECT ib.import_batch_id, ib.created_at, ce.name AS client, le.name AS entity,
@@ -357,9 +364,11 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
             ...qDraftAdj.map((r) => `<tr>${four(r)}
               <td><span class="badge st-UPLOADED">草稿</span></td><td>${esc(r.title)}</td>
               <td><a href="/b05?adj=${r.adjustment_id}">開啟 B-05</a></td></tr>`),
-            ...qDraftMap.map((r) => `<tr><td>${esc(r.client)}</td><td>—（案件層）</td><td>—</td>
+            ...qDraftMap.map((r) => `<tr>${four(r)}
               <td><span class="badge st-UPLOADED">映射草稿</span></td><td>${esc(r.source_account_code)}</td>
-              <td><a href="/b04?batch=">開啟 B-04</a></td></tr>`),
+              <td>${r.source_import_batch_id
+                ? `<a href="/b04?batch=${r.source_import_batch_id}">開啟 B-04</a>`
+                : `<span class="note">—（無來源批次脈絡）</span>`}</td></tr>`),
           ], qDraftAdj.length + qDraftMap.length)}
          <h2>上傳試算表（TB）</h2>
          <form class="up" method="post" action="/upload">
@@ -606,18 +615,20 @@ account_code,account_name,debit,credit
       const ruleId = randomUUID();
       exec(`WITH ins AS (
               INSERT INTO mapping_rule (mapping_rule_id, tenant_id, engagement_id,
-                     source_account_code, target_account_id, version_no, created_by)
+                     source_account_code, target_account_id, version_no, created_by,
+                     source_import_batch_id)
               VALUES (:'m'::uuid, :'t'::uuid, :'e'::uuid, :'sc', :'a'::uuid,
                       (SELECT COALESCE(MAX(version_no), 0) + 1 FROM mapping_rule
                         WHERE engagement_id = :'e'::uuid AND source_account_code = :'sc'),
-                      :'u'::uuid)
+                      :'u'::uuid, :'b'::uuid)
               RETURNING mapping_rule_id, version_no)
             INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
             SELECT :'t'::uuid, 'DOMAIN_EVENT', 'mapping_rule.drafted', :'u'::uuid,
                    'mapping_rule', ins.mapping_rule_id,
                    jsonb_build_object('source_code', :'sc', 'target', :'a', 'version', ins.version_no)
               FROM ins`,
-        { m: ruleId, t: s.tenantId, e: g.b.engagement_id, sc: sourceCode, a: target, u: s.userId },
+        { m: ruleId, t: s.tenantId, e: g.b.engagement_id, sc: sourceCode, a: target, u: s.userId,
+          b: g.b.import_batch_id },
         { tenantId: s.tenantId });
       return send(302, "", { location: `/b04?batch=${g.b.import_batch_id}` });
     }

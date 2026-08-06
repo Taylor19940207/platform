@@ -229,6 +229,45 @@ try {
   check("原確認紀錄並存於已接受批次",
     sql(`SELECT count(*) FROM source_identity_resolution WHERE import_batch_id='${BU}'`) === "1");
 
+  // ── 映射草稿：不可變來源批次脈絡＋可用的一鍵回位（0020 source_import_batch_id） ──
+  const ACCT = sql(`SELECT a.account_id FROM account a
+                    JOIN chart_of_accounts c ON c.coa_id = a.coa_id
+                    WHERE c.engagement_id='${ENG_A}' LIMIT 1`);
+  check("甲建立映射草稿（B-04，來源批次 B1）", await post(jia, "/b04/map",
+    { batch: B1, source_code: "9999", target: ACCT }) === 302);
+  check("映射草稿保存來源批次脈絡",
+    sql(`SELECT source_import_batch_id FROM mapping_rule WHERE source_account_code='9999'`) === B1);
+  homeJia = await get(jia, "/");
+  sec = section(homeJia, "未完成草稿");
+  check("映射草稿列：四欄脈絡為真實法人與期間（非破折號）",
+    sec.includes("9999") && sec.includes("A 商事株式会社") && sec.includes("2026-03"));
+  check("映射草稿列：一鍵回位連結指向來源批次的 B-04", sec.includes(`/b04?batch=${B1}`));
+  check("一鍵回位連結實際可用（200）", await getStatus(jia, `/b04?batch=${B1}`) === 200);
+  check("來源批次脈絡不可變更（DB 守衛）", (() => {
+    try {
+      sql(`SET app.tenant_id='${T1}';
+           UPDATE mapping_rule SET source_import_batch_id='${BU}' WHERE source_account_code='9999'`);
+      return false;
+    } catch { return true; }
+  })());
+
+  // ── 佇列 1 收緊：待身分確認只收 VALIDATED（VALIDATING 中不入列） ──
+  const BV = "00000000-0000-0000-0000-0000000000e1";
+  sql(`SET app.tenant_id='${T1}';
+       INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+              declared_period_revision_id, uploaded_by, provided_by, file_name, file_sha256, status)
+       VALUES ('${BV}','${T1}','${ENG_A}','${LE_A}','${PR1}','${U_JIA}','${U_JIA}','v.csv','hv','UPLOADED');
+       UPDATE import_batch SET status='VALIDATING' WHERE import_batch_id='${BV}';
+       INSERT INTO source_identity_assessment (assessment_id, tenant_id, import_batch_id, batch_version,
+              match_result, evidence_kind, detection_rule_version)
+       VALUES ('aa990000-0000-0000-0000-000000000001','${T1}','${BV}',1,'UNVERIFIABLE','NONE','rv');
+       UPDATE import_batch SET identity_status='PENDING_CONFIRMATION',
+              current_identity_assessment_id='aa990000-0000-0000-0000-000000000001'
+        WHERE import_batch_id='${BV}'`);
+  homeJia = await get(jia, "/");
+  check("待身分確認只收 VALIDATED：VALIDATING 中的 PENDING_CONFIRMATION 不入列",
+    !section(homeJia, "待身分確認").includes(BV.slice(0, 8)));
+
   // ── WKB-b：撤銷指派即時生效——佇列消失、既有連結被拒 ──
   sql(`SET app.tenant_id='${T1}';
        UPDATE role_assignment SET revoked_at=now()
@@ -238,6 +277,10 @@ try {
   check("撤銷後：既有確認頁連結被拒（403）", await getStatus(yi, `/b03/identity?batch=${BU2}`) === 403);
 } finally {
   api.kill(); worker.kill();
+  // 等子行程真正退出——殘留 worker 會搶先認領下一支測試的工作（跨測試競態）
+  await Promise.all([api, worker].map((p) => p && p.exitCode === null && p.signalCode === null
+    ? new Promise((res) => { const t = setTimeout(() => p.kill("SIGKILL"), 3000); p.once("exit", () => { clearTimeout(t); res(null); }); })
+    : null));
 }
 
 const failed = results.filter(([, ok]) => !ok).length;
