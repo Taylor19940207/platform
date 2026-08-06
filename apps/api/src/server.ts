@@ -598,6 +598,20 @@ account_code,account_name,debit,credit
       }
       const sourceCode = fields["source_code"] ?? "";
       const target = fields["target"] ?? "";
+      // 來源批次必須已接受（0021）：未經接受的批次不得成為正式映射的來源脈絡。
+      // 應用層先判定並回穩定機器代碼；DB 觸發器（含 FOR UPDATE）仍是最後防線，
+      // 不信任應用層——少了這層，繞過 UI 直接呼叫會得到 DB 例外與 HTTP 500。
+      if (g.b.status !== "ACCEPTED") {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "mapping.create.rejected", s.userId,
+          "import_batch", g.b.import_batch_id,
+          { guard: "SOURCE_BATCH_NOT_ACCEPTED", reason: "映射來源批次尚未接受",
+            batch_status: g.b.status, source_code: sourceCode });
+        return send(409, page("拒絕", b04CtxBar(g.b, "B-04"),
+          `<h2>⛔ SOURCE_BATCH_NOT_ACCEPTED：來源批次尚未接受</h2>
+           <p>目前狀態 <b>${esc(g.b.status)}</b>；映射的來源脈絡必須是已接受（ACCEPTED）的批次。</p>
+           <p class="note">此次嘗試已寫入稽核軌跡。</p>`),
+          { "x-error-code": "SOURCE_BATCH_NOT_ACCEPTED" });
+      }
       // 歸屬完整性（§24.1A）：目標科目必須屬於本案件的科目表；DB 觸發器為最後防線
       const okTarget = query<{ n: string }>(
         `SELECT count(*) AS n FROM account a JOIN chart_of_accounts c ON c.coa_id = a.coa_id

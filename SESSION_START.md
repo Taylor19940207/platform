@@ -39,8 +39,13 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
-里程碑 1、`SLICE-M2-01` 科目映射切片與 `SLICE-M2-02A` 調整生命週期切片均已完成。
-現有 20 份 migration；完整實跑結果為 **503/503**（單元 50、DB 整合 213、端到端 240），連續兩輪全綠。
+里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04` 均已完成並關閉。
+現有 21 份 migration；完整實跑結果為 **520/520**（單元 50、DB 整合 226、端到端 244），連續兩輪全綠。
+
+`SLICE-M2-04` 的關閉收口為 **0021**：映射來源批次必須為 `ACCEPTED`——未經接受的批次
+（含 QUARANTINED）不得成為正式映射的來源脈絡。DB 以 `FOR UPDATE` 鎖住來源批次列消除
+TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED`，DB 仍是最後防線。
+既有映射不因來源批次日後轉 `SUPERSEDED` 而被追溯刪除或改寫。
 
 **跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8098）
 與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，

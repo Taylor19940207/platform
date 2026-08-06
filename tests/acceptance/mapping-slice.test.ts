@@ -105,6 +105,28 @@ try {
   check("R4（乙）批准全部 15 條映射",
     sql(`SELECT count(*) FROM mapping_rule WHERE engagement_id='${ENG_A}' AND approved_at IS NOT NULL`) === "15");
 
+  // 0021：來源批次必須已接受——未經接受的批次不得成為正式映射的來源脈絡。
+  // 應用層先判定並回穩定機器代碼，不讓使用者撞上 DB 例外的 500。
+  const B_NEW = await (async () => {
+    await upload(staff, PR1, `${FIX}/jp_tb_2026-03.csv`);
+    await waitWorker();
+    return sql(`SELECT import_batch_id FROM import_batch ORDER BY created_at DESC LIMIT 1`);
+  })();
+  const newStatus = sql(`SELECT status FROM import_batch WHERE import_batch_id='${B_NEW}'`);
+  const r0021 = await fetch(`${API}/b04/map`, { method: "POST", redirect: "manual",
+    headers: { cookie: staff, "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ batch: B_NEW, source_code: "100",
+      target: accountId("1002") }).toString() });
+  check("0021：來源批次未 ACCEPTED（VALIDATED）→ 409，非 500",
+    newStatus === "VALIDATED" && r0021.status === 409, `status=${newStatus} http=${r0021.status}`);
+  check("0021：回穩定機器代碼 SOURCE_BATCH_NOT_ACCEPTED",
+    r0021.headers.get("x-error-code") === "SOURCE_BATCH_NOT_ACCEPTED");
+  check("0021：拒絕已留痕（guard=SOURCE_BATCH_NOT_ACCEPTED）",
+    Number(sql(`SELECT count(*) FROM audit_event WHERE kind='CONTROL_VIOLATION_ATTEMPT'
+                AND payload->>'guard'='SOURCE_BATCH_NOT_ACCEPTED'`)) >= 1);
+  check("0021：未接受批次確實沒有留下映射草稿",
+    sql(`SELECT count(*) FROM mapping_rule WHERE source_import_batch_id='${B_NEW}'`) === "0");
+
   // 跨案件誤用：目標科目屬 B 案件 → 拒絕＋留痕（§24.1A）
   const bAccount = sql(`SELECT a.account_id FROM account a JOIN chart_of_accounts c ON c.coa_id=a.coa_id
     WHERE c.engagement_id='eeeeeeee-0000-0000-0000-000000000002'`);

@@ -1,5 +1,8 @@
 # SESSION HANDOFF — SLICE-M2-04 B-00 待辦整合與身分確認（2026-08-06）
 
+> **狀態：已正式關閉**（0021 收口完成，520/520 連續兩輪全綠）。
+> 關閉收口內容見下方「關閉收口（0021，跨機最終複核）」一節。
+
 ## 本次完成（切片已完整實作並通過三層測試）
 
 契約：`docs/slices/SLICE-M2-04_B00待辦與身分確認.md`（二輪走查定稿，commit b0329e4）。
@@ -88,6 +91,39 @@
 測試 487→**503**（DB 213：0020 成對性／不對應／跨批次／指標凍結／歸因五連發；
 端到端 55：映射草稿脈絡與回位、VALIDATING 不入佇列）。**連續兩輪全綠**，
 複核者的兩個回滾探測重放皆被 DB 拒絕。
+
+## 關閉收口（0021，跨機最終複核）
+
+跨機最終複核在 `67a4691` 之後再找到一個 P1，本刀已修畢：
+
+**`fn_mapping_source_batch_guard` 只驗同租戶同案件，未要求來源批次已 ACCEPTED。**
+因此 DRAFT／UPLOADED／VALIDATED／QUARANTINED／SUPERSEDED 的批次都能成為映射草稿的
+來源脈絡。真正的風險**不是** engagement_id 漂移——0020 的 `fn_import_batch_guard`
+已在 `OLD.status <> 'DRAFT'` 時凍結歸屬欄位——而是**未經接受的批次成為正式映射的
+來源脈絡**：被隔離或尚未通過驗證的批次會讓追溯鏈指向一份從未被接受的資料。
+
+`0021_mapping_source_batch_accepted.sql`：
+
+- INSERT 時以 `FOR UPDATE` **鎖住來源批次列**再驗狀態。只做 `SELECT` 檢查會留下
+  TOCTOU 窗口——檢查通過後、INSERT 提交前，另一交易可把批次轉 `SUPERSEDED`。
+- 狀態非 `ACCEPTED` 一律拒絕，錯誤訊息帶穩定代碼 `SOURCE_BATCH_NOT_ACCEPTED`。
+- UPDATE 分支**刻意不重驗** `ACCEPTED`：已合法建立的映射不因來源批次日後轉
+  `SUPERSEDED` 而被追溯刪除或阻止批准（歷史事實不可回溯改寫）。
+
+應用層同步 fail closed：`/b04/map` 事前檢查 `status === 'ACCEPTED'`，不符回 **409**
+＋ header `x-error-code: SOURCE_BATCH_NOT_ACCEPTED` ＋ CVA 留痕。**只加 DB trigger
+不夠**——繞過 UI 直接呼叫會撞上 DB 例外變成 HTTP 500。DB 仍是最後防線，不信任應用層。
+
+測試 503 → **520**（DB 226：六個批次分別停在各狀態的負面／正向、SUPERSEDED 先行、
+`FOR UPDATE` 競態、不追溯改寫、脈絡不可變更共 13 條；端到端 244：映射驗收 27→31，
+409 非 500、機器代碼、留痕、未留草稿）。**既有 503 條零退化，連續兩輪 520/520 全綠。**
+
+實作期間自捕兩個測試缺陷：種子用 `UPDATE` 內嵌 `INSERT…RETURNING`（該位置不合法）
+使批次全卡在 VALIDATING，**四條負面案例一度以錯誤理由通過**（假綠）——改用檔案既有
+的兩步式合法路徑並加狀態斷言 fail closed；另一條斷言把來源改成同一個值，
+`IS DISTINCT FROM` 不成立，改為指向不同批次。
+
+**SLICE-M2-04 至此正式關閉。**
 
 ## 尚未做（依定稿「明確不做」）
 
