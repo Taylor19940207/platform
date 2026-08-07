@@ -20,6 +20,8 @@ import { canSubmit, canReview, canApprove, g08Check, balanceCheck, legalTransiti
   previewOnlyJudgment, decimalOf, type AdjustmentStatus, type AdjustmentState,
   type GuardResult } from "../../../packages/domain/src/adjustment.ts";
 import { idempotencyKey, isStalled } from "../../../packages/domain/src/backgroundJob.ts";
+import { extractDbCode, httpStatusForCode, displayTextForCode, isNotImplemented,
+  validateTransitionRequest } from "../../../packages/domain/src/periodLifecycle.ts";
 
 // 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分
 const DETECTION_RULE_VERSION = "detect-r1";
@@ -211,6 +213,58 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
     const s = session(req);
     if (!s) return send(302, "", { location: "/" });
+
+    // ═══════════ SLICE-M2-05：期間生命週期（§25.8） ═══════════
+    // 責任邊界：
+    //   API = 證明「呼叫者是誰」——p_actor 一律取自登入 Session，
+    //         **不接受請求自行傳 actor**（所有連線共用 app_runtime，
+    //         DB 無法證明呼叫者本人就是該自然人）。
+    //   DB  = 證明「這個人是否真的持有該角色、並允許這次遷移」。
+    // 本處不重寫任何守衛，只呼叫 DB 唯一裁決點並映射穩定代碼。
+    if (url.pathname === "/period/transition" && req.method === "POST") {
+      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
+      const revision = f["revision"] ?? "";
+      const expectedFrom = f["expected_from"] ?? "";
+      const to = f["to"] ?? "";
+      const actingRole = f["acting_role"] ?? "";
+      // 格式驗證只擋「連送進 DB 都不成形」的請求，不做守衛裁決。
+      // 一般欄位驗證錯誤不寫 CVA（§25.18）。
+      const v = validateTransitionRequest({ revision, expectedFrom, to, actingRole });
+      if (!v.ok) {
+        return send(400, page("請求格式錯誤", `<span>畫面 <b>期間生命週期</b></span>`,
+          `<h2>⛔ 請求格式錯誤</h2><p>欄位 <b>${esc(v.field)}</b>：${esc(v.reason)}</p>`),
+          { "x-error-code": "INVALID_REQUEST" });
+      }
+      try {
+        const [row] = query<{ landed: string }>(
+          `SELECT fn_period_attempt_transition(:'r'::uuid, :'ef', :'to', :'u'::uuid, :'role') AS landed`,
+          { r: revision, ef: expectedFrom, to, u: s.userId, role: actingRole },
+          { tenantId: s.tenantId });
+        // 不再另寫事件：DB 已在同一交易寫入權威的 period.transitioned（含
+        // from／requested／landed）。若在此補第二筆，遷移已提交而事件失敗時
+        // 會回 500，但期間其實已成功遷移——客戶看到的狀態與真實狀態不一致。
+        return send(200, page("期間狀態已更新", `<span>畫面 <b>期間生命週期</b></span>`,
+          `<h2>✓ 期間狀態：${esc(row.landed)}</h2>
+           ${row.landed !== to ? `<p class="note">你請求 <b>${esc(to)}</b>，系統依覆核覆蓋評估判給
+             <b>${esc(row.landed)}</b>。</p>` : ""}`),
+          { "x-period-status": row.landed });
+      } catch (e) {
+        // 代碼以前綴擷取，不依中文文案判斷（文案會改，代碼不會）
+        const code = extractDbCode(String(e));
+        const status = httpStatusForCode(code);
+        if (code === null) throw e;              // 未預期錯誤不吞、不猜
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "period.transition.rejected", s.userId,
+          "period_revision", revision,
+          { guard: code, requested: to, expected_from: expectedFrom, acting_role: actingRole });
+        return send(status, page("期間遷移被拒", `<span>畫面 <b>期間生命週期</b></span>`,
+          `<h2>⛔ ${esc(code)}</h2><p>${esc(displayTextForCode(code))}</p>
+           ${isNotImplemented(code)
+             ? `<p class="note">此守衛<b>尚未實作</b>，因此此遷移在本版不可用——
+                這不代表守衛已驗證通過。</p>` : ""}
+           <p class="note">此次嘗試已寫入稽核軌跡。</p>`),
+          { "x-error-code": code });
+      }
+    }
 
     // ── 診斷：背景工作狀態（SLICE-M2-03 第 16 條；管理用途，本刀只做 API 不做畫面） ──
     if (url.pathname === "/admin/jobs" && req.method === "GET") {

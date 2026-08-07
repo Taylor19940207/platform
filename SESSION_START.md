@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、十八份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
+7. `packages/domain/src/importBatch.ts`、二十二份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
 8. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
 
 CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時閱讀，不得取代已合併的 v1.2／v1.1 正式基線。工程細節以 repo 內 Markdown 與現行程式為準，PDF 供閱讀。
@@ -39,15 +39,15 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
-里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04` 均已完成並關閉。
-現有 21 份 migration；完整實跑結果為 **520/520**（單元 50、DB 整合 226、端到端 244），連續兩輪全綠。
+里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05` 均已完成並關閉。
+現有 22 份 migration；完整實跑結果為 **594/594**（單元 58、DB 整合 255、端到端 281），連續兩輪全綠。
 
 `SLICE-M2-04` 的關閉收口為 **0021**：映射來源批次必須為 `ACCEPTED`——未經接受的批次
 （含 QUARANTINED）不得成為正式映射的來源脈絡。DB 以 `FOR UPDATE` 鎖住來源批次列消除
 TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED`，DB 仍是最後防線。
 既有映射不因來源批次日後轉 `SUPERSEDED` 而被追溯刪除或改寫。
 
-**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8098）
+**跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8099）
 與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，
 跑完以 `pnpm db:seed` 還原。
 
@@ -60,8 +60,10 @@ TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED
 - `docs/handoffs/SESSION_HANDOFF_2026-08-04_SLICE-M2-03.md`（背景工作可靠性）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-05_MILESTONE-2-EXIT-REVIEW.md`（里程碑 2 阻擋盤點、
   三項待修正判定、SLICE-M2-04 邊界）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-06_SLICE-M2-04.md`（**最新接續入口**：B-00 五佇列
-  ＋ UNVERIFIABLE 人工確認；0019／0020 硬化與 **0021 關閉收口**；M2-04 已正式關閉）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-06_SLICE-M2-04.md`（B-00 五佇列 ＋ UNVERIFIABLE
+  人工確認；0019／0020 硬化與 **0021 關閉收口**；M2-04 已正式關閉）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-05.md`（**最新接續入口**：期間生命週期
+  §25.8 完整狀態機、DB 唯一裁決點、fail closed 穩定代碼）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -95,8 +97,11 @@ HTML artifact 一次生成保存（staging 安全重試）、`package_content_ha
 （0021 收口，520/520 連續兩輪全綠）。里程碑 2 離開條件盤點見
 `docs/reviews/MILESTONE-2_EXIT_REVIEW.md`（提交 `6ab32d3`），目前**尚不能宣告離開**。
 
-下一刀為 **§25.8 期間生命週期切片**（不預設 `OPEN→LOCKED` 簡化，依完整語意）；
-其後依序：多基礎／四類規則最小資料模型 → 自動保存／Session 恢復（NFR-UX-001）
+`SLICE-M2-05 期間生命週期`已完成：狀態機由四值簡化擴為 §25.8 完整 13 值，
+DB 為唯一裁決點（`app_runtime` 對 `period_revision` 只餘 INSERT／SELECT），
+未實作的守衛一律 fail closed 並回 `Gxx_NOT_IMPLEMENTED:` 穩定代碼。
+
+下一刀依序：多基礎／四類規則最小資料模型 → 自動保存／Session 恢復（NFR-UX-001）
 → 重跑里程碑 2 離開複核。動工前先寫一頁切片與驗收清單。
 不重開已關閉切片、不擴寫大型規格、不修改兩份正式基線。
 

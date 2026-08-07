@@ -32,10 +32,10 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 50 ＋ DB 整合 226 ＋ 端到端驗收 244（里程碑 1 之 20 ＋ 映射 31 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23 ＋ 證據包 24 ＋ 工作台身分確認 55），共 520 條
+pnpm test          # 單元 58 ＋ DB 整合 255 ＋ 端到端驗收 281（里程碑 1 之 20 ＋ 映射 31 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23 ＋ 證據包 24 ＋ 工作台身分確認 55 ＋ 期間生命週期 37），共 594 條
 ```
 
-**跑測試前先停掉 `pnpm dev`**：端到端測試會自己 spawn API（8091～8098）與 worker，
+**跑測試前先停掉 `pnpm dev`**：端到端測試會自己 spawn API（8091～8099）與 worker，
 8080 的 dev worker 會與之競爭同一批 `UPLOADED` 批次。測試會重建 `cbfc_dev` 資料，
 跑完以 `pnpm db:seed` 還原開發資料。
 
@@ -52,7 +52,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 
 ## 現況
 
-- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋21 份 migration（可從零重建）
+- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋22 份 migration（可從零重建）
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）
@@ -63,7 +63,8 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 - [x] **里程碑 2 第三刀（SLICE-M2-02B）**：PREVIEW CalculationRun ＋ CalculationInputManifest 凍結（同交易解析＋G-02＋Manifest＋Job＋事件）；重演＝新 run 引用同一 Manifest；result_content_hash 排除身分欄位；B-06 骨架；Case-001 調整後集團 TB 12/12（`docs/slices/`）
 - [x] **里程碑 2 第四刀（SLICE-M2-02C）**：預覽證據包——非同步產包（GENERATING→READY/FAILED）、HTML artifact 一次生成保存＋下載驗 hash、audit cutoff、逐科目範圍追溯（Case-001 12/12 BALANCE）、staging 安全重試、契約 D 上游驗證；來源三表補不可變（`docs/slices/`）
 - [x] **SLICE-M2-04 B-00 待辦整合與身分確認**：五佇列（待身分確認／待覆核／待批准／被退回／未完成草稿）＋ UNVERIFIABLE 人工確認（B-03）；`current_identity_assessment_id` 指標與身分判定成對寫入；確認狀態正向白名單；映射草稿保存不可變來源批次脈絡。**0021 關閉收口**：映射來源批次必須為 ACCEPTED（DB `FOR UPDATE` 鎖列＋應用層 409／`SOURCE_BATCH_NOT_ACCEPTED`）
-- [ ] 里程碑 2 後續（依離開複核順序）：期間生命週期（§25.8）→ 多基礎最小模型 → 自動保存／Session 恢復 → 重跑離開複核
+- [x] **SLICE-M2-05 期間生命週期（§25.8）**：`PeriodRevision` 由四值簡化擴為完整 13 狀態；`SETUP → OPEN → IN_PREPARATION → IN_REVIEW → ADJ_APPROVED` ＋ `AWAITING_REVIEWER` 由覆蓋評估決定落點；**守衛未實作一律 fail closed**（`Gxx_NOT_IMPLEMENTED:` 穩定代碼）；DB 為唯一裁決點（`app_runtime` 的 UPDATE／DELETE 已撤回）；`ReviewerEligibilityEvaluation` 最小版不可變快照
+- [ ] 里程碑 2 後續（依離開複核順序）：多基礎最小模型 → 自動保存／Session 恢復 → 重跑離開複核
 
 ## 結構
 
@@ -71,6 +72,6 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 apps/        api（模組化單體宿主）｜worker（背景驗證）｜web（Next.js 佔位）
 packages/    domain（狀態機）｜database（migration＋轉接層）｜auth｜contracts｜config
 scripts/     dev.mjs｜env.sh（傳輸層）｜sandbox/（非主流程）
-tests/       unit（50）｜integration（DB 守衛 226 條）｜acceptance（端到端 244 條）｜fixtures/case-001
+tests/       unit（58）｜integration（DB 守衛 255 條）｜acceptance（端到端 281 條）｜fixtures/case-001
 docs/        GOVERNANCE｜BACKLOG｜FUTURE_DISCUSSIONS｜adr/｜slices/｜handoffs/
 ```
