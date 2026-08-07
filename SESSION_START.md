@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、二十二份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
+7. `packages/domain/src/importBatch.ts`、二十三份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
 8. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
 
 CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時閱讀，不得取代已合併的 v1.2／v1.1 正式基線。工程細節以 repo 內 Markdown 與現行程式為準，PDF 供閱讀。
@@ -39,8 +39,9 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
-里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05` 均已完成並關閉。
-現有 22 份 migration；完整實跑結果為 **594/594**（單元 58、DB 整合 255、端到端 281），連續兩輪全綠。
+里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05`／`M2-06`
+均已完成並關閉。
+現有 23 份 migration；完整實跑結果為 **712/712**（單元 58、DB 整合 357、端到端 297），連續兩輪全綠。
 
 `SLICE-M2-04` 的關閉收口為 **0021**：映射來源批次必須為 `ACCEPTED`——未經接受的批次
 （含 QUARANTINED）不得成為正式映射的來源脈絡。DB 以 `FOR UPDATE` 鎖住來源批次列消除
@@ -62,8 +63,10 @@ TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED
   三項待修正判定、SLICE-M2-04 邊界）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-06_SLICE-M2-04.md`（B-00 五佇列 ＋ UNVERIFIABLE
   人工確認；0019／0020 硬化與 **0021 關閉收口**；M2-04 已正式關閉）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-05.md`（**最新接續入口**：期間生命週期
+- `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-05.md`（期間生命週期
   §25.8 完整狀態機、DB 唯一裁決點、fail closed 穩定代碼）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-06.md`（**最新接續入口**：多基礎與
+  四類規則最小資料模型、0023、審查節奏決議）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -101,8 +104,33 @@ HTML artifact 一次生成保存（staging 安全重試）、`package_content_ha
 DB 為唯一裁決點（`app_runtime` 對 `period_revision` 只餘 INSERT／SELECT），
 未實作的守衛一律 fail closed 並回 `Gxx_NOT_IMPLEMENTED:` 穩定代碼。
 
-下一刀依序：多基礎／四類規則最小資料模型 → 自動保存／Session 恢復（NFR-UX-001）
-→ 重跑里程碑 2 離開複核。動工前先寫一頁切片與驗收清單。
+`SLICE-M2-06 多基礎與四類規則最小資料模型`已完成（migration 0023）：
+`BookBasis`（案件範圍＋RLS）／`PostingLayer`（平台參照主檔，`app_runtime` 唯讀）／
+`BasisSourcePolicyVersion`／構成模型（`BasisCompositionVersion` ＋ `ConstitutiveLayerItem`）／
+調節模型（`BasisReconciliation` ＋ Line ＋ Difference，`DRAFT → FINALIZED`）／
+`TaxBasisObservation`／`Rule`＋`RuleVersion`（四類規則，無引擎）。
+`adjustment.basis` 硬約束欄位已 DROP，改為 `basis_from_id`／`basis_to_id`／`posting_layer_id`。
+**REQ-BAS-001 與 REQ-RUL-001 的阻擋項因此清除。**
+
+三條不可退讓的實作原則寫在 0023 檔頭：代碼不驅動約束（新增第四基礎零 DDL）；
+構成與調節分屬不同模型（§26.1 L1074）；守衛未實作即 fail closed
+（`AMENDED_NOT_IMPLEMENTED:`、`INV24_THRESHOLD_NOT_IMPLEMENTED:`、
+`AUTO_POST_NOT_IMPLEMENTED:`、`RECON_RUN_PREDATES_BASIS_MODEL:`）。
+
+下一刀：**自動保存、儲存狀態與 Session 恢復**（NFR-UX-001／NFR-INT-002）——
+完成後里程碑 2 離開盤點的阻擋清單即清空，可重跑離開複核，
+之後把重心轉向可操作產品（B-00 工作台、期間工作台、匯入、映射、調整覆核與預覽流程）。
+
+**審查節奏（2026-08-07 決議）**：審查預算按不可逆性投放。
+第一級（資料模型、跨租戶、安全、會計口徑、金額精度、狀態機、版本與稽核軌跡）
+維持先寫短契約與負面測試再實作；第二級（API 契約、併發、草稿恢復、權限與工作流程）
+直接實作但必須有整合測試與失敗案例；第三級（畫面布局、文案、篩選）直接做並實機走查，
+不建立切片文件。折算屬第一級，將來仍需較完整的事前契約。
+門檻不變：基線不隨意更改、每刀明列不做事項、DB 不變條件與租戶隔離必須有負面測試、
+關鍵操作維持交易原子性與可重演性、完整測試不得退化、真正偏離基線才寫 ADR／CR、
+每個切片必須交付可執行程式。
+**每個負面測試必須先證明前置狀態成立，再驗證拒絕理由**——避免「以錯誤理由通過」的假綠。
+
 不重開已關閉切片、不擴寫大型規格、不修改兩份正式基線。
 
 ## 第一次回覆使用者時

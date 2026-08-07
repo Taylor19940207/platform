@@ -129,9 +129,11 @@ try {
     && sql(`SELECT count(*) FROM background_job WHERE subject_id='${RUN1}'`) === "1"
     && sql(`SELECT count(*) FROM audit_event WHERE event_type='calculation_run.created'
             AND object_id='${RUN1}'`) === "1");
-  check("Manifest 凍結 19 筆輸入（SCOPE 1＋TB 1＋映射 15＋調整 1＋COA 1）",
+  // SLICE-M2-06 起再凍結兩份基礎組成（A、C）——「哪些層構成哪個基礎」是計算輸入，
+  // 不凍結的話組成升版後重演會得到不同的基礎餘額且無任何錯誤訊息（INV-21／INV-29）。
+  check("Manifest 凍結 21 筆輸入（SCOPE 1＋TB 1＋映射 15＋調整 1＋COA 1＋基礎組成 2）",
     sql(`SELECT count(*) FROM calculation_manifest_entry cme JOIN calculation_run r
-         ON r.manifest_id = cme.manifest_id WHERE r.calculation_run_id='${RUN1}'`) === "19",
+         ON r.manifest_id = cme.manifest_id WHERE r.calculation_run_id='${RUN1}'`) === "21",
     sql(`SELECT count(*) FROM calculation_manifest_entry cme JOIN calculation_run r
          ON r.manifest_id = cme.manifest_id WHERE r.calculation_run_id='${RUN1}'`));
 

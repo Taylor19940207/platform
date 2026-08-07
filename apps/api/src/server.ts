@@ -950,17 +950,35 @@ account_code,account_name,debit,credit
         `SELECT declared_period_revision_id AS period_revision_id FROM import_batch
           WHERE import_batch_id = :'b'::uuid`,
         { b: g.b.import_batch_id }, { tenantId: s.tenantId })[0];
+      // 多基礎橋樑（SLICE-M2-06）：本刀的 B-05 只建 A→C ＋ GROUP_GAAP_ADJ 的調整。
+      // 基礎是案件內的口徑，缺了就明白拒絕——不得以任意基礎頂替，也不得靜默寫 NULL。
+      const br = query<{ from_id: string; to_id: string; layer_id: string }>(
+        `SELECT a.basis_id AS from_id, c.basis_id AS to_id, l.layer_id
+           FROM book_basis a, book_basis c, posting_layer l
+          WHERE a.engagement_id = :'e'::uuid AND a.code = 'A'
+            AND c.engagement_id = :'e'::uuid AND c.code = 'C'
+            AND l.code = 'GROUP_GAAP_ADJ'`,
+        { e: g.b.engagement_id }, { tenantId: s.tenantId })[0];
+      if (!br) {
+        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.rejected", s.userId,
+          "import_batch", g.b.import_batch_id, { code: "BASIS_NOT_CONFIGURED" });
+        return send(409, page("拒絕", b04CtxBar(g.b, "B-04"),
+          "<h2>⛔ BASIS_NOT_CONFIGURED</h2><p>本案件尚未建立 A／C 基礎，無法建立跨基礎調整。</p>"),
+          { "x-error-code": "BASIS_NOT_CONFIGURED" });
+      }
       const adjId = randomUUID();
       const ev = auditSql(s.tenantId, "DOMAIN_EVENT", "adjustment.drafted", s.userId,
         "adjustment", adjId, { title: f["title"] ?? "" });
       exec(`BEGIN;
             INSERT INTO adjustment (adjustment_id, tenant_id, engagement_id, period_revision_id,
-                    title, prepared_by)
-            VALUES ('${adjId}'::uuid, :'t'::uuid, :'e'::uuid, :'pr'::uuid, :'ti', :'u'::uuid);
+                    title, prepared_by, basis_from_id, basis_to_id, posting_layer_id)
+            VALUES ('${adjId}'::uuid, :'t'::uuid, :'e'::uuid, :'pr'::uuid, :'ti', :'u'::uuid,
+                    :'bf'::uuid, :'bt'::uuid, :'bl'::uuid);
             ${ev.sql}
             COMMIT;`,
         { t: s.tenantId, e: g.b.engagement_id, pr: pr.period_revision_id,
-          ti: f["title"] || "未命名調整", u: s.userId, ...ev.params }, { tenantId: s.tenantId });
+          ti: f["title"] || "未命名調整", u: s.userId,
+          bf: br.from_id, bt: br.to_id, bl: br.layer_id, ...ev.params }, { tenantId: s.tenantId });
       return send(302, "", { location: `/b05?adj=${adjId}` });
     }
 
@@ -1286,10 +1304,13 @@ account_code,account_name,debit,credit
             UPDATE adjustment SET status = 'APPROVED', approved_by = :'u'::uuid,
                    approved_at = now(), business_version = ${bv}
              WHERE adjustment_id = :'a'::uuid;
+            -- 分層自 Adjustment 帶入（不重新決定；DB 守衛要求兩者一致）。
+            -- 不帶 basis_id：一筆事實屬於某個層，「哪些基礎包含它」由組成模型回答。
             INSERT INTO journal_entry (entry_id, tenant_id, engagement_id, period_revision_id,
-                    adjustment_id, business_version, entry_date)
+                    adjustment_id, business_version, entry_date, posting_layer_id)
             VALUES ('${entryId}'::uuid, :'t'::uuid, :'e'::uuid, :'pr'::uuid,
-                    :'a'::uuid, ${bv}, :'ed'::date);
+                    :'a'::uuid, ${bv}, :'ed'::date,
+                    (SELECT posting_layer_id FROM adjustment WHERE adjustment_id = :'a'::uuid));
             INSERT INTO journal_line (tenant_id, entry_id, line_no, account_id, debit, credit)
             VALUES ${values};
             ${snap.sql}
@@ -1581,6 +1602,32 @@ account_code,account_name,debit,credit
               jsonb_build_object('coa_id',c.coa_id,'version_no',c.version_no,'name',c.name)
             FROM chart_of_accounts c WHERE c.engagement_id = :'e'::uuid;
 
+          -- 基礎組成（SLICE-M2-06）：凍結本案件全部已批准的組成版本。
+          -- 「哪些層構成哪個基礎」是計算輸入的一部分——不凍結的話，組成 v2 落地後
+          -- 重演同一個 run 會得到不同的基礎餘額，而且不會有任何錯誤訊息（INV-21／INV-29）。
+          INSERT INTO _entries
+            SELECT 'BASIS_COMPOSITION', c.basis_composition_version_id, NULL,
+              'COMPOSITION_VERSION_NO', c.version_no::text,
+              'BASIS_COMPOSITION|'||b.code||'|'||c.basis_composition_version_id||'|v'||c.version_no||'|'||
+                COALESCE((SELECT string_agg(pl.code||':'||i.sign, ';' ORDER BY pl.code)
+                            FROM constitutive_layer_item i
+                            JOIN posting_layer pl ON pl.layer_id = i.layer_id
+                           WHERE i.basis_composition_version_id = c.basis_composition_version_id),''),
+              jsonb_build_object('basis_id', c.basis_id, 'basis_code', b.code,
+                'source_mode', b.source_mode, 'version_no', c.version_no,
+                'items', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                             'layer_code', pl.code, 'layer_id', i.layer_id, 'sign', i.sign)
+                           ORDER BY pl.code),'[]'::jsonb)
+                            FROM constitutive_layer_item i
+                            JOIN posting_layer pl ON pl.layer_id = i.layer_id
+                           WHERE i.basis_composition_version_id = c.basis_composition_version_id))
+            FROM basis_composition_version c JOIN book_basis b ON b.basis_id = c.basis_id
+           WHERE c.engagement_id = :'e'::uuid AND c.status = 'APPROVED';
+          -- 沒有已批准的組成就沒有分層語意可凍結。若放行，這個 run 會與 0023 之前的
+          -- 歷史 run 長得一模一樣（無組成 entry、快照無分層），等於靜默降級。
+          SELECT fn_assert((SELECT count(*) FROM _entries WHERE object_type = 'BASIS_COMPOSITION') > 0,
+            'BASIS_COMPOSITION_NOT_APPROVED:本案件沒有已批准的基礎組成版本');
+
           -- frozen hash 只涵蓋計算輸入（entries）；run_id／建立者／時間不入 hash。
           -- v2：entry hash 涵蓋 canonical＋payload（計算實際讀 payload，兩者都要蓋到）
           INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id,
@@ -1620,7 +1667,8 @@ account_code,account_name,debit,credit
       } catch (e) {
         const msg = String(e);
         const code = reasonCodeOf(msg);
-        if (code === "G02_UNMAPPED" || code === "BATCH_NOT_ACCEPTED")
+        if (code === "G02_UNMAPPED" || code === "BATCH_NOT_ACCEPTED"
+            || code === "BASIS_COMPOSITION_NOT_APPROVED")
           return b06Refuse(g.b, "calculation.create.rejected", code,
             msg.split(`${code}:`)[1]?.split("\n")[0] ?? "");
         if (msg.includes("calculation_run_tenant_request_key_uq")) {   // 併發同 key：回查

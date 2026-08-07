@@ -394,15 +394,31 @@ function commitCalcResult(j: ClaimedCalc): void {
           SELECT 1 FROM _src s LEFT JOIN _m m ON m.source_code = s.code
            WHERE m.source_code IS NULL), 'REPLAY_FAILED:MAPPING_INCOMPLETE');
 
+        -- 分層（SLICE-M2-06）：以「本 manifest 是否凍結了組成版本」為版本界線——
+        -- 與 DB 守衛同一個判準。含組成＝分層模型之後的 run，必須帶層；
+        -- 不含（重演 0023 之前的 manifest）＝維持 NULL，重演才會逐位元忠實。
+        -- posting_layer_id 不進 result_content_hash（下方 h 的欄位未變），
+        -- 否則既有 run 的結果雜湊與證據包雜湊會全部失效。
+        CREATE TEMP TABLE _layered ON COMMIT DROP AS
+          SELECT EXISTS (SELECT 1 FROM calculation_manifest_entry
+                          WHERE manifest_id = ${M}::uuid AND object_type = 'BASIS_COMPOSITION') AS on_;
         INSERT INTO balance_snapshot_line
-          (tenant_id, calculation_run_id, posting_layer, account_id, account_code, account_name, debit, credit)
-        SELECT ${T}::uuid, ${RUN}::uuid, 'SOURCE_TB', m.target_account_id, m.target_code,
+          (tenant_id, calculation_run_id, posting_layer, posting_layer_id,
+           account_id, account_code, account_name, debit, credit)
+        SELECT ${T}::uuid, ${RUN}::uuid, 'SOURCE_TB',
+               CASE WHEN (SELECT on_ FROM _layered)
+                    THEN (SELECT layer_id FROM posting_layer WHERE code = 'LOCAL_BOOK') END,
+               m.target_account_id, m.target_code,
                MAX(m.target_name), SUM(s.debit), SUM(s.credit)
           FROM _src s JOIN _m m ON m.source_code = s.code
          GROUP BY m.target_account_id, m.target_code;
         INSERT INTO balance_snapshot_line
-          (tenant_id, calculation_run_id, posting_layer, account_id, account_code, account_name, debit, credit)
-        SELECT ${T}::uuid, ${RUN}::uuid, 'ADJUSTMENT', (l->>'account_id')::uuid, l->>'code',
+          (tenant_id, calculation_run_id, posting_layer, posting_layer_id,
+           account_id, account_code, account_name, debit, credit)
+        SELECT ${T}::uuid, ${RUN}::uuid, 'ADJUSTMENT',
+               CASE WHEN (SELECT on_ FROM _layered)
+                    THEN (SELECT layer_id FROM posting_layer WHERE code = 'GROUP_GAAP_ADJ') END,
+               (l->>'account_id')::uuid, l->>'code',
                MAX(l->>'name'), SUM((l->>'debit')::numeric), SUM((l->>'credit')::numeric)
           FROM calculation_manifest_entry e, jsonb_array_elements(e.payload->'lines') l
          WHERE e.manifest_id = ${M}::uuid AND e.object_type = 'ADJUSTMENT'

@@ -38,6 +38,8 @@ export const RUN_REASON = {
   BATCH_NOT_ACCEPTED: "批次尚未接受（G-01 接受判定式），不得建立計算執行",
   G02_UNMAPPED: "重要來源餘額尚未全數映射（G-02），不得建立計算執行",
   ROLE_REQUIRED: "建立計算執行需 R2 或 R3 角色（B-06，§28.3）",
+  BASIS_COMPOSITION_NOT_APPROVED:
+    "本案件沒有已批准的基礎組成版本，無法凍結分層語意（放行會使新 run 與分層模型之前的歷史 run 無法區分）",
   CONTEXT_MISMATCH: "輸入組合與案件／期間歸屬不一致（§24.1A）",
   REQUEST_KEY_REUSED: "相同 request key 但請求內容不同——冪等鍵不得重用於不同請求",
   REPLAY_TARGET_NOT_COMPLETED: "只能重演已 COMPLETED 的 run",

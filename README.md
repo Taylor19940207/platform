@@ -32,7 +32,7 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 58 ＋ DB 整合 255 ＋ 端到端驗收 281（里程碑 1 之 20 ＋ 映射 31 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23 ＋ 證據包 24 ＋ 工作台身分確認 55 ＋ 期間生命週期 37），共 594 條
+pnpm test          # 單元 58 ＋ DB 整合 357 ＋ 端到端驗收 297（里程碑 1 之 20 ＋ 映射 31 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23 ＋ 證據包 24 ＋ 工作台身分確認 55 ＋ 期間生命週期 37 ＋ 多基礎 16），共 712 條
 ```
 
 **跑測試前先停掉 `pnpm dev`**：端到端測試會自己 spawn API（8091～8099）與 worker，
@@ -52,7 +52,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 
 ## 現況
 
-- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋22 份 migration（可從零重建）
+- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋23 份 migration（可從零重建）
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）

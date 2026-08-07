@@ -89,8 +89,16 @@ try {
   check("草稿初始狀態 DRAFTING、bv=1、ov=1",
     adjField(ADJ, "status") === "DRAFTING" && adjField(ADJ, "business_version") === "1"
     && adjField(ADJ, "object_version") === "1");
-  check("MAJOR ＋ GROUP_GAAP（本切片唯一場景）",
-    adjField(ADJ, "materiality") === "MAJOR" && adjField(ADJ, "basis") === "GROUP_GAAP");
+  // SLICE-M2-06 起「基礎」不再是 adjustment 上的字串，而是 A→C 橋樑＋分層外鍵。
+  // 驗語意等價：來源 A、目標 C、層 GROUP_GAAP_ADJ（其 rule_type 即 GROUP_GAAP）。
+  check("MAJOR ＋ A→C 橋樑掛 GROUP_GAAP_ADJ 分層（本切片唯一場景）",
+    adjField(ADJ, "materiality") === "MAJOR"
+    && sql(`SELECT bf.code||'→'||bt.code||'@'||pl.code||'/'||COALESCE(pl.rule_type,'-')
+              FROM adjustment a
+              JOIN book_basis bf ON bf.basis_id = a.basis_from_id
+              JOIN book_basis bt ON bt.basis_id = a.basis_to_id
+              JOIN posting_layer pl ON pl.layer_id = a.posting_layer_id
+             WHERE a.adjustment_id = '${ADJ}'`) === "A→C@GROUP_GAAP_ADJ/GROUP_GAAP");
 
   // ── 2 G-08：四項缺一不可 ──
   check("G-08：空白草稿送覆核 → 409", await post(jia, "/b05/submit", { adj: ADJ }) === 409);
