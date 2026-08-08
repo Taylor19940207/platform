@@ -9,19 +9,39 @@ import { g08Check, balanceCheck } from "../../../../../packages/domain/src/adjus
 import type { AuthenticatedContext } from "../../http/context.ts";
 import { esc, page, type Respond } from "../../http/respond.ts";
 import { audit } from "../audit.ts";
-import { rolesOf, loadAdj, adjLines, type AdjRow } from "./access.ts";
+import { rolesOf } from "../engagements/access.ts";
+import { loadAdj, adjLines, type AdjRow } from "./access.ts";
 import * as adjSvc from "./service.ts";
 
 /** 共通入口：調整存在＋使用者被指派該案件。 */
+/**
+ * 可讀取調整的角色白名單（§24.6 L449「調整 Adjustment」列）。
+ *
+ * 「持有任何角色」**不等於**「有這個物件的權限」。矩陣明定 R1 提供者與 R6 系管
+ * 對調整為 `–`（無權限）：R1 只能對被指派的期間×法人建立與提交來源資料，
+ * 不得瀏覽母公司調整（footnote ①）；R6 是技術角色，不得取得客戶工作資料存取權。
+ * 而 `rolesOf` 依設計包含租戶層指派（engagement_id IS NULL），R6 因此必然
+ * `size > 0`——只判斷 size 等於對這兩個角色完全不設防。
+ *
+ * 白名單刻意**嚴於矩陣**：矩陣另給 R5「R\*」（限授權範圍內唯讀）、R7 與 R8「R」。
+ *   * R5 的唯讀以「審計師授權（實體×期間×到期日）」為範圍，該物件尚未實作——
+ *     在沒有範圍的情況下放行等於把「限範圍」讀成「不限範圍」，屬 fail open。
+ *   * R7／R8 目前在產品內沒有指派路徑，先不開；要開時連同其範圍語意一起做。
+ * 兩者都記在切片的後續驗收，不在本次權限修補內擴張。
+ */
+const ADJUSTMENT_READERS = new Set(["R2", "R3", "R4"]);
+
 const b05Guard = (ctx: AuthenticatedContext, send: Respond, adjId: string, action: string):
     { ok: true; r: AdjRow; roles: Set<string> } | { ok: false; res: void } => {
   const s = ctx.session;
   const r = loadAdj(s.tenantId, adjId);
   if (!r) return { ok: false, res: send(404, page("404", "", "<h2>調整不存在</h2>")) };
   const roles = rolesOf(s, r.engagement_id);
-  if (roles.size === 0) {
+  const readers = [...roles].filter((x) => ADJUSTMENT_READERS.has(x));
+  if (readers.length === 0) {
     audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
-      "adjustment", adjId, { reason: "未被指派此案件", action });
+      "adjustment", adjId,
+      { reason: "角色無調整物件的讀取權限（§24.6）", action, held: [...roles].sort() });
     return { ok: false, res: send(403, page("拒絕", "<b>⛔ 未被指派</b>",
       `<h2>⛔ 未被指派此案件</h2><p>此次嘗試已寫入稽核軌跡。</p>`)) };
   }

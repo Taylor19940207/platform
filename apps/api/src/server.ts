@@ -21,7 +21,7 @@ import { authenticatedContext, readBody, sessionOf } from "./http/context.ts";
 import { dispatch } from "./http/dispatch.ts";
 import { esc, page, responder } from "./http/respond.ts";
 import { audit, auditSql } from "./modules/audit.ts";
-import { rolesOf } from "./modules/adjustments/access.ts";
+import { rolesOf } from "./modules/engagements/access.ts";
 import * as adjSvc from "./modules/adjustments/service.ts";
 
 // 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分

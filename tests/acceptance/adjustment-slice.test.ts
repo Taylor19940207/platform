@@ -11,6 +11,8 @@ const API = "http://127.0.0.1:8093";
 const U_JIA = "aaaaaaaa-0000-0000-0000-000000000001";    // 職員甲：R2＋R3＋R4
 const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";     // 資深乙：R2＋R3＋R4
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";   // 經理丙：R4
+const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";    // 系管丁：R6（租戶層指派）
+const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";    // 稅務擔當戊：R1（本案件）
 const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
@@ -32,6 +34,9 @@ async function post(cookie: string, path: string, fields: Record<string, string>
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(fields).toString() });
   return r.status;
+}
+async function getStatus(cookie: string, path: string): Promise<number> {
+  return (await fetch(`${API}${path}`, { headers: { cookie }, redirect: "manual" })).status;
 }
 async function get(cookie: string, path: string): Promise<string> {
   const r = await fetch(`${API}${path}`, { headers: { cookie } });
@@ -99,6 +104,30 @@ try {
               JOIN book_basis bt ON bt.basis_id = a.basis_to_id
               JOIN posting_layer pl ON pl.layer_id = a.posting_layer_id
              WHERE a.adjustment_id = '${ADJ}'`) === "A→C@GROUP_GAAP_ADJ/GROUP_GAAP");
+
+  // ── 1b §24.6 權限矩陣：調整列的 R1／R6 為「–」（無權限） ──
+  // 「持有任何角色」不等於「有這個物件的權限」。R6 是租戶層指派（engagement_id IS NULL），
+  // 只判斷 roles.size 的話它必然通過——這正是本次修補封住的洞。
+  const ops = await login(U_OPS);
+  const tax = await login(U_TAX);
+  const cvaBefore = violations("b05.view.denied");
+  check("前置成立：戊確實在本案件持有 R1、丁確實持有租戶層 R6",
+    sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TAX}' AND role='R1'
+          AND engagement_id='${ENG_A}' AND revoked_at IS NULL`) === "1"
+    && sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_OPS}' AND role='R6'
+          AND engagement_id IS NULL AND revoked_at IS NULL`) === "1");
+  check("R1（資料提供者）直接 GET /b05 → 403（§24.6：調整列為 –）",
+    await getStatus(tax, `/b05?adj=${ADJ}`) === 403);
+  check("R6（系管）直接 GET /b05 → 403（租戶層指派不得取得客戶工作資料）",
+    await getStatus(ops, `/b05?adj=${ADJ}`) === 403);
+  check("兩次越權讀取都留下 CVA（含實際持有的角色清單）",
+    violations("b05.view.denied") === cvaBefore + 2
+    && sql(`SELECT payload->>'reason' FROM audit_event
+             WHERE event_type='b05.view.denied' ORDER BY audit_event_id DESC LIMIT 1`)
+       === "角色無調整物件的讀取權限（§24.6）");
+  check("R2／R3／R4 的合法讀取不受影響（甲 200、丙 200）",
+    await getStatus(jia, `/b05?adj=${ADJ}`) === 200
+    && await getStatus(bing, `/b05?adj=${ADJ}`) === 200);
 
   // ── 2 G-08：四項缺一不可 ──
   check("G-08：空白草稿送覆核 → 409", await post(jia, "/b05/submit", { adj: ADJ }) === 409);

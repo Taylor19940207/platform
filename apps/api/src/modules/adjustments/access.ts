@@ -5,16 +5,7 @@
 // 這裡**不做任何裁決**：角色清單只是事實，能不能做由 route（權限矩陣）與
 // DB 守衛（SoD、狀態機、不變條件）決定。
 import { query } from "../../../../../packages/database/src/psql.ts";
-import type { Session } from "../../../../../packages/auth/src/session.ts";
 import type { AdjustmentStatus } from "../../../../../packages/domain/src/adjustment.ts";
-
-export function rolesOf(s: Session, engagementId: string): Set<string> {
-  return new Set(query<{ role: string }>(
-    `SELECT role FROM role_assignment
-      WHERE user_id = :'u'::uuid AND revoked_at IS NULL
-        AND (engagement_id IS NULL OR engagement_id = :'e'::uuid)`,
-    { u: s.userId, e: engagementId }, { tenantId: s.tenantId }).map((r) => r.role));
-}
 
 export interface AdjRow {
   adjustment_id: string; engagement_id: string; period_revision_id: string;
