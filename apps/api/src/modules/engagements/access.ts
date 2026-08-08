@@ -6,13 +6,47 @@
 //
 // **本檔不做裁決**：回傳的是持有清單，能不能讀寫某個物件由各模組依
 // §24.6 權限矩陣自行以白名單判斷——「有任何角色」不等於「有這個物件的權限」。
+//
+// ── 為什麼要分成三個函式 ────────────────────────────────────
+// §26.3 明定 R1～R5、R7 屬 `EngagementAssignment`（案件層），
+// R6／R8-Tenant／R9 屬 `TenantMembership`（租戶層）。兩者是不同的授權範圍，
+// 混在一個 `rolesOf()` 裡（`engagement_id IS NULL OR engagement_id = :e`）會讓
+// 「租戶層被授予 R2／R3／R4」隱式取得**該租戶所有案件**的客戶資料——
+// Tenant 內的每個 Engagement 都必須明示授權，不得由租戶層角色推導。
+//
+// 因此：業務物件一律用 engagementRolesOf()；技術／治理面才用 tenantRolesOf()。
+// allAssignedRolesOf() 只是舊 B-04 既有行為的顯名保留，**不得用於新程式**。
 import { query } from "../../../../../packages/database/src/psql.ts";
 import type { Session } from "../../../../../packages/auth/src/session.ts";
 
-export function rolesOf(s: Session, engagementId: string): Set<string> {
+/** 案件層授權（EngagementAssignment）。業務物件的權限判斷一律用這個。 */
+export function engagementRolesOf(session: Session, engagementId: string): Set<string> {
+  return new Set(query<{ role: string }>(
+    `SELECT role FROM role_assignment
+      WHERE user_id = :'u'::uuid AND revoked_at IS NULL
+        AND engagement_id = :'e'::uuid`,
+    { u: session.userId, e: engagementId }, { tenantId: session.tenantId }).map((r) => r.role));
+}
+
+/** 租戶層授權（TenantMembership）。技術與治理用途；**不得**據以存取客戶業務資料。 */
+export function tenantRolesOf(session: Session): Set<string> {
+  return new Set(query<{ role: string }>(
+    `SELECT role FROM role_assignment
+      WHERE user_id = :'u'::uuid AND revoked_at IS NULL
+        AND engagement_id IS NULL`,
+    { u: session.userId }, { tenantId: session.tenantId }).map((r) => r.role));
+}
+
+/**
+ * 兩種範圍的聯集——**舊 B-04 既有行為的顯名保留，不得用於新程式**。
+ *
+ * 名字刻意冗長且難用：它把「案件層授權」與「租戶層授權」混為一談，
+ * 正是本次修補要消除的模糊。B-04 收進 ImportBatch 模組時一併改掉。
+ */
+export function allAssignedRolesOf(session: Session, engagementId: string): Set<string> {
   return new Set(query<{ role: string }>(
     `SELECT role FROM role_assignment
       WHERE user_id = :'u'::uuid AND revoked_at IS NULL
         AND (engagement_id IS NULL OR engagement_id = :'e'::uuid)`,
-    { u: s.userId, e: engagementId }, { tenantId: s.tenantId }).map((r) => r.role));
+    { u: session.userId, e: engagementId }, { tenantId: session.tenantId }).map((r) => r.role));
 }

@@ -21,7 +21,7 @@ import { authenticatedContext, readBody, sessionOf } from "./http/context.ts";
 import { dispatch } from "./http/dispatch.ts";
 import { esc, page, responder } from "./http/respond.ts";
 import { audit, auditSql } from "./modules/audit.ts";
-import { rolesOf } from "./modules/engagements/access.ts";
+import { allAssignedRolesOf } from "./modules/engagements/access.ts";
 import * as adjSvc from "./modules/adjustments/service.ts";
 
 // 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分
@@ -389,7 +389,7 @@ account_code,account_name,debit,credit
         { ok: true; b: BatchCtx; roles: Set<string> } | { ok: false; res: void } => {
       const b = loadBatch(s, batchId);
       if (!b) return { ok: false, res: send(404, page("404", "", "<h2>批次不存在</h2>")) };
-      const roles = rolesOf(s, b.engagement_id);
+      const roles = allAssignedRolesOf(s, b.engagement_id);
       if (roles.size === 0) {
         audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
           "import_batch", batchId, { reason: "未被指派此案件", action });

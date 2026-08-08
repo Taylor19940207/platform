@@ -13,6 +13,7 @@ const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";     // 資深乙：R2＋R3�
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";   // 經理丙：R4
 const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";    // 系管丁：R6（租戶層指派）
 const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";    // 稅務擔當戊：R1（本案件）
+const U_TR4 = "aaaaaaaa-0000-0000-0000-000000000006";    // 租戶層己：R4 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
@@ -124,7 +125,22 @@ try {
     violations("b05.view.denied") === cvaBefore + 2
     && sql(`SELECT payload->>'reason' FROM audit_event
              WHERE event_type='b05.view.denied' ORDER BY audit_event_id DESC LIMIT 1`)
-       === "角色無調整物件的讀取權限（§24.6）");
+       === "目前角色或授權範圍無權讀取此調整（§24.6）");
+  // 作用域：角色**種類**在白名單內，不代表**範圍**涵蓋本案件。
+  // §26.3：R1～R5、R7 屬 EngagementAssignment；租戶層角色不得隱式取得客戶資料。
+  const tr4 = await login(U_TR4);
+  check("前置成立：己持有 R4，但那是租戶層指派（engagement_id IS NULL），無任何案件授權",
+    sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR4}' AND role='R4'
+          AND engagement_id IS NULL AND revoked_at IS NULL`) === "1"
+    && sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR4}'
+          AND engagement_id IS NOT NULL`) === "0");
+  check("租戶層 R4 直接 GET /b05 → 403（種類在白名單內，但作用域不涵蓋本案件）",
+    await getStatus(tr4, `/b05?adj=${ADJ}`) === 403);
+  check("CVA 分開記錄兩種範圍：案件層為空、租戶層有 R4",
+    sql(`SELECT (payload->>'engagement_roles')||'|'||(payload->>'tenant_roles')
+           FROM audit_event WHERE event_type='b05.view.denied'
+          ORDER BY audit_event_id DESC LIMIT 1`) === '[]|["R4"]');
+
   check("R2／R3／R4 的合法讀取不受影響（甲 200、丙 200）",
     await getStatus(jia, `/b05?adj=${ADJ}`) === 200
     && await getStatus(bing, `/b05?adj=${ADJ}`) === 200);

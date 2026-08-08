@@ -9,7 +9,7 @@ import { g08Check, balanceCheck } from "../../../../../packages/domain/src/adjus
 import type { AuthenticatedContext } from "../../http/context.ts";
 import { esc, page, type Respond } from "../../http/respond.ts";
 import { audit } from "../audit.ts";
-import { rolesOf } from "../engagements/access.ts";
+import { engagementRolesOf, tenantRolesOf } from "../engagements/access.ts";
 import { loadAdj, adjLines, type AdjRow } from "./access.ts";
 import * as adjSvc from "./service.ts";
 
@@ -36,14 +36,17 @@ const b05Guard = (ctx: AuthenticatedContext, send: Respond, adjId: string, actio
   const s = ctx.session;
   const r = loadAdj(s.tenantId, adjId);
   if (!r) return { ok: false, res: send(404, page("404", "", "<h2>調整不存在</h2>")) };
-  const roles = rolesOf(s, r.engagement_id);
+  // **只看案件層授權**：租戶層的 R2／R3／R4 不得隱式取得該租戶所有案件的調整。
+  const roles = engagementRolesOf(s, r.engagement_id);
   const readers = [...roles].filter((x) => ADJUSTMENT_READERS.has(x));
   if (readers.length === 0) {
+    // 兩種範圍分開留痕：稽核軌跡要答得出「他到底持有什麼、缺的是種類還是範圍」
     audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
       "adjustment", adjId,
-      { reason: "角色無調整物件的讀取權限（§24.6）", action, held: [...roles].sort() });
-    return { ok: false, res: send(403, page("拒絕", "<b>⛔ 未被指派</b>",
-      `<h2>⛔ 未被指派此案件</h2><p>此次嘗試已寫入稽核軌跡。</p>`)) };
+      { reason: "目前角色或授權範圍無權讀取此調整（§24.6）", action,
+        engagement_roles: [...roles].sort(), tenant_roles: [...tenantRolesOf(s)].sort() });
+    return { ok: false, res: send(403, page("拒絕", "<b>⛔ 無權讀取</b>",
+      `<h2>⛔ 目前角色或授權範圍無權讀取此調整</h2><p>此次嘗試已寫入稽核軌跡。</p>`)) };
   }
   return { ok: true, r, roles };
 };
