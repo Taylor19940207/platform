@@ -22,7 +22,8 @@ import { dispatch } from "./http/dispatch.ts";
 import { esc, page, responder } from "./http/respond.ts";
 import { audit, auditSql } from "./modules/audit.ts";
 import { allAssignedRolesOf } from "./modules/engagements/access.ts";
-import * as adjSvc from "./modules/adjustments/service.ts";
+import { loadBatch, type BatchCtx } from "./modules/imports/access.ts";
+import { b04CtxBar } from "./modules/imports/views.ts";
 
 // 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分
 const DETECTION_RULE_VERSION = "detect-r1";
@@ -50,27 +51,6 @@ function validateContext(s: Session, engagementId: string, legalEntityId: string
 }
 
 /** 使用者在該案件的角色集合（含租戶層指派）。 */
-interface BatchCtx {
-  import_batch_id: string; engagement_id: string; status: ImportBatchStatus;
-  identity_status: IdentityStatus; hash_verified: boolean;
-  client: string; entity: string; period: string; period_end: string;
-  declared_period_revision_id: string;
-}
-function loadBatch(s: Session, batchId: string): BatchCtx | null {
-  const rows = query<BatchCtx>(
-    `SELECT ib.import_batch_id, ib.engagement_id, ib.status, ib.identity_status, ib.hash_verified,
-            ib.declared_period_revision_id,
-            ce.name AS client, le.name AS entity, rp.label AS period, rp.end_date AS period_end
-       FROM import_batch ib
-       JOIN client_engagement ce ON ce.engagement_id = ib.engagement_id
-       JOIN legal_entity le ON le.legal_entity_id = ib.declared_legal_entity_id
-       JOIN period_revision pr ON pr.period_revision_id = ib.declared_period_revision_id
-       JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
-      WHERE ib.import_batch_id = :'b'::uuid`,
-    { b: batchId }, { tenantId: s.tenantId });
-  return rows[0] ?? null;
-}
-
 /**
  * 目前生效映射：每來源科目取「該報告期間生效」的最高已批准版本。
  * 生效以期間終了日判定（TB 為期末餘額）；NULL 生效日＝不限。
@@ -102,12 +82,6 @@ function tbLines(s: Session, batchId: string): TbAccountLine[] {
     { b: batchId }, { tenantId: s.tenantId })
     .map((r) => ({ accountCode: r.account_code, accountName: r.account_name ?? "",
                    debitCents: cents(r.debit), creditCents: cents(r.credit) }));
-}
-
-function b04CtxBar(b: BatchCtx, screen: string): string {
-  return `<span>畫面 <b>${esc(screen)}</b></span><span>客戶 <b>${esc(b.client)}</b></span>` +
-    `<span>法人 <b>${esc(b.entity)}</b></span><span>期間 <b>${esc(b.period)}</b></span>` +
-    `<span>批次 <b>${b.import_batch_id.slice(0, 8)}</b>（${b.status}）</span>`;
 }
 
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -695,34 +669,6 @@ account_code,account_name,debit,credit
     // ═══════════ SLICE-M2-02A：B-05 調整編製・覆核・批准 ═══════════
     // 契約：docs/slices/SLICE-M2-02A_調整生命週期.md
     // 三個守衛掛在三個不同的狀態遷移；DB 觸發器（0007）為最後防線。
-
-    // ── 建立調整草稿（R2） ──
-    if (url.pathname === "/b05/create" && req.method === "POST") {
-      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
-      const g = b04Guard(f["batch"] ?? "", "adjustment.create");
-      if (!g.ok) return;
-      if (!g.roles.has("R2")) {
-        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.denied", s.userId,
-          "import_batch", g.b.import_batch_id, { reason: "編製調整需 R2 角色" });
-        return send(403, page("拒絕", b04CtxBar(g.b, "B-04"), "<h2>⛔ 編製調整需 R2 角色</h2>"));
-      }
-      const pr = query<{ period_revision_id: string }>(
-        `SELECT declared_period_revision_id AS period_revision_id FROM import_batch
-          WHERE import_batch_id = :'b'::uuid`,
-        { b: g.b.import_batch_id }, { tenantId: s.tenantId })[0];
-      const created = adjSvc.createDraft(
-        { userId: s.userId, tenantId: s.tenantId, roles: g.roles },
-        { engagementId: g.b.engagement_id, periodRevisionId: pr.period_revision_id,
-          title: f["title"] || "未命名調整" });
-      if (!created.ok) {
-        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.rejected", s.userId,
-          "import_batch", g.b.import_batch_id, { code: "BASIS_NOT_CONFIGURED" });
-        return send(409, page("拒絕", b04CtxBar(g.b, "B-04"),
-          "<h2>⛔ BASIS_NOT_CONFIGURED</h2><p>本案件尚未建立 A／C 基礎，無法建立跨基礎調整。</p>"),
-          { "x-error-code": "BASIS_NOT_CONFIGURED" });
-      }
-      return send(302, "", { location: `/b05?adj=${created.adjustmentId}` });
-    }
 
     // ═══════════ SLICE-M2-04：B-03 身分確認（UNVERIFIABLE 人工確認） ═══════════
     // 明確案件指派的業務角色（不含租戶層 NULL 指派——R6 不得取得客戶工作存取權）

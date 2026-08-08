@@ -145,6 +145,29 @@ try {
     await getStatus(jia, `/b05?adj=${ADJ}`) === 200
     && await getStatus(bing, `/b05?adj=${ADJ}`) === 200);
 
+  // ── 1c /b05/create 的逐動作授權（§24.6 調整列 C ＝ 僅 R2，且須案件層） ──
+  const preCreate = Number(sql(`SELECT count(*) FROM adjustment`));
+  check("租戶層 R4 建立調整 → 403（種類不符且作用域不涵蓋本案件）",
+    await post(tr4, "/b05/create", { batch: B1, title: "越權建立" }) === 403);
+  check("R1（本案件資料提供者）建立調整 → 403（調整列 C 只給 R2）",
+    await post(tax, "/b05/create", { batch: B1, title: "越權建立" }) === 403);
+  check("兩次越權建立都留 CVA，且未產生任何調整",
+    sql(`SELECT payload->>'reason' FROM audit_event WHERE event_type='adjustment.create.denied'
+          ORDER BY audit_event_id DESC LIMIT 1`) === "編製調整需本案件的 R2 角色（§24.6 調整列 C）"
+    && Number(sql(`SELECT count(*) FROM adjustment`)) === preCreate);
+  // 未接受的批次其來源事實尚非正式，不得成為調整的期間脈絡
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1,
+    csv: "#legal_entity_code=1234567890123\naccount_code,account_name,debit,credit\n1002,現金,50,0\n4000,売上,0,50\n" });
+  await waitWorker();
+  const B_DRAFT = sql(`SELECT import_batch_id FROM import_batch
+                        WHERE status <> 'ACCEPTED' ORDER BY created_at DESC LIMIT 1`);
+  check("前置成立：存在一個非 ACCEPTED 的批次",
+    B_DRAFT.length === 36
+    && sql(`SELECT status FROM import_batch WHERE import_batch_id='${B_DRAFT}'`) !== "ACCEPTED");
+  check("以非 ACCEPTED 批次建立調整 → 409＋BATCH_NOT_ACCEPTED",
+    await post(jia, "/b05/create", { batch: B_DRAFT, title: "未接受批次" }) === 409
+    && Number(sql(`SELECT count(*) FROM adjustment`)) === preCreate);
+
   // ── 2 G-08：四項缺一不可 ──
   check("G-08：空白草稿送覆核 → 409", await post(jia, "/b05/submit", { adj: ADJ }) === 409);
   await post(jia, "/b05/save", { adj: ADJ, base_object_version: "1", title: "GROUP_GAAP 調整",

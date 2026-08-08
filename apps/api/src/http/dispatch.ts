@@ -12,6 +12,7 @@ export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise
 
 const ROUTES: Record<string, RouteHandler> = {
   "POST /period/transition": periods.transition,
+  "POST /b05/create": adjustments.create,
   "GET /b05": adjustments.view,
   "POST /b05/save": adjustments.save,
   "POST /b05/submit": adjustments.submit,

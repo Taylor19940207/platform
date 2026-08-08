@@ -10,6 +10,8 @@ import type { AuthenticatedContext } from "../../http/context.ts";
 import { esc, page, type Respond } from "../../http/respond.ts";
 import { audit } from "../audit.ts";
 import { engagementRolesOf, tenantRolesOf } from "../engagements/access.ts";
+import { loadBatch } from "../imports/access.ts";
+import { b04CtxBar } from "../imports/views.ts";
 import { loadAdj, adjLines, type AdjRow } from "./access.ts";
 import * as adjSvc from "./service.ts";
 
@@ -252,4 +254,50 @@ export async function approve(ctx: AuthenticatedContext, send: Respond): Promise
   const out = adjSvc.approve(actorOf(s, g.roles), g.r);
   if (out.ok) return send(302, "", { location: `/b05?adj=${g.r.adjustment_id}` });
   return renderAdjFailure(send, g.r, out);
+}
+
+/**
+ * 建立調整草稿。
+ *
+ * 授權按**這個動作**判斷，不沿用萬用的批次守衛：
+ *   * §24.6「調整」列的 `C`（建立）只給 R2；
+ *   * 且必須是**案件層**的 R2——租戶層 R2 不得在任一案件建立調整（§26.3）。
+ * 批次脈絡另外驗三件事：同租戶（RLS 已保證查不到別租戶）、同案件、且已 ACCEPTED。
+ * 未接受的批次其來源事實尚非正式，不得成為調整的期間脈絡。
+ */
+export async function create(ctx: AuthenticatedContext, send: Respond): Promise<void> {
+  const s = ctx.session;
+  const f = await ctx.form();
+  const batchId = f["batch"] ?? "";
+  const b = loadBatch(s, batchId);
+  if (!b) return send(404, page("404", "", "<h2>批次不存在</h2>"));
+
+  const roles = engagementRolesOf(s, b.engagement_id);
+  if (!roles.has("R2")) {
+    audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.denied", s.userId,
+      "import_batch", b.import_batch_id,
+      { reason: "編製調整需本案件的 R2 角色（§24.6 調整列 C）",
+        engagement_roles: [...roles].sort(), tenant_roles: [...tenantRolesOf(s)].sort() });
+    return send(403, page("拒絕", b04CtxBar(b, "B-04"),
+      "<h2>⛔ 編製調整需本案件的 R2 角色</h2><p>此次嘗試已寫入稽核軌跡。</p>"));
+  }
+  if (b.status !== "ACCEPTED") {
+    audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.rejected", s.userId,
+      "import_batch", b.import_batch_id, { code: "BATCH_NOT_ACCEPTED", status: b.status });
+    return send(409, page("拒絕", b04CtxBar(b, "B-04"),
+      `<h2>⛔ BATCH_NOT_ACCEPTED</h2><p>批次目前為 ${esc(b.status)}，其來源事實尚非正式，不得成為調整的期間脈絡。</p>`),
+      { "x-error-code": "BATCH_NOT_ACCEPTED" });
+  }
+
+  const created = adjSvc.createDraft({ userId: s.userId, tenantId: s.tenantId, roles },
+    { engagementId: b.engagement_id, periodRevisionId: b.declared_period_revision_id,
+      title: f["title"] || "未命名調整" });
+  if (!created.ok) {
+    audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "adjustment.create.rejected", s.userId,
+      "import_batch", b.import_batch_id, { code: "BASIS_NOT_CONFIGURED" });
+    return send(409, page("拒絕", b04CtxBar(b, "B-04"),
+      "<h2>⛔ BASIS_NOT_CONFIGURED</h2><p>本案件尚未建立 A／C 基礎，無法建立跨基礎調整。</p>"),
+      { "x-error-code": "BASIS_NOT_CONFIGURED" });
+  }
+  return send(302, "", { location: `/b05?adj=${created.adjustmentId}` });
 }
