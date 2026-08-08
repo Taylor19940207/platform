@@ -6,11 +6,18 @@
 import type { AuthenticatedContext } from "./context.ts";
 import type { Respond } from "./respond.ts";
 import * as periods from "../modules/periods/routes.ts";
+import * as adjustments from "../modules/adjustments/routes.ts";
 
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
 const ROUTES: Record<string, RouteHandler> = {
   "POST /period/transition": periods.transition,
+  "GET /b05": adjustments.view,
+  "POST /b05/save": adjustments.save,
+  "POST /b05/submit": adjustments.submit,
+  "POST /b05/review": adjustments.review,
+  "POST /b05/return": adjustments.returnDraft,
+  "POST /b05/approve": adjustments.approve,
 };
 
 /** 命中則執行並回傳 true；未命中回傳 false，由呼叫端繼續原有分派。 */
