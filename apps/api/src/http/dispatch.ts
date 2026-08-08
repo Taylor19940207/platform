@@ -10,6 +10,7 @@ import * as adjustments from "../modules/adjustments/routes.ts";
 import * as imports from "../modules/imports/routes.ts";
 import * as mappings from "../modules/mappings/routes.ts";
 import * as calculations from "../modules/calculations/routes.ts";
+import * as evidence from "../modules/evidence/routes.ts";
 
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
@@ -25,6 +26,10 @@ const ROUTES: Record<string, RouteHandler> = {
   "GET /b06/run": calculations.runView,
   "POST /b06/replay": calculations.replay,
   "GET /b06": calculations.list,
+  "POST /b07/package": evidence.createPackage,
+  "GET /b07/package": evidence.packageView,
+  "GET /b07": evidence.list,
+  "GET /b07/download": evidence.download,
   "POST /b05/create": adjustments.create,
   "GET /b05": adjustments.view,
   "POST /b05/save": adjustments.save,

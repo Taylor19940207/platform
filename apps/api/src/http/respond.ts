@@ -30,13 +30,21 @@ button{background:#1b1f24;color:#fff;border:0;border-radius:6px;padding:7px 16px
 <div class="ctx">${ctxBar}</div><div class="wrap">${body}</div></html>`;
 }
 
-/** 回應函式：狀態碼 ＋ HTML ＋ 額外 Header（如 x-error-code）。 */
-export type Respond = (code: number, body: string, headers?: Record<string, string>) => void;
+/**
+ * 回應函式：狀態碼 ＋ HTML ＋ 額外 Header（如 x-error-code）。
+ * `bytes` 供下載類回應使用——route 因此仍不需要碰到 ServerResponse。
+ */
+export interface Respond {
+  (code: number, body: string, headers?: Record<string, string>): void;
+  bytes(code: number, body: Buffer, headers: Record<string, string>): void;
+}
 
 export function responder(res: ServerResponse): Respond {
-  return (code, body, headers = {}) => {
+  const send = ((code: number, body: string, headers: Record<string, string> = {}) => {
     res.writeHead(code, { "content-type": "text/html; charset=utf-8", ...headers });
     res.end(body);
-  };
+  }) as Respond;
+  send.bytes = (code, body, headers) => { res.writeHead(code, headers); res.end(body); };
+  return send;
 }
 

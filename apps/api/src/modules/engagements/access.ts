@@ -15,7 +15,10 @@
 // Tenant 內的每個 Engagement 都必須明示授權，不得由租戶層角色推導。
 //
 // 因此：業務物件一律用 engagementRolesOf()；技術／治理面才用 tenantRolesOf()。
-// allAssignedRolesOf() 只是舊 B-04 既有行為的顯名保留，**不得用於新程式**。
+//
+// 歷史：曾有一個 rolesOf()／allAssignedRolesOf() 回傳兩者聯集，讓租戶層角色隱式
+// 取得客戶資料，且六個 B-04 動作共用同一份授權判斷。B-04／B-06／B-07 全部改為
+// 逐動作、案件層授權後，該函式已無使用者，於本刀刪除。
 import { query } from "../../../../../packages/database/src/psql.ts";
 import type { Session } from "../../../../../packages/auth/src/session.ts";
 
@@ -35,18 +38,4 @@ export function tenantRolesOf(session: Session): Set<string> {
       WHERE user_id = :'u'::uuid AND revoked_at IS NULL
         AND engagement_id IS NULL`,
     { u: session.userId }, { tenantId: session.tenantId }).map((r) => r.role));
-}
-
-/**
- * 兩種範圍的聯集——**舊 B-04 既有行為的顯名保留，不得用於新程式**。
- *
- * 名字刻意冗長且難用：它把「案件層授權」與「租戶層授權」混為一談，
- * 正是本次修補要消除的模糊。B-04 收進 ImportBatch 模組時一併改掉。
- */
-export function allAssignedRolesOf(session: Session, engagementId: string): Set<string> {
-  return new Set(query<{ role: string }>(
-    `SELECT role FROM role_assignment
-      WHERE user_id = :'u'::uuid AND revoked_at IS NULL
-        AND (engagement_id IS NULL OR engagement_id = :'e'::uuid)`,
-    { u: session.userId, e: engagementId }, { tenantId: session.tenantId }).map((r) => r.role));
 }

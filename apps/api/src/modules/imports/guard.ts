@@ -18,8 +18,16 @@ export type BatchGate =
   | { ok: true; b: BatchCtx; roles: Set<string> }
   | { ok: false; res: void };
 
+export interface ObjectRef { objectType: string; objectId: string }
+
+/**
+ * `objectRef` 讓呼叫端指定 CVA 要記在哪個物件上。預設記 import_batch；
+ * 但以 run 或 package 為入口的動作必須記回**它自己的**物件——
+ * 把 package 的越權記成 import_batch，稽核軌跡就答不出「他想拿的是哪一份」。
+ */
 export function batchGate(ctx: AuthenticatedContext, send: Respond, batchId: string,
-                          action: string, allowed: readonly string[]): BatchGate {
+                          action: string, allowed: readonly string[],
+                          objectRef?: ObjectRef): BatchGate {
   const s = ctx.session;
   const b = loadBatch(s, batchId);
   if (!b) return { ok: false, res: send(404, page("404", "", "<h2>批次不存在</h2>")) };
@@ -27,7 +35,7 @@ export function batchGate(ctx: AuthenticatedContext, send: Respond, batchId: str
   if (!allowed.some((x) => roles.has(x))) {
     // 兩種範圍分開留痕：稽核軌跡要答得出「缺的是角色種類還是授權範圍」
     audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
-      "import_batch", batchId,
+      objectRef?.objectType ?? "import_batch", objectRef?.objectId ?? batchId,
       { reason: `本動作需本案件的 ${allowed.join("／")} 角色（§24.6）`, action,
         engagement_roles: [...roles].sort(), tenant_roles: [...tenantRolesOf(s)].sort() });
     return { ok: false, res: send(403, page("拒絕", "<b>⛔ 無權執行</b>",

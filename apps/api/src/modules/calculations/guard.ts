@@ -8,7 +8,7 @@
 import { query } from "../../../../../packages/database/src/psql.ts";
 import type { AuthenticatedContext } from "../../http/context.ts";
 import { page, type Respond } from "../../http/respond.ts";
-import { batchGate, type BatchGate } from "../imports/guard.ts";
+import { batchGate, type BatchGate, type ObjectRef } from "../imports/guard.ts";
 
 /** §24.6：建立、重演、清單與單次結果檢視均為案件層 R2／R3。 */
 export const B06 = {
@@ -29,12 +29,13 @@ export type RunGate = BatchGate & { run?: Record<string, string> };
 const RUN_BY_ID = `SELECT r.* FROM calculation_run r WHERE r.calculation_run_id = :'r'::uuid`;
 
 export function runGate(ctx: AuthenticatedContext, send: Respond, runId: string,
-                        action: string, allowed: readonly string[], sql = RUN_BY_ID):
+                        action: string, allowed: readonly string[], sql = RUN_BY_ID,
+                        objectRef?: ObjectRef):
     { ok: true; b: BatchGate & { ok: true }; run: Record<string, string> } | { ok: false; res: void } {
   const run = query<Record<string, string>>(sql,
     { r: runId }, { tenantId: ctx.session.tenantId })[0];
   if (!run) return { ok: false, res: send(404, page("404", "", "<h2>Run 不存在</h2>")) };
-  const g = batchGate(ctx, send, run.import_batch_id, action, allowed);
+  const g = batchGate(ctx, send, run.import_batch_id, action, allowed, objectRef);
   if (!g.ok) return { ok: false, res: g.res };
   return { ok: true, b: g, run };
 }

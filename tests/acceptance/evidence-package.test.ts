@@ -15,12 +15,16 @@ const U_JIA = "aaaaaaaa-0000-0000-0000-000000000001";
 const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";   // R4（可產包）
 const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";    // R6（不可產包）
+const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";    // R1（本案件資料提供者）
+const U_TR3 = "aaaaaaaa-0000-0000-0000-000000000007";    // 租戶層庚：R3 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
 const FIX = "tests/fixtures/case-001";
 
+const getStatus = async (cookie: string, path: string): Promise<number> =>
+  (await fetch(`${API}${path}`, { headers: { cookie }, redirect: "manual" })).status;
 const results: [string, boolean, string][] = [];
 const check = (name: string, ok: boolean, detail = "") => {
   results.push([name, ok, detail]);
@@ -238,6 +242,62 @@ try {
         WHERE (p.status IN ('READY','FAILED')) <> (j.status IN ('COMPLETED','FAILED'))`) === "0");
   check("不存在任何交付紀錄實體（驗收 #12：PREVIEW 不建立第二套發布真相）",
     sql(`SELECT count(*) FROM pg_tables WHERE tablename IN ('delivery_record','export_job')`) === "0");
+  // ── §24.6 逐動作授權：清單／建立／檢視／下載皆為**案件層** R2／R3／R4 ──
+  // 授權沿父鏈反查：清單與建立 run → batch → engagement；
+  // 檢視與下載 package → run → batch → engagement（不用 package.engagement_id）。
+  const tax = await login(U_TAX);
+  const tr3 = await login(U_TR3);
+  const pkgBefore = Number(sql("SELECT count(*) FROM evidence_package"));
+  const jobBefore = Number(sql("SELECT count(*) FROM background_job WHERE job_type='EVIDENCE_PACKAGE'"));
+  const evBefore = Number(sql(`SELECT count(*) FROM audit_event
+                                WHERE event_type='evidence_package.created'`));
+  check("前置成立：庚持租戶層 R3（種類在白名單內、範圍不涵蓋本案件）、戊持本案件 R1",
+    sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR3}' AND role='R3'
+          AND engagement_id IS NULL`) === "1"
+    && sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR3}'
+          AND engagement_id IS NOT NULL`) === "0");
+  check("租戶層 R3：清單／建立／檢視／下載皆 403（種類正確、範圍錯誤）",
+    await getStatus(tr3, `/b07?run=${RUN}`) === 403
+    && (await post(tr3, "/b07/package", { run: RUN, request_key: K(90) })).status === 403
+    && await getStatus(tr3, `/b07/package?id=${P1}`) === 403
+    && await getStatus(tr3, `/b07/download?id=${P1}`) === 403);
+  check("R1 與 R6 皆不得存取 B-07",
+    await getStatus(tax, `/b07?run=${RUN}`) === 403
+    && await getStatus(ops, `/b07/package?id=${P1}`) === 403
+    && await getStatus(ops, `/b07/download?id=${P1}`) === 403);
+  check("越權未建立 EvidencePackage、BackgroundJob 或 evidence_package.created",
+    Number(sql("SELECT count(*) FROM evidence_package")) === pkgBefore
+    && Number(sql("SELECT count(*) FROM background_job WHERE job_type='EVIDENCE_PACKAGE'")) === jobBefore
+    && Number(sql(`SELECT count(*) FROM audit_event
+                    WHERE event_type='evidence_package.created'`)) === evBefore);
+  check("CVA 記在動作自己的物件上（檢視／下載＝evidence_package ＋ package_id）",
+    sql(`SELECT object_type||'|'||object_id FROM audit_event
+          WHERE event_type='b07.download.denied' ORDER BY audit_event_id DESC LIMIT 1`)
+      === `evidence_package|${P1}`
+    && sql(`SELECT object_type FROM audit_event
+             WHERE event_type='b07.view.denied' ORDER BY audit_event_id DESC LIMIT 1`)
+      === "calculation_run");
+
+  // ── 雜湊不符：是完整性故障，不是使用者違規 ──
+  const cvaBefore = Number(sql(`SELECT count(*) FROM audit_event
+                                 WHERE kind='CONTROL_VIOLATION_ATTEMPT'`));
+  sql(`ALTER TABLE evidence_package DISABLE TRIGGER ALL`);
+  sql(`UPDATE evidence_package SET artifact_sha256 = repeat('0',64) WHERE package_id='${P1}'`);
+  sql(`ALTER TABLE evidence_package ENABLE TRIGGER ALL`);
+  const bad = await fetch(`${API}/b07/download?id=${P1}`, { headers: { cookie: bing } });
+  const badBody = await bad.text();
+  check("雜湊不符 → 500、零 artifact 位元組",
+    bad.status === 500 && !badBody.includes("<html lang=\"en\"") && badBody.includes("ARTIFACT_HASH_MISMATCH"));
+  check("完整性失敗記為 CONTROL_PRECHECK，不增加任何使用者違規紀錄",
+    sql(`SELECT kind||'|'||event_type||'|'||object_type FROM audit_event
+          WHERE event_type='evidence.artifact_integrity_failed' ORDER BY audit_event_id DESC LIMIT 1`)
+      === "CONTROL_PRECHECK|evidence.artifact_integrity_failed|evidence_package"
+    && sql(`SELECT (payload->>'expected_hash')||'|'||(payload->>'actual_hash') <> ''
+             FROM audit_event WHERE event_type='evidence.artifact_integrity_failed'
+             ORDER BY audit_event_id DESC LIMIT 1`) === "t"
+    && Number(sql(`SELECT count(*) FROM audit_event
+                    WHERE kind='CONTROL_VIOLATION_ATTEMPT'`)) === cvaBefore);
+
   check("created／completed／failed 事件皆存在",
     Number(sql(`SELECT count(DISTINCT event_type) FROM audit_event WHERE kind='DOMAIN_EVENT'
       AND event_type IN ('evidence_package.created','evidence_package.completed','evidence_package.failed')`)) === 3);
