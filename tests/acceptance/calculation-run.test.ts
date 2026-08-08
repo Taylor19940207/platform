@@ -11,6 +11,10 @@ const API = "http://127.0.0.1:8096";
 const U_JIA = "aaaaaaaa-0000-0000-0000-000000000001";     // 甲 R2/R3/R4
 const U_YI  = "aaaaaaaa-0000-0000-0000-000000000002";     // 乙 R2/R3/R4
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";    // 丙 R4（無 R2/R3）
+const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";     // 系管丁：R6（租戶層）
+const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";     // 稅務擔當戊：R1（本案件）
+const U_TR4 = "aaaaaaaa-0000-0000-0000-000000000006";     // 租戶層己：R4 但 engagement_id IS NULL
+const U_TR3 = "aaaaaaaa-0000-0000-0000-000000000007";     // 租戶層庚：R3 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
@@ -34,6 +38,8 @@ async function post(cookie: string, path: string, fields: Record<string, string>
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(fields).toString() });
 }
+const getStatus = async (cookie: string, path: string): Promise<number> =>
+  (await fetch(`${API}${path}`, { headers: { cookie }, redirect: "manual" })).status;
 const get = async (cookie: string, path: string): Promise<string> =>
   (await fetch(`${API}${path}`, { headers: { cookie } })).text();
 async function upload(cookie: string, pr: string, csvPath: string): Promise<number> {
@@ -166,6 +172,48 @@ try {
   check("結果頁醒目標示 PREVIEW 非正式・未折算（NO_FX）",
     pg.includes("PREVIEW") && pg.includes("未折算") && pg.includes("NO_FX")
     && pg.includes("不得作為入帳或交付依據"));
+
+  // 7b §24.6 逐動作授權：建立／重演／清單／結果檢視皆為**案件層** R2／R3
+  // 以 run 為入口者由 CalculationRun → ImportBatch → Engagement 反查歸屬，
+  // 不採信請求附帶的 batch。
+  const ops = await login(U_OPS);
+  const tax = await login(U_TAX);
+  const tr4 = await login(U_TR4);
+  const tr3 = await login(U_TR3);
+  const runsBefore = Number(sql("SELECT count(*) FROM calculation_run"));
+  const jobsBefore = Number(sql("SELECT count(*) FROM background_job WHERE job_type='CALCULATION_RUN'"));
+  const createdBefore = Number(sql(`SELECT count(*) FROM audit_event
+                                     WHERE event_type='calculation_run.created'`));
+  check("前置成立：戊持本案件 R1、丁持租戶層 R6、己持租戶層 R4（三者皆無案件層 R2／R3）",
+    sql(`SELECT count(*) FROM role_assignment WHERE user_id IN ('${U_TAX}','${U_OPS}','${U_TR4}')
+          AND role IN ('R2','R3') AND engagement_id='${ENG_A}'`) === "0");
+  // 庚是「角色種類正確（R3 在白名單內）、但作用域是租戶層」的樣本——
+  // 只有它能釘住作用域判定；R1／R6／R4 三者連白名單都不在。
+  check("租戶層 R3（種類正確、範圍錯誤）建立／重演／檢視 run 皆 403",
+    (await post(tr3, "/b06/run", { batch: B1, request_key: K(93) })).status === 403
+    && (await post(tr3, "/b06/replay", { run: RUN1 })).status === 403
+    && await getStatus(tr3, `/b06/run?id=${RUN1}`) === 403);
+  check("建立 run：R1／R6／租戶層 R4 皆 403",
+    (await post(tax, "/b06/run", { batch: B1, request_key: K(90) })).status === 403
+    && (await post(ops, "/b06/run", { batch: B1, request_key: K(91) })).status === 403
+    && (await post(tr4, "/b06/run", { batch: B1, request_key: K(92) })).status === 403);
+  check("重演：三者皆 403（歸屬由 run 反查，不採信附帶 batch）",
+    (await post(tax, "/b06/replay", { run: RUN1 })).status === 403
+    && (await post(ops, "/b06/replay", { run: RUN1 })).status === 403
+    && (await post(tr4, "/b06/replay", { run: RUN1 })).status === 403);
+  check("清單與單次結果檢視：三者皆 403",
+    await getStatus(tax, `/b06?batch=${B1}`) === 403
+    && await getStatus(ops, `/b06/run?id=${RUN1}`) === 403
+    && await getStatus(tr4, `/b06/run?id=${RUN1}`) === 403);
+  check("越權未新增任何 calculation_run、背景工作或 calculation_run.created 事件",
+    Number(sql("SELECT count(*) FROM calculation_run")) === runsBefore
+    && Number(sql("SELECT count(*) FROM background_job WHERE job_type='CALCULATION_RUN'")) === jobsBefore
+    && Number(sql(`SELECT count(*) FROM audit_event
+                    WHERE event_type='calculation_run.created'`)) === createdBefore);
+  check("拒絕的 CVA 分開記錄 engagement_roles 與 tenant_roles",
+    sql(`SELECT (payload->>'engagement_roles')||'|'||(payload->>'tenant_roles')
+           FROM audit_event WHERE event_type='b06.run.view.denied'
+          ORDER BY audit_event_id DESC LIMIT 1`) === '[]|["R4"]');
 
   // 8 冪等契約三情形
   const again = await post(jia, "/b06/run", { batch: B1, request_key: K(4) });

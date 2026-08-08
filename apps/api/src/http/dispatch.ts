@@ -9,6 +9,7 @@ import * as periods from "../modules/periods/routes.ts";
 import * as adjustments from "../modules/adjustments/routes.ts";
 import * as imports from "../modules/imports/routes.ts";
 import * as mappings from "../modules/mappings/routes.ts";
+import * as calculations from "../modules/calculations/routes.ts";
 
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
@@ -20,6 +21,10 @@ const ROUTES: Record<string, RouteHandler> = {
   "POST /b04/approve": mappings.approveMapping,
   "GET /b04/preview": mappings.preview,
   "POST /b04/submit": mappings.submitMapping,
+  "POST /b06/run": calculations.createRun,
+  "GET /b06/run": calculations.runView,
+  "POST /b06/replay": calculations.replay,
+  "GET /b06": calculations.list,
   "POST /b05/create": adjustments.create,
   "GET /b05": adjustments.view,
   "POST /b05/save": adjustments.save,
