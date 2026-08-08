@@ -9,20 +9,12 @@ fi
 need fx_reset fx_core fx_accounts
 
 # ── 映射版本化（SLICE-M2-01；migrations/0005） ───────
-PSQL_C >/dev/null <<'SQL'
-INSERT INTO chart_of_accounts (coa_id, tenant_id, engagement_id, name) VALUES
-  ('88888888-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','集團科目表');
-INSERT INTO account (account_id, tenant_id, coa_id, code, name) VALUES
-  ('ac000000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','88888888-0000-0000-0000-000000000001','1002','银行存款'),
-  ('ac000000-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','88888888-0000-0000-0000-000000000001','6602','管理费用');
-INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES
-  ('eeeeeeee-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','另一案件');
-INSERT INTO chart_of_accounts (coa_id, tenant_id, engagement_id, name) VALUES
-  ('88888888-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000099','另一案件科目表');
-INSERT INTO account (account_id, tenant_id, coa_id, code, name) VALUES
-  ('ac000000-0000-0000-0000-000000000099','11111111-1111-1111-1111-111111111111','88888888-0000-0000-0000-000000000099','1002','银行存款');
-SQL
-ok "映射測試種子（兩案件各一份科目表）"
+# 前置由 fx_accounts 建立。此處**只斷言它確實存在**，不重複 INSERT——
+# 重複插入必然 duplicate key，而錯誤被吞掉之後下一行照樣記 PASS：
+# 那正是「以錯誤理由通過」的假綠。
+seeded=$(APP_C <<<"$T1 SELECT count(*) FROM account WHERE account_id IN ('$ACC1','$ACC2','$ACC99')")
+[ "$seeded" = "3" ] && ok "前置成立：兩案件各一份科目表（1002／6602 ＋ 另一案件 1002）" \
+  || ng "前置不成立：fx_accounts 的三個科目只找到 $seeded 個"
 
 MR1=ab000000-0000-0000-0000-000000000001
 expect_ok "映射：建立草稿 v1" \

@@ -79,8 +79,10 @@ ADJ_BRIDGE_COLS="basis_from_id, basis_to_id, posting_layer_id"
 ADJ_BRIDGE_VALS="'$BASIS_A','$BASIS_C','$LAYER_GG'"
 EVID="legal_basis='企業会計基準第29号', evidence_ref='attach-001.pdf', judgment_reason='集團政策', language_tag='ja-JP'"
 
-# 表存在且有列＝該 fixture 已建立
-_has() { [ "$(PSQL_C <<<"SELECT count(*) FROM $1 ${2:-}" 2>/dev/null)" != "0" ]; }
+# fixture 是否已建立——**一律查固定 ID**。
+# 「表裡存在任何一列」證明不了需要的那一列在：別的區段先插了自己的資料，
+# 這裡就會誤判為已建立，然後在缺前置的狀態下往下跑。
+_has() { [ "$(PSQL_C <<<"SELECT count(*) FROM $1 WHERE $2" 2>/dev/null)" != "0" ]; }
 
 # ── fixture ───────────────────────────────────────────────────
 fx_reset() {
@@ -90,7 +92,7 @@ fx_reset() {
 }
 
 fx_core() {
-  _has tenant && return 0
+  _has tenant "tenant_id = '$TEN'" && return 0
   PSQL_C >/dev/null <<SQL || { ng "fx_core 建立失敗（fail closed）"; exit 1; }
 INSERT INTO tenant (tenant_id, name) VALUES ('$TEN','T1 事務所'),('$TEN2','T2 事務所');
 SET app.tenant_id = '$TEN';
@@ -151,7 +153,7 @@ SQL
 }
 
 fx_accounts() {
-  _has chart_of_accounts && return 0
+  _has chart_of_accounts "coa_id = '88888888-0000-0000-0000-000000000001'" && return 0
   PSQL_C >/dev/null <<SQL || { ng "fx_accounts 建立失敗（fail closed）"; exit 1; }
 INSERT INTO chart_of_accounts (coa_id, tenant_id, engagement_id, name) VALUES
   ('88888888-0000-0000-0000-000000000001','$TEN','$ENG','集團科目表');
@@ -167,7 +169,7 @@ SQL
 }
 
 fx_tb_lines() {
-  _has source_ledger_line && return 0
+  _has source_dataset "source_dataset_id = '77777777-0000-0000-0000-000000000001'" && return 0
   PSQL_C >/dev/null <<SQL || { ng "fx_tb_lines 建立失敗（fail closed）"; exit 1; }
 INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, batch_version, granularity, content_sha256, row_count)
 VALUES ('77777777-0000-0000-0000-000000000001','$TEN','$B2',1,'BALANCE','h',2);
@@ -180,7 +182,7 @@ SQL
 # 已批准並物化的調整：其他領域（計算、調節）需要它，但不應重複驗證它的守衛。
 # 這裡刻意**靜默建立**——斷言留在 adjustment 領域檔，避免同一條規則被計兩次。
 fx_adjustment_approved() {
-  _has adjustment "WHERE adjustment_id='$ADJ'" && return 0
+  _has adjustment "adjustment_id = '$ADJ'" && return 0
   fx_accounts
   PSQL_C >/dev/null <<SQL || { ng "fx_adjustment_approved 建立失敗（fail closed）"; exit 1; }
 $T1
@@ -210,7 +212,7 @@ MANI2=ee110000-0000-0000-0000-000000000002
 RUNA=ee110000-0000-0000-0000-000000000011
 RUNB=ee110000-0000-0000-0000-000000000012
 fx_calc_runs() {
-  _has calculation_run "WHERE calculation_run_id='$RUNA'" && return 0
+  _has calculation_run "calculation_run_id = '$RUNA'" && return 0
   fx_accounts
   PSQL_C >/dev/null <<SQL || { ng "fx_calc_runs 建立失敗（fail closed）"; exit 1; }
 $T1
