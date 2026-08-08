@@ -33,6 +33,9 @@ pnpm dev                          # API + Worker
 
 ```bash
 pnpm test          # 單元 58 ＋ DB 整合 357 ＋ 端到端驗收 297（里程碑 1 之 20 ＋ 映射 31 ＋ 調整 62 ＋ 工作可靠性 29 ＋ 計算執行 23 ＋ 證據包 24 ＋ 工作台身分確認 55 ＋ 期間生命週期 37 ＋ 多基礎 16），共 712 條
+pnpm test:quick    # 單元＋DB 整合（約 48 秒）——日常改 DB 守衛時跑這個
+pnpm test:db:basis # 只跑一個領域（mapping／adjustment／period／basis，各約 10～15 秒）
+pnpm test:timing   # 逐 suite 耗時，決定要優化什麼之前先量
 ```
 
 **跑測試前先停掉 `pnpm dev`**：端到端測試會自己 spawn API（8091～8099）與 worker，
