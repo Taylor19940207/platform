@@ -16,12 +16,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DB="${DB_TEST_NAME:-cbfc_test}"
 
 PSQL_C() { psql_run -d "$DB" "$@"; }
+# app_runtime 身分（RLS 生效的那一邊）。PSQL_MODE=local 分支沿用原 db.test.sh 的寫法，
+# 但本機未安裝 psql，**這條路徑未經實測**——要啟用 local 模式前先驗證它的認證方式。
 APP_C() {
   if [ "$PSQL_MODE" = "docker" ]; then
     docker exec -i "$DB_CONTAINER" psql -v ON_ERROR_STOP=1 -qtA -U app_runtime -d "$DB" "$@"
   else
-    PGPASSWORD="${APP_DB_PASSWORD:-app}" psql -v ON_ERROR_STOP=1 -qtA \
-      -h "$DB_HOST" -p "$DB_PORT" -U app_runtime -d "$DB" "$@"
+    psql -v ON_ERROR_STOP=1 -qtA -h "$DB_HOST" -p "$DB_PORT" -U app_runtime -d "$DB" "$@"
   fi
 }
 

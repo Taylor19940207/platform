@@ -48,6 +48,27 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED`，DB 仍是最後防線。
 既有映射不因來源批次日後轉 `SUPERSEDED` 而被追溯刪除或改寫。
 
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 712 條：
+
+| 指令 | 範圍 | 耗時 |
+|---|---|---|
+| `pnpm test:db:<domain>` | mapping／adjustment／period／basis 各自單跑（自行重建 DB 並補齊前置） | 9～15 秒 |
+| `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
+| `pnpm test`（＝`test:full`） | 完整 712 條 | **262 秒（4.7 分鐘）** |
+| `pnpm test:acceptance:<suite>` | 九支端到端各自單跑 | 8～54 秒 |
+| `pnpm test:timing` | 逐 suite 耗時 | — |
+
+完整一輪只在**切片收口與 push 前**跑。連續兩輪不機械套用：
+worker／租約／競態／冪等＝收口跑兩輪；migration／RLS／會計不變條件＝至少完整一輪，
+重要版本可兩輪；純檔案搬移＝相關測試反覆跑，最後完整一輪；UI 文案與布局＝相關測試＋實機走查。
+
+DB 整合測試已拆為共用底座（`tests/integration/lib/harness.sh`）＋四個可單跑的領域檔
+（`tests/integration/db/`），其餘領域仍在聚合入口 `tests/integration/db.test.sh`。
+fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀態就跳過——不維護兩套種子。
+
+`PSQL_MODE` 維持 `docker`（本機未裝 psql）：實測 `docker exec` 只佔 262 秒中的約 30 秒，
+原訂「完整測試超過 20 分鐘就做連線池」的觸發條件遠未達成，因此不做連線池。
+
 **跑 `pnpm test` 前必須先停掉 `pnpm dev`**——端到端測試會自己 spawn API（8091～8099）
 與 worker，8080 的 dev worker 會搶同一批 `UPLOADED` 批次造成偽失敗；測試會重建 `cbfc_dev`，
 跑完以 `pnpm db:seed` 還原。
