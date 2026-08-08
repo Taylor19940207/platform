@@ -20,72 +20,15 @@ import { canSubmit, canReview, canApprove, g08Check, balanceCheck, legalTransiti
   previewOnlyJudgment, decimalOf, type AdjustmentStatus, type AdjustmentState,
   type GuardResult } from "../../../packages/domain/src/adjustment.ts";
 import { idempotencyKey, isStalled } from "../../../packages/domain/src/backgroundJob.ts";
-import { extractDbCode, httpStatusForCode, displayTextForCode, isNotImplemented,
-  validateTransitionRequest } from "../../../packages/domain/src/periodLifecycle.ts";
+import { authenticatedContext, readBody, sessionOf } from "./http/context.ts";
+import { dispatch } from "./http/dispatch.ts";
+import { esc, page, responder } from "./http/respond.ts";
+import { audit, auditSql } from "./modules/audit.ts";
 
 // 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分
 const DETECTION_RULE_VERSION = "detect-r1";
 
 const PORT = config.port;
-const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g,
-  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
-
-// ── 共通版面：每個作業畫面固定顯示脈絡（§28.9 EngagementContext） ──
-function page(title: string, ctxBar: string, body: string): string {
-  return `<!DOCTYPE html><html lang="zh-Hant"><meta charset="utf-8">
-<title>${esc(title)}</title><style>
-body{font-family:"Hiragino Sans","Noto Sans CJK TC",sans-serif;margin:0;color:#1b1f24}
-.ctx{background:#1b1f24;color:#fff;padding:8px 20px;font-size:13px;display:flex;gap:18px}
-.ctx b{color:#ffd27f}.wrap{max-width:960px;margin:0 auto;padding:20px}
-table{border-collapse:collapse;width:100%;font-size:13.5px;margin:12px 0}
-th,td{border:1px solid #dfe4ea;padding:7px 10px;text-align:left}
-th{background:#f7f9fb}
-.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;border:1px solid}
-.st-VALIDATED{color:#3d6b4a;border-color:#b7d2bf;background:#ebf3ed}
-.st-QUARANTINED,.st-CONFLICT{color:#a8402f;border-color:#e3bcb3;background:#fbeeeb}
-.st-UPLOADED,.st-VALIDATING,.st-NOT_CHECKED,.st-PENDING_CONFIRMATION{color:#8a5a2b;border-color:#d9c1a0;background:#faf4ec}
-.st-MATCHED,.st-ACCEPTED{color:#3d6b4a;border-color:#b7d2bf;background:#ebf3ed}
-form.up{border:1px solid #dfe4ea;border-radius:8px;padding:14px 18px;margin:14px 0;background:#f7f9fb}
-input,select,button,textarea{font:inherit;margin:4px 0}
-button{background:#1b1f24;color:#fff;border:0;border-radius:6px;padding:7px 16px;cursor:pointer}
-.note{color:#7a8593;font-size:12.5px}</style>
-<div class="ctx">${ctxBar}</div><div class="wrap">${body}</div></html>`;
-}
-
-function cookies(req: IncomingMessage): Record<string, string> {
-  return Object.fromEntries((req.headers.cookie ?? "").split(";")
-    .map((p) => p.trim().split("=")).filter((kv) => kv.length === 2) as [string, string][]);
-}
-function session(req: IncomingMessage): Session | null { return verify(cookies(req)["s"]); }
-
-function audit(tenantId: string, kind: string, eventType: string, actor: string | null,
-               objectType: string, objectId: string, payload: object): void {
-  exec(`INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
-        VALUES (:'t'::uuid, :'k', :'e', ${actor ? ":'a'::uuid" : "NULL"}, :'ot', :'oi'::uuid, :'pl'::jsonb)`,
-    { t: tenantId, k: kind, e: eventType, ...(actor ? { a: actor } : {}),
-      ot: objectType, oi: objectId, pl: JSON.stringify(payload) }, { tenantId });
-}
-
-/**
- * DomainEvent 的 SQL 片段（不執行），供併入狀態遷移的同一交易。
- *
- * 事件在 COMMIT 之後另行插入時，一旦插入失敗，狀態已永久前進而事件不存在——
- * 驗收「每個遷移都有 DomainEvent」就不再成立。生命週期事件必須與狀態同進同出。
- * `prefix` 讓同一交易能容納多個事件（如批准同時寫 approved 與 materialized）
- * 而不撞參數名，也不與快照片段的參數衝突。
- */
-function auditSql(tenantId: string, kind: string, eventType: string, actor: string,
-                  objectType: string, objectId: string, payload: object, prefix = "ev"):
-    { sql: string; params: Record<string, string> } {
-  const p = prefix;
-  return {
-    sql: `INSERT INTO audit_event (tenant_id, kind, event_type, actor_id, object_type, object_id, payload)
-          VALUES (:'${p}t'::uuid, :'${p}k', :'${p}e', :'${p}a'::uuid, :'${p}ot', :'${p}oi'::uuid, :'${p}pl'::jsonb);`,
-    params: { [`${p}t`]: tenantId, [`${p}k`]: kind, [`${p}e`]: eventType, [`${p}a`]: actor,
-              [`${p}ot`]: objectType, [`${p}oi`]: objectId, [`${p}pl`]: JSON.stringify(payload) },
-  };
-}
-
 // ── EngagementContext 伺服器端驗證（§24.1A：不得信任前端下拉選單） ──
 function validateContext(s: Session, engagementId: string, legalEntityId: string,
                          periodRevisionId: string): { ok: boolean; reason?: string } {
@@ -176,21 +119,9 @@ function b04CtxBar(b: BatchCtx, screen: string): string {
     `<span>批次 <b>${b.import_batch_id.slice(0, 8)}</b>（${b.status}）</span>`;
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
   const url = new URL(req.url ?? "/", "http://x");
-  const send = (code: number, body: string, headers: Record<string, string> = {}) => {
-    res.writeHead(code, { "content-type": "text/html; charset=utf-8", ...headers });
-    res.end(body);
-  };
+  const send = responder(res);
   try {
     if (url.pathname === "/health") {
       const [row] = query<{ ok: number }>("SELECT 1 AS ok", {}, { asRuntime: false });
@@ -199,7 +130,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
 
     // ── 登入（開發用：列出種子使用者；真機換 SSO） ──
-    if (url.pathname === "/" && !session(req)) {
+    if (url.pathname === "/" && !sessionOf(req)) {
       const users = query<{ user_id: string; email: string; display_name: string; tenant_id: string }>(
         "SELECT user_id, email, display_name, tenant_id FROM app_user WHERE is_active", {}, { asRuntime: false });
       return send(200, page("登入", "<b>未登入</b>",
@@ -211,60 +142,12 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       return send(302, "", { "set-cookie": `s=${sign(s)}; HttpOnly; Path=/`, location: "/" });
     }
 
-    const s = session(req);
+    const s = sessionOf(req);
     if (!s) return send(302, "", { location: "/" });
 
-    // ═══════════ SLICE-M2-05：期間生命週期（§25.8） ═══════════
-    // 責任邊界：
-    //   API = 證明「呼叫者是誰」——p_actor 一律取自登入 Session，
-    //         **不接受請求自行傳 actor**（所有連線共用 app_runtime，
-    //         DB 無法證明呼叫者本人就是該自然人）。
-    //   DB  = 證明「這個人是否真的持有該角色、並允許這次遷移」。
-    // 本處不重寫任何守衛，只呼叫 DB 唯一裁決點並映射穩定代碼。
-    if (url.pathname === "/period/transition" && req.method === "POST") {
-      const f = Object.fromEntries(new URLSearchParams((await readBody(req)).toString("utf8")));
-      const revision = f["revision"] ?? "";
-      const expectedFrom = f["expected_from"] ?? "";
-      const to = f["to"] ?? "";
-      const actingRole = f["acting_role"] ?? "";
-      // 格式驗證只擋「連送進 DB 都不成形」的請求，不做守衛裁決。
-      // 一般欄位驗證錯誤不寫 CVA（§25.18）。
-      const v = validateTransitionRequest({ revision, expectedFrom, to, actingRole });
-      if (!v.ok) {
-        return send(400, page("請求格式錯誤", `<span>畫面 <b>期間生命週期</b></span>`,
-          `<h2>⛔ 請求格式錯誤</h2><p>欄位 <b>${esc(v.field)}</b>：${esc(v.reason)}</p>`),
-          { "x-error-code": "INVALID_REQUEST" });
-      }
-      try {
-        const [row] = query<{ landed: string }>(
-          `SELECT fn_period_attempt_transition(:'r'::uuid, :'ef', :'to', :'u'::uuid, :'role') AS landed`,
-          { r: revision, ef: expectedFrom, to, u: s.userId, role: actingRole },
-          { tenantId: s.tenantId });
-        // 不再另寫事件：DB 已在同一交易寫入權威的 period.transitioned（含
-        // from／requested／landed）。若在此補第二筆，遷移已提交而事件失敗時
-        // 會回 500，但期間其實已成功遷移——客戶看到的狀態與真實狀態不一致。
-        return send(200, page("期間狀態已更新", `<span>畫面 <b>期間生命週期</b></span>`,
-          `<h2>✓ 期間狀態：${esc(row.landed)}</h2>
-           ${row.landed !== to ? `<p class="note">你請求 <b>${esc(to)}</b>，系統依覆核覆蓋評估判給
-             <b>${esc(row.landed)}</b>。</p>` : ""}`),
-          { "x-period-status": row.landed });
-      } catch (e) {
-        // 代碼以前綴擷取，不依中文文案判斷（文案會改，代碼不會）
-        const code = extractDbCode(String(e));
-        const status = httpStatusForCode(code);
-        if (code === null) throw e;              // 未預期錯誤不吞、不猜
-        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "period.transition.rejected", s.userId,
-          "period_revision", revision,
-          { guard: code, requested: to, expected_from: expectedFrom, acting_role: actingRole });
-        return send(status, page("期間遷移被拒", `<span>畫面 <b>期間生命週期</b></span>`,
-          `<h2>⛔ ${esc(code)}</h2><p>${esc(displayTextForCode(code))}</p>
-           ${isNotImplemented(code)
-             ? `<p class="note">此守衛<b>尚未實作</b>，因此此遷移在本版不可用——
-                這不代表守衛已驗證通過。</p>` : ""}
-           <p class="note">此次嘗試已寫入稽核軌跡。</p>`),
-          { "x-error-code": code });
-      }
-    }
+    // 已拆出模組的路由先問 dispatcher；未命中才落回下方原有的 if 鏈。
+    // 一個模組一次地搬，回歸差異才分得清是哪個模組造成的。
+    if (await dispatch(authenticatedContext(req, url, s), send)) return;
 
     // ── 診斷：背景工作狀態（SLICE-M2-03 第 16 條；管理用途，本刀只做 API 不做畫面） ──
     if (url.pathname === "/admin/jobs" && req.method === "GET") {
