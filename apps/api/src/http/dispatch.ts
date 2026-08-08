@@ -7,11 +7,19 @@ import type { AuthenticatedContext } from "./context.ts";
 import type { Respond } from "./respond.ts";
 import * as periods from "../modules/periods/routes.ts";
 import * as adjustments from "../modules/adjustments/routes.ts";
+import * as imports from "../modules/imports/routes.ts";
+import * as mappings from "../modules/mappings/routes.ts";
 
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
 const ROUTES: Record<string, RouteHandler> = {
   "POST /period/transition": periods.transition,
+  "POST /b04/accept": imports.accept,
+  "GET /b04": mappings.view,
+  "POST /b04/map": mappings.createMapping,
+  "POST /b04/approve": mappings.approveMapping,
+  "GET /b04/preview": mappings.preview,
+  "POST /b04/submit": mappings.submitMapping,
   "POST /b05/create": adjustments.create,
   "GET /b05": adjustments.view,
   "POST /b05/save": adjustments.save,

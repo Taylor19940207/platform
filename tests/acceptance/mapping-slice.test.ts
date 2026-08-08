@@ -9,6 +9,9 @@ import { raw } from "../../packages/database/src/psql.ts";
 const API = "http://127.0.0.1:8092";
 const U_STAFF = "aaaaaaaa-0000-0000-0000-000000000001";   // 職員甲：R2（A 案件）
 const U_SENIOR = "aaaaaaaa-0000-0000-0000-000000000002";  // 資深乙：R2＋R4（A 案件）
+const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";     // 系管丁：R6（租戶層）
+const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";     // 稅務擔當戊：R1（A 案件）
+const U_TR4 = "aaaaaaaa-0000-0000-0000-000000000006";     // 租戶層己：R4 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
@@ -26,6 +29,9 @@ const sql = (q: string): string => raw(q, { db: "cbfc_dev" });
 async function login(userId: string): Promise<string> {
   const r = await fetch(`${API}/login?u=${userId}&t=${T1}`, { redirect: "manual" });
   return (r.headers.get("set-cookie") ?? "").split(";")[0];
+}
+async function getStatus(cookie: string, path: string): Promise<number> {
+  return (await fetch(`${API}${path}`, { headers: { cookie }, redirect: "manual" })).status;
 }
 async function post(cookie: string, path: string, fields: Record<string, string>): Promise<number> {
   const r = await fetch(`${API}${path}`, { method: "POST", redirect: "manual",
@@ -96,6 +102,42 @@ try {
     await post(staff, "/b04/map", { batch: B1, source_code: srcCode, target: accountId(tgtCode) });
   check("依人工映射表建立 15 條草稿",
     sql(`SELECT count(*) FROM mapping_rule WHERE engagement_id='${ENG_A}' AND approved_at IS NULL`) === "15");
+
+  // ── §24.6 逐動作授權（本刀凍結的白名單，一律案件層） ──
+  // 舊萬用守衛只問「有沒有被指派這個案件」，於是六個動作共用同一份授權，
+  // 而且用的是「案件層 ∪ 租戶層」聯集。以下逐一證明兩者都被封住。
+  const ops = await login(U_OPS);
+  const tax = await login(U_TAX);
+  const tr4 = await login(U_TR4);
+  const preReady = Number(sql(`SELECT count(*) FROM audit_event
+                                WHERE event_type='mapping.review_ready'`));
+  check("前置成立：戊持有本案件 R1、丁持有租戶層 R6、己持有租戶層 R4（皆非案件層 R2）",
+    sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TAX}' AND role='R1'
+          AND engagement_id='${ENG_A}'`) === "1"
+    && sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_OPS}' AND role='R6'
+          AND engagement_id IS NULL`) === "1"
+    && sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR4}' AND role='R4'
+          AND engagement_id IS NULL`) === "1");
+
+  // /b04/submit：先前完全沒有角色檢查——任何被指派者、甚至租戶層角色都能送出映射覆核
+  check("/b04/submit 需案件層 R2：R1 → 403",  await post(tax, "/b04/submit", { batch: B1 }) === 403);
+  check("/b04/submit 需案件層 R2：R6 → 403",  await post(ops, "/b04/submit", { batch: B1 }) === 403);
+  check("/b04/submit 需案件層 R2：租戶層 R4 → 403", await post(tr4, "/b04/submit", { batch: B1 }) === 403);
+  check("三次越權送覆核都未產生 mapping.review_ready",
+    Number(sql(`SELECT count(*) FROM audit_event WHERE event_type='mapping.review_ready'`)) === preReady);
+  check("/b04/approve 需案件層 R4：租戶層 R4 → 403",
+    await post(tr4, "/b04/approve", { batch: B1,
+      rule: sql(`SELECT mapping_rule_id FROM mapping_rule WHERE approved_at IS NULL LIMIT 1`) }) === 403);
+  check("/b04/map 需案件層 R2／R7：租戶層 R4 與 R1 皆 → 403",
+    await post(tr4, "/b04/map", { batch: B1, source_code: "999", target: accountId("6602") }) === 403
+    && await post(tax, "/b04/map", { batch: B1, source_code: "999", target: accountId("6602") }) === 403);
+  check("R6 不得開啟完整 B-04 或預覽（畫面混有調整與計算入口）",
+    await getStatus(ops, `/b04?batch=${B1}`) === 403
+    && await getStatus(ops, `/b04/preview?batch=${B1}`) === 403);
+  check("拒絕的 CVA 分開記錄 engagement_roles 與 tenant_roles",
+    sql(`SELECT (payload->>'engagement_roles')||'|'||(payload->>'tenant_roles')
+           FROM audit_event WHERE event_type='b04.preview.denied'
+          ORDER BY audit_event_id DESC LIMIT 1`) === '[]|["R6"]');
 
   // SOD：建立者不得批准自己；R4 才可批准
   const draftIds = sql(`SELECT mapping_rule_id FROM mapping_rule
