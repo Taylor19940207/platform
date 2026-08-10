@@ -1,8 +1,10 @@
 # SLICE-M3-02　折算與外幣報表折算差額（CTA）
 
-> 狀態：**事前契約 第三版（走查兩輪修訂後）**。會計算式與 Case-001 算例已於第二版
-> 走查通過（保留盈餘延續橋接、CTA 97,159.00 借方、100,380.00 首次轉換輸入）；
-> 第三版只封工程語意：**一筆科目對多筆歷史來源、版本集合、主檔凍結、CTA 幣別落點**。
+> 狀態：**APPROVED_FOR_IMPLEMENTATION**（2026-08-11，第四版收口後批准）。
+> 會計算式與 Case-001 算例於第二版走查通過（保留盈餘延續橋接、CTA 97,159.00 借方、
+> 100,380.00 首次轉換輸入），第三版封工程語意，第四版寫死四個實作前細節
+> （Currency 入 manifest、合計約束的執行時點、PRIOR_RUN 的狀態條件、
+> lot set 的版本方向）並裁決匯率的自然人 SoD。**契約至此凍結，開始 migration。**
 > 風險：**第一級**。
 >
 > 對應基線：手冊 v1.2 REQ-FX-001／AC-FX-001／§20 MVP 3；設計書 v1.1 §25.3、§26.6、
@@ -32,6 +34,9 @@
 - 與 `posting_layer` 同性質：**平台參照主檔**，`app_runtime` **唯讀**（只 GRANT SELECT）。
   不屬任何租戶，不做 RLS。
 - 金額精度一律讀 `minor_unit`，**不得**在程式裡寫死幣別與位數的對應。
+- **`minor_unit` 必須被 run 凍結**（manifest 條目 `currency_definition`，見 §6.2）。
+  只凍結幣別*指派*而不凍結幣別*定義*，CNY 由 2 位改成 0 位時舊 run 的重演就會漂移。
+  **折算函式一律讀 manifest 的凍結值，重演時不得回查目前的 `currency` 表。**
 
 ### 1.2 `ReportingUnitCurrencyAssignment`（INV-22／D-26-06）
 
@@ -64,9 +69,19 @@
 退回（`SUBMITTED`／`REVIEWED → DRAFT`）保留，退回理由必填。
 改率＝發新版本，既有 run 仍指向舊版本。
 
-> **待決（不阻塞 migration）**：是否比照調整鏈要求「提交／覆核／批准為三個不同**自然人**」。
-> §24.6 只指定角色，未指定自然人；本刀**先只實作角色層**，若要加自然人層 SoD 屬另一個
-> 明示決定，不在此默默加上。
+**自然人層 SoD（裁決：最低限度的獨立覆核，不要求三人）**
+
+    submitted_by ≠ reviewed_by      強制（穩定代碼 FX_RATE_SELF_REVIEW_DENIED）
+    reviewed_by  = approved_by      允許
+    created_by   = submitted_by     允許
+
+甲可建立並提交匯率版本，乙必須獨立覆核；乙若同時持有 R4，可接著批准。
+**兩人即可運作**，同時避免一個人從提交、覆核一路自簽。這是**實例級**控制——
+不禁止同一自然人持有多個角色，只禁止同一自然人在同一版本上同時提交與覆核。
+要求三個不同自然人會讓 2～3 人的事務所無法運作。
+
+此為**本切片的嚴格子集**（比 §24.6 的角色矩陣多一條實例級限制），已登記
+`docs/BACKLOG.md`，日後併回正式基線時再統一。
 
 ### 2.2 報價方向與期間語意
 
@@ -140,7 +155,8 @@ ASSET／LIABILITY／EQUITY 也**分不出實收資本、保留盈餘、股利分
 
     EquityTranslationLotSetVersion            每個科目一次批准一個完整 set
     ├─ account_id / reporting_unit_id
-    ├─ set_version / superseded_by
+    ├─ series_id / version_no                 同一科目的版本序列
+    ├─ supersedes_set_version_id              **新版本向後指向舊版本**
     ├─ approved_by / approved_at
     └─ EquityTranslationLot［］
        ├─ event_date                          出資／權益變動日期
@@ -153,7 +169,11 @@ ASSET／LIABILITY／EQUITY 也**分不出實收資本、保留盈餘、股利分
   餘額與合計。差一塊錢就代表有一次出資沒被記錄，其歷史匯率也就沒被使用——
   那筆差額會被靜默吸收進 CTA。
 - **run 凍結的是 `set_version`**（manifest 的 `object_id` 指向它），不是個別 lot。
-- `APPROVED` 後 set 不可變；增減出資＝發新 set version。
+- `APPROVED` 後 set **完全不可變**——因此**不使用向前的 `superseded_by`**：
+  填入該欄本身就是在修改已批准的舊列，與「不可變」直接矛盾。
+  建立 v2 時由 **v2 指向 v1**（`supersedes_set_version_id`），v1 一個位元都不動。
+  同一 `series_id` 內 `version_no` 唯一且遞增；`supersedes_set_version_id` 必須指向
+  同一 series 的前一版；**同一科目同一時點只有一個未被指向的最新版本**。
 
 ### 3.4 保留盈餘：延續橋接，不是「餘額 × 某率」
 
@@ -172,14 +192,28 @@ ASSET／LIABILITY／EQUITY 也**分不出實收資本、保留盈餘、股利分
 
       source_kind = PRIOR_RUN | FIRST_CONVERSION
 
-      PRIOR_RUN         → source_calculation_run_id 必填，且該 run 必須是
-                          前期已鎖定（LOCKED）的 run
+      PRIOR_RUN         → source_calculation_run_id 必填，且必須同時滿足：
+                          ① 該 run 的 status = COMPLETED
+                             （CalculationRun **沒有** LOCKED 狀態，鎖定屬期間）
+                          ② 該 run 的 PeriodRevision.status = LOCKED
+                          ③ 該 PeriodRevision 屬目前期間的**顯式前期**
+                          ④ ReportingUnit、Account 與報告幣三者相同
       FIRST_CONVERSION  → evidence_ref 必填（經批准的外部證據）
 
   **後續期間必須引用前期已鎖定的 run**；只有首次導入能用經批准的外部證據。
   否則每期都可以人工填一個數，形式上批准、實際上沒有延續——那正是「延續橋接」
-  最容易退化成的樣子。以 CHECK 強制 XOR，並在 run 建立時驗證 `PRIOR_RUN` 所引用的
-  run 確實屬於前一期且已鎖定（`FX_OPENING_EQUITY_NOT_CONTINUOUS:`）。
+  最容易退化成的樣子。以 CHECK 強制 XOR，四項條件任一不成立即
+  `FX_OPENING_EQUITY_NOT_CONTINUOUS:`。
+- **「前期」必須由顯式期間連結判定**，不得用日期減一或 `revision_no` 推導——
+  期間可跳號、可有非標準長度，推導出來的「前期」在跨年度或補期時會指錯。
+  現況 `reporting_period` **沒有**這個連結，因此本刀新增：
+
+      reporting_period.previous_reporting_period_id   可為 NULL（首期）
+
+  約束：必須屬**同一 `reporting_unit_id` ＋ `fiscal_calendar_id`**；不得指向自己；
+  一個期間**至多被一個**後期指向（唯一索引，避免兩期共用同一前期）；
+  設定後不可變更（與 `is_initial_period` 同性質的身分事實）。
+  `is_initial_period = true` 者該欄必須為 NULL，反之必須非 NULL。
 - 缺失 → `FX_OPENING_EQUITY_MISSING:`，拒絕整個 run。
 - 首次導入的期初橋接**方法**（REQ-PER-101）不在本刀——本刀只要求那個值存在且經批准。
 
@@ -289,9 +323,14 @@ AC-FX-001 的「重跑結果一致」就只是碰巧成立。折算計算**在 D
 | `OPENING_TRANSLATED_BALANCE` | 保留盈餘延續橋接 | **必為 NULL** |
 | `CTA_RESIDUAL` | CTA 殘差 | **必為 NULL** |
 
-- **完整性約束（DB 強制）**：同一 `TranslationResult` 的所有 component 的
-  `result_debit`／`result_credit` 合計必須等於彙總的 `result_debit`／`result_credit`；
-  `source_debit`／`source_credit` 亦然。差額不得存在——那就是無法追溯的金額。
+- **完整性約束（DB 強制，`DEFERRABLE INITIALLY DEFERRED`）**：同一 `TranslationResult`
+  的所有 component 的 `result_debit`／`result_credit` 合計必須等於彙總的
+  `result_debit`／`result_credit`；`source_debit`／`source_credit` 亦然。
+  差額不得存在——那就是無法追溯的金額。
+  **執行時點必須寫死**：彙總先建立、component 後插入，普通 row trigger 在第一筆
+  component 時必然不平。因此以 `CREATE CONSTRAINT TRIGGER … DEFERRABLE INITIALLY
+  DEFERRED` 在**交易結束前**檢查。**不得**依賴應用層或 worker「記得最後再檢查一次」——
+  忘記檢查與檢查失敗看起來一模一樣，而前者會留下無法追溯的金額。
 - 一般科目與損益也各有**一個** component，追溯模型因此完全一致：
   「彙總怎麼來的」永遠答得出來，而不是只有權益科目答得出來。
 - **INV-19**：`(source_snapshot_line_id, amount_role)` 唯一索引，落在彙總層。
@@ -304,6 +343,7 @@ AC-FX-001 的「重跑結果一致」就只是碰巧成立。折算計算**在 D
 `(object_type, object_id, domain_version_kind, domain_version_value, content_hash)`
 結構，因此只需新增 `object_type`：
 
+    currency_definition                   幣別定義（currency_code ＋ minor_unit）
     exchange_rate_version                 匯率版本
     translation_policy_version            折算政策版本（含 CTA 科目凍結）
     currency_assignment                   幣別角色指派（FUNCTIONAL 與 REPORTING 各一筆）
@@ -318,6 +358,9 @@ AC-FX-001 的「重跑結果一致」就只是碰巧成立。折算計算**在 D
   `IN ('NO_FX','FX_TRANSLATION')`（**該欄在 manifest 上，不在 `calculation_run`**）。
 - `frozen_set_content_hash` 與 `result_content_hash` 涵蓋新條目；兩者仍**排除**
   run_id 與時間戳（0012 已凍結的規則）。
+- **重演一律讀 manifest 的凍結值**，不得回查目前的主檔（`currency`、`account`、
+  `exchange_rate_observation` 皆同）。這是 §6.3 與 `currency_definition` 存在的理由：
+  凍結了卻在重演時回查，等於沒有凍結。
 - **重演**沿用 02B：新 run 帶 `replay_of_run_id` 引用**同一份 Manifest**，失敗屬
   replay run，原 run 永不修改。
 
@@ -424,10 +467,18 @@ TB，借貸各 59,000,000）。功能幣 JPY、報告幣 CNY。匯率版本 `202
    `REPORTING` 同樣拒絕。
 2. **INV-22 (b)**：Manifest 含 `currency_assignment` 兩筆；指派其後變更不影響既有 run 的
    重演結果。
-3. **`Currency` 主檔**：`app_runtime` 對 `currency` 只有 SELECT；精度取自 `minor_unit`
-   （反證：把 CNY 的 `minor_unit` 改為 0 → 算例金額必須跟著變，證明沒有寫死）。
+3. **`Currency` 主檔**：`app_runtime` 對 `currency` 只有 SELECT；精度取自 `minor_unit`，
+   未寫死於程式。
+3A. **`minor_unit` 的凍結（兩條缺一不可）**：
+   (a) 建立 run 後把 CNY 的 `minor_unit` 改為 0，**舊 run 重演仍用 manifest 的 2 位**，
+       `result_content_hash` 不變；
+   (b) 之後建立的**新 run** 使用改後的 0 位，結果**跟著改變**。
+   反證：折算函式改成重演時回查目前 `currency` 表 → (a) 轉紅。
 4. **匯率四狀態**：`DRAFT → SUBMITTED` 後不得增刪觀測；`REVIEWED` 的
    `reviewed_by/at` 不可覆寫；`APPROVED` 後整版不可變；角色不符者被拒。
+4A. **匯率自然人 SoD**：`submitted_by = reviewed_by` → 拒絕，代碼
+   `FX_RATE_SELF_REVIEW_DENIED`；`reviewed_by = approved_by` **必須允許**
+   （反證：把它一併禁掉 → 兩人事務所路徑轉紅）。
 5. **G-07**：`FX_TRANSLATION` run 未指定或匯率版本未 `APPROVED` → **建立即拒絕**、
    不產生任何 run 與預覽；`NO_FX` run 不受影響。
 6. **缺率 fail closed**：缺一筆 `HISTORICAL` → 整個 run 拒絕並列出缺哪一筆。
@@ -441,9 +492,16 @@ TB，借貸各 59,000,000）。功能幣 JPY、報告幣 CNY。匯率版本 `202
     → 算例轉紅（CTA 不再是 97,159.00）。
 11. **lot set 合計一致**：把一筆 lot 的 `functional_amount` 改小 →
     `EQUITY_LOT_SUM_MISMATCH:` 拒絕整個 run，**不得**把差額靜默併入 CTA。
-12. **期初已折算餘額的來源**：`PRIOR_RUN` 但引用的 run 不屬前期或未鎖定 →
-    `FX_OPENING_EQUITY_NOT_CONTINUOUS:`；缺失 → `FX_OPENING_EQUITY_MISSING:`；
+11A. **lot set 版本方向**：建立 v2 後 v1 **逐欄位未變**（含 hash）；
+    對已 `APPROVED` 的 set 或其 lots 做任何 UPDATE → DB 拒絕。
+12. **期初已折算餘額的來源**（四項條件各一條負面測試）：run 非 `COMPLETED`／
+    其 PeriodRevision 非 `LOCKED`／非目前期間的顯式前期／單位或科目或報告幣不同
+    → 皆 `FX_OPENING_EQUITY_NOT_CONTINUOUS:`；缺失 → `FX_OPENING_EQUITY_MISSING:`；
     `FIRST_CONVERSION` 缺 `evidence_ref` → 拒絕。
+12A. **顯式前期連結**：`previous_reporting_period_id` 跨單位或跨曆別 → 拒絕；
+    指向自己 → 拒絕；兩個期間指向同一前期 → 拒絕；設定後變更 → 拒絕；
+    `is_initial_period = true` 卻有前期（或反之）→ 拒絕。
+    **反證：把前期改成「用 end_date 減一期推導」→ 12A 的跨曆別案例轉紅。**
 13. **算例**：§七逐科目 12/12 相符；**CTA ＝ 97,159.00 且在借方**；
     RE 勾稽 100,380.00 ＋ 273,315.00 ＝ 373,695.00。
 14. **CTA 的產生方式**：**CTA 必須由報告幣下已捨入的借貸合計差額產生；
@@ -453,7 +511,9 @@ TB，借貸各 59,000,000）。功能幣 JPY、報告幣 CNY。匯率版本 `202
     的 `debit` → 功能幣合計檢查轉紅。
 16. **CTA 落點科目**：`cta_account_id` 不屬於本案件集團科目表 → 拒絕；
     政策版本未凍結 CTA 科目 → 拒絕。
-17. **彙總與明細一致**：component 合計 ≠ 彙總 → DB 拒絕；
+17. **彙總與明細一致**：component 合計 ≠ 彙總 → **交易 COMMIT 時**拒絕
+    （`DEFERRABLE INITIALLY DEFERRED`；且必須驗證「彙總已存在、component 尚未插完」
+    的中間狀態**不會**誤擋）；
     4001 的彙總必須恰有兩個 `EQUITY_LOT` component，
     `OPENING_TRANSLATED_BALANCE` 與 `CTA_RESIDUAL` 的 component
     帶匯率觀測 → 拒絕。
@@ -484,9 +544,10 @@ TB，借貸各 59,000,000）。功能幣 JPY、報告幣 CNY。匯率版本 `202
    緩解：§6.3 只新增獨立條目，驗收 22 以既有 33＋31 條斷言不改為判準。
 
 實作順序（契約確認後）：
-migration（`Currency` → 幣別指派 → 匯率版本／觀測四狀態 → `translation_category` →
-政策版本＋CTA 科目 → 權益 lot set version → 期初已折算餘額 →
-`TranslationAdjustmentEntry`／Line → `TranslationResult`＋Component →
+migration（`Currency` → 幣別指派 → `reporting_period.previous_reporting_period_id`
+→ 匯率版本／觀測四狀態＋自然人 SoD → `translation_category` →
+政策版本＋CTA 科目 → 權益 lot set version（`supersedes` 向後指）→ 期初已折算餘額 →
+`TranslationAdjustmentEntry`／Line → `TranslationResult`＋Component＋deferred 合計約束 →
 manifest 新條目與 `calculation_scope` 放寬 → `balance_snapshot_line` 的 CHECK）
-→ DB 負面測試（1～12、15～19）→ 折算函式（DB 內 `numeric`）
-→ 算例驗收（13／14／20／21）→ `NO_FX` 回歸（22）→ 完整一輪（23）。**畫面不在本刀。**
+→ DB 負面測試（1～12A、15～19）→ 折算函式（DB 內 `numeric`，一律讀 manifest 凍結值）
+→ 算例驗收（3A／13／14／20／21）→ `NO_FX` 回歸（22）→ 完整一輪（23）。**畫面不在本刀。**
