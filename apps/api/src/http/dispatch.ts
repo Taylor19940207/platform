@@ -11,6 +11,7 @@ import * as imports from "../modules/imports/routes.ts";
 import * as mappings from "../modules/mappings/routes.ts";
 import * as calculations from "../modules/calculations/routes.ts";
 import * as evidence from "../modules/evidence/routes.ts";
+import * as identities from "../modules/identities/routes.ts";
 
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
@@ -30,6 +31,8 @@ const ROUTES: Record<string, RouteHandler> = {
   "GET /b07/package": evidence.packageView,
   "GET /b07": evidence.list,
   "GET /b07/download": evidence.download,
+  "GET /b03/identity": identities.identityView,
+  "POST /b03/identity/confirm": identities.identityConfirm,
   "POST /b05/create": adjustments.create,
   "GET /b05": adjustments.view,
   "POST /b05/save": adjustments.save,

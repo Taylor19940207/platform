@@ -10,6 +10,7 @@ const U_JIA = "aaaaaaaa-0000-0000-0000-000000000001";    // 職員甲：R2＋R3�
 const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";     // 資深乙：R2＋R3＋R4
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";   // 經理丙：僅 R4
 const U_DING = "aaaaaaaa-0000-0000-0000-000000000004";   // 系管丁：R6（租戶層，engagement NULL）
+const U_TR2 = "aaaaaaaa-0000-0000-0000-000000000008";    // 租戶層辛：R2 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
@@ -149,6 +150,27 @@ try {
   const cvaView0 = cva("identity.view.denied");
   check("R6 丁：直開確認頁 → 403", await getStatus(ding, `/b03/identity?batch=${BU}`) === 403);
   check("R6 丁：確認頁拒絕寫入 CVA", cva("identity.view.denied") === cvaView0 + 1);
+  // 作用域：R2 在 B-03 白名單內，但租戶層指派不得取得客戶工作資料（§26.3）。
+  // 辛是「種類正確、範圍錯誤」的樣本——丁（R6）連白名單都不在，釘不住作用域。
+  const tr2 = await login(U_TR2);
+  check("前置成立：辛持 R2 且該指派 engagement_id IS NULL、無任何案件層指派",
+    sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR2}' AND role='R2'
+          AND engagement_id IS NULL AND revoked_at IS NULL`) === "1"
+    && sql(`SELECT count(*) FROM role_assignment WHERE user_id='${U_TR2}'
+          AND engagement_id IS NOT NULL`) === "0");
+  const resBefore = Number(sql("SELECT count(*) FROM source_identity_resolution"));
+  check("租戶層 R2：GET 確認頁與 POST 確認皆 403",
+    await getStatus(tr2, `/b03/identity?batch=${BU}`) === 403
+    && await post(tr2, "/b03/identity/confirm",
+         { batch: BU, assessment_id: sql(`SELECT current_identity_assessment_id FROM import_batch
+                                           WHERE import_batch_id='${BU}'`),
+           reason: "越權確認" }) === 403);
+  check("越權未新增任何 Resolution",
+    Number(sql("SELECT count(*) FROM source_identity_resolution")) === resBefore);
+  check("拒絕的 CVA 分開記錄 engagement_roles 與 tenant_roles",
+    sql(`SELECT (payload->>'engagement_roles')||'|'||(payload->>'tenant_roles')
+           FROM audit_event WHERE event_type='identity.confirm.denied'
+          ORDER BY audit_event_id DESC LIMIT 1`) === '[]|["R2"]');
 
   // ── B-03 確認頁內容（決策 4） ──
   const AID = sql(`SELECT current_identity_assessment_id FROM import_batch WHERE import_batch_id='${BU}'`);
