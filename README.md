@@ -32,7 +32,7 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 58 ＋ DB 整合 357 ＋ 端到端驗收 349（里程碑 1 之 27 ＋ 映射 40 ＋ 調整 75 ＋ 工作可靠性 29 ＋ 計算執行 30 ＋ 證據包 31 ＋ 工作台身分確認 64 ＋ 期間生命週期 37 ＋ 多基礎 16），共 764 條
+pnpm test          # 單元 66 ＋ DB 整合 363 ＋ 端到端驗收 364（里程碑 1 之 27 ＋ 映射 40 ＋ 調整 89 ＋ 工作可靠性 29 ＋ 計算執行 33 ＋ 證據包 31 ＋ 工作台身分確認 64 ＋ 期間生命週期 37 ＋ 多基礎 16），共 793 條
 pnpm test:quick    # 單元＋DB 整合（約 48 秒）——日常改 DB 守衛時跑這個
 pnpm test:db:basis # 只跑一個領域（mapping／adjustment／period／basis，各約 10～15 秒）
 pnpm test:timing   # 逐 suite 耗時，決定要優化什麼之前先量
@@ -55,7 +55,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 
 ## 現況
 
-- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋24 份 migration（可從零重建）
+- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋27 份 migration（可從零重建）
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）

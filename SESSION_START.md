@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、二十四份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、二十七份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -45,8 +45,20 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 
 里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05`／`M2-06`
 均已完成並關閉。
-現有 24 份 migration；完整實跑結果為 **764/764**（單元 58、DB 整合 357、端到端 349），
-最新一輪全綠（HEAD `2e19c9b`，已 push）。
+現有 27 份 migration；完整實跑結果為 **793/793**（單元 66、DB 整合 363、端到端 364），
+最新一輪全綠（HEAD `46772ff`，已 push）。
+
+## 🏁 里程碑 2 已完成（2026-08-10 離開複核通過）
+
+複核報告：`docs/reviews/MILESTONE-2_EXIT_REVIEW_2026-08-10.md`。
+前次盤點的五個阻擋項全部關閉，各有**反證過**的負面測試；期間另封閉六類既有
+授權／歸屬缺口。MVP 1 與 MVP 2 的離開條件六句全部成立。
+
+**三項已知限制標為 ACCEPTED_DEVIATION，不得寫成完成**——三者方向一致：
+現行行為都**比目標更嚴**，不存在「已放行但未驗證」的資料。
+1. `CalendarUsage` 未落地，首期唯一約束暫時較寬（不分用途）。
+2. R5／R7／R8 的授權範圍物件未完成，讀取白名單採嚴格子集 R2／R3／R4。
+3. `AMENDED` 取代鏈未完成，寫入即 fail closed。
 
 `SLICE-M2-04` 的關閉收口為 **0021**：映射來源批次必須為 `ACCEPTED`——未經接受的批次
 （含 QUARANTINED）不得成為正式映射的來源脈絡。DB 以 `FOR UPDATE` 鎖住來源批次列消除
@@ -93,13 +105,13 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 764 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 793 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis 各自單跑（自行重建 DB 並補齊前置） | 9～15 秒 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
-| `pnpm test`（＝`test:full`） | 完整 764 條 | **約 4～5 分鐘** |
+| `pnpm test`（＝`test:full`） | 完整 793 條 | **約 5 分鐘** |
 | `pnpm test:acceptance:<suite>` | 九支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
@@ -133,8 +145,10 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   §25.8 完整狀態機、DB 唯一裁決點、fail closed 穩定代碼）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-06.md`（多基礎與四類規則最小
   資料模型、0023、審查節奏決議）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-10_ROUTE-SERVICE.md`（**最新接續入口**：
-  API 模組化拆層、六類授權缺口封閉、0024、測試分級）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-10_ROUTE-SERVICE.md`（API 模組化拆層、
+  六類授權缺口封閉、0024、測試分級）
+- `docs/reviews/MILESTONE-2_EXIT_REVIEW_2026-08-10.md`（**最新接續入口**：
+  里程碑 2 離開複核通過；PASS／ACCEPTED_DEVIATION／DEFERRED 逐條判定）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -185,17 +199,16 @@ DB 為唯一裁決點（`app_runtime` 對 `period_revision` 只餘 INSERT／SELE
 （`AMENDED_NOT_IMPLEMENTED:`、`INV24_THRESHOLD_NOT_IMPLEMENTED:`、
 `AUTO_POST_NOT_IMPLEMENTED:`、`RECON_RUN_PREDATES_BASIS_MODEL:`）。
 
-下一刀：**自動保存、儲存狀態與 Session 恢復**（NFR-UX-001／NFR-INT-002）——
-**這是里程碑 2 離開盤點的最後一個阻擋項**，完成後即可重跑離開複核。
+下一刀：**SLICE-M3-01 B-02 期間工作台**（`docs/slices/SLICE-M3-01_期間工作台.md`）。
 
-範圍限定在 **B-05 Adjustment 草稿**，不做全平台通用編輯框架：
-dirty 時 5 秒內嘗試自動保存；blur、切換案件、送覆核、Session 到期前立即保存；
-畫面顯示「未保存／保存中／已保存／保存失敗／版本衝突」；
-`object_version` ＋ `edit_session_id` ＋ `client_save_sequence`（§26.9 三層版本語意）；
-已獲伺服器確認的草稿不得遺失；**不使用 IndexedDB／localStorage 保存客戶財務內容**；
-Session 恢復後回到原案件、期間與 Adjustment；兩個分頁衝突不得互相覆蓋；
-PREVIEW run 繼續只讀 manifest 凍結內容。
-Adjustment 驗證完成後，再把同一套能力擴到映射草稿。
+為什麼不是折算：基線的 MVP 3 是折算與對帳，但它屬**第一級風險**（幣別、金額精度、
+CTA 必須物化、匯率版本凍結），依節奏需要較完整的事前契約。而期間狀態機（0022）
+是「能力完整、入口缺席」——13 個狀態與全部守衛就緒，使用者卻只能用
+`POST /period/transition` 打它。補上畫面，整條流程才第一次以**期間**串起來，
+而且不新增任何控制面。折算緊接其後，屆時寫較完整的事前契約。
+
+期間工作台唯一的實質風險是**在畫面層重寫一份遷移表**——「下一步」必須由 DB 的
+同一份事實推導，切片驗收第 2 與第 7 條就是為了釘住這一點。
 
 **不要再做結構重構**——拆層已於 2e19c9b 結束，server.ts 54 行已達目標，
 不得為了行數繼續拆。
