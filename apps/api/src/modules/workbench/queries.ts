@@ -162,3 +162,24 @@ export const uploadOptions = (s: Session, sc: Scope) => {
       ORDER BY u.display_name`, {}, { tenantId: s.tenantId });
   return { eng, entities, periods, providers };
 };
+
+/**
+ * B-02 入口清單。可見範圍與 B-02 的授權**同一組角色**（案件層 R2／R3／R4）——
+ * 用比 B-02 寬的角色列出期間，等於在 B-00 洩漏 B-02 擋掉的東西。
+ * R1 不列（§24.6 註③：只看自身提交狀態，非期間全貌）。
+ */
+export interface PeriodRow {
+  period_revision_id: string; client: string; unit: string;
+  period_label: string; status: string; revision_no: string;
+}
+export const periods = (s: Session, sc: Scope): PeriodRow[] =>
+  query<PeriodRow>(
+    `SELECT pr.period_revision_id, ce.name AS client, ru.name AS unit,
+            rp.label AS period_label, pr.status, pr.revision_no::text
+       FROM period_revision pr
+       JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
+       JOIN client_engagement ce ON ce.engagement_id = rp.engagement_id
+       JOIN reporting_unit ru ON ru.reporting_unit_id = rp.reporting_unit_id
+      WHERE rp.engagement_id IN (${engIn(sc, "R2", "R3", "R4")})
+      ORDER BY ce.name, ru.name, rp.start_date DESC`,
+    {}, { tenantId: s.tenantId });

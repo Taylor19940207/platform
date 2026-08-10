@@ -20,7 +20,7 @@
     "test:db:adjustment": "bash tests/integration/db/adjustment.test.sh",
     "test:db:period": "bash tests/integration/db/period.test.sh",
     "test:db:basis": "bash tests/integration/db/basis.test.sh",
-    "test:acceptance": "node tests/acceptance/milestone1.test.ts && node tests/acceptance/mapping-slice.test.ts && node tests/acceptance/adjustment-slice.test.ts && node tests/acceptance/job-reliability.test.ts && node tests/acceptance/calculation-run.test.ts && node tests/acceptance/evidence-package.test.ts && node tests/acceptance/workbench-identity.test.ts && node tests/acceptance/period-lifecycle.test.ts && node tests/acceptance/multi-basis.test.ts",
+    "test:acceptance": "node tests/acceptance/milestone1.test.ts && node tests/acceptance/mapping-slice.test.ts && node tests/acceptance/adjustment-slice.test.ts && node tests/acceptance/job-reliability.test.ts && node tests/acceptance/calculation-run.test.ts && node tests/acceptance/evidence-package.test.ts && node tests/acceptance/workbench-identity.test.ts && node tests/acceptance/period-lifecycle.test.ts && node tests/acceptance/multi-basis.test.ts && node tests/acceptance/period-workbench.test.ts",
     "test:acceptance:milestone1": "node tests/acceptance/milestone1.test.ts",
     "test:acceptance:mapping-slice": "node tests/acceptance/mapping-slice.test.ts",
     "test:acceptance:adjustment-slice": "node tests/acceptance/adjustment-slice.test.ts",
@@ -30,7 +30,8 @@
     "test:acceptance:evidence-package": "node tests/acceptance/evidence-package.test.ts",
     "test:acceptance:workbench-identity": "node tests/acceptance/workbench-identity.test.ts",
     "test:acceptance:period-lifecycle": "node tests/acceptance/period-lifecycle.test.ts",
-    "test:acceptance:multi-basis": "node tests/acceptance/multi-basis.test.ts"
+    "test:acceptance:multi-basis": "node tests/acceptance/multi-basis.test.ts",
+    "test:acceptance:period-workbench": "node tests/acceptance/period-workbench.test.ts"
   },
   "packageManager": "pnpm@10.28.0",
   "engines": {

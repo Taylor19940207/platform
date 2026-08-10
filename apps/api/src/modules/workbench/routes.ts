@@ -18,6 +18,7 @@ export async function home(ctx: AuthenticatedContext, send: Respond): Promise<vo
   const qDraftMap = q.draftMappings(s, sc);
   const batches = q.batches(s, sc);
   const opt = q.uploadOptions(s, sc);
+  const periods = q.periods(s, sc);
 
   return send(200, page("B-00 個人工作台",
     `<span>畫面 <b>B-00 個人工作台</b></span><span>使用者 <b>${esc(s.userId.slice(-4))}</b></span>`,
@@ -47,6 +48,13 @@ export async function home(ctx: AuthenticatedContext, send: Respond): Promise<vo
             : `<span class="note">—（無來源批次脈絡）</span>`}</td></tr>`),
       ], qDraftAdj.length + qDraftMap.length)}
      ${uploadForm(opt)}
+     ${periods.length ? `<h2>期間</h2>
+     <table><tr><th>客戶</th><th>單位</th><th>期間</th><th>狀態</th><th></th></tr>
+     ${periods.map((p) => `<tr><td>${esc(p.client)}</td><td>${esc(p.unit)}</td>
+       <td>${esc(p.period_label)}（rev ${esc(p.revision_no)}）</td>
+       <td><span class="badge st-${esc(p.status)}">${esc(p.status)}</span></td>
+       <td><a href="/b02?revision=${p.period_revision_id}">開啟 B-02</a></td></tr>`).join("")}
+     </table>` : ""}
      <h2>批次狀態</h2>
      <table><tr><th>客戶</th><th>法人</th><th>期間</th><th>狀態</th><th>身分比對</th><th>檔案</th><th>說明</th><th>動作</th></tr>
      ${batches.map((b) => `<tr><td>${esc(b.client)}</td><td>${esc(b.entity)}</td><td>${esc(b.period)}</td>

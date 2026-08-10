@@ -19,6 +19,7 @@ import * as admin from "../modules/admin/routes.ts";
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
 const ROUTES: Record<string, RouteHandler> = {
+  "GET /b02": periods.workbench,
   "POST /period/transition": periods.transition,
   "POST /b04/accept": imports.accept,
   "GET /b04": mappings.view,
