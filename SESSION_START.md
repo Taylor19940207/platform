@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、二十七份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、二十九份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -44,9 +44,9 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
 里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05`／`M2-06`
-均已完成並關閉。
-現有 27 份 migration；完整實跑結果為 **793/793**（單元 66、DB 整合 363、端到端 364），
-最新一輪全綠（HEAD `46772ff`，已 push）。
+均已完成並關閉；里程碑 3 的第一刀 **`SLICE-M3-01 B-02 期間工作台`亦已正式關閉**（2026-08-11）。
+現有 29 份 migration；完整實跑結果為 **858/858**（單元 66、DB 整合 365、端到端 427），
+最新一輪全綠（HEAD `4053404`，已 push）。
 
 ## 🏁 里程碑 2 已完成（2026-08-10 離開複核通過）
 
@@ -105,14 +105,14 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 793 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 858 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis 各自單跑（自行重建 DB 並補齊前置） | 9～15 秒 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
-| `pnpm test`（＝`test:full`） | 完整 793 條 | **約 5 分鐘** |
-| `pnpm test:acceptance:<suite>` | 九支端到端各自單跑 | 8～54 秒 |
+| `pnpm test`（＝`test:full`） | 完整 858 條 | **約 5～6 分鐘** |
+| `pnpm test:acceptance:<suite>` | 十支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
 完整一輪只在**切片收口與 push 前**跑。連續兩輪不機械套用：
@@ -147,8 +147,10 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   資料模型、0023、審查節奏決議）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-10_ROUTE-SERVICE.md`（API 模組化拆層、
   六類授權缺口封閉、0024、測試分級）
-- `docs/reviews/MILESTONE-2_EXIT_REVIEW_2026-08-10.md`（**最新接續入口**：
-  里程碑 2 離開複核通過；PASS／ACCEPTED_DEVIATION／DEFERRED 逐條判定）
+- `docs/reviews/MILESTONE-2_EXIT_REVIEW_2026-08-10.md`（里程碑 2 離開複核通過；
+  PASS／ACCEPTED_DEVIATION／DEFERRED 逐條判定）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-11_SLICE-M3-01.md`（**最新接續入口**：
+  B-02 期間工作台、0028 遷移規格函式、0029 角色作用域修補、折算前置）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -199,16 +201,41 @@ DB 為唯一裁決點（`app_runtime` 對 `period_revision` 只餘 INSERT／SELE
 （`AMENDED_NOT_IMPLEMENTED:`、`INV24_THRESHOLD_NOT_IMPLEMENTED:`、
 `AUTO_POST_NOT_IMPLEMENTED:`、`RECON_RUN_PREDATES_BASIS_MODEL:`）。
 
-下一刀：**SLICE-M3-01 B-02 期間工作台**（`docs/slices/SLICE-M3-01_期間工作台.md`）。
+## `SLICE-M3-01 B-02 期間工作台`已完成並關閉（2026-08-11）
 
-為什麼不是折算：基線的 MVP 3 是折算與對帳，但它屬**第一級風險**（幣別、金額精度、
-CTA 必須物化、匯率版本凍結），依節奏需要較完整的事前契約。而期間狀態機（0022）
-是「能力完整、入口缺席」——13 個狀態與全部守衛就緒，使用者卻只能用
-`POST /period/transition` 打它。補上畫面，整條流程才第一次以**期間**串起來，
-而且不新增任何控制面。折算緊接其後，屆時寫較完整的事前契約。
+切片文件：`docs/slices/SLICE-M3-01_期間工作台.md`。期間狀態機（0022）原本是
+「能力完整、入口缺席」——13 個狀態與全部守衛就緒，使用者卻只能用
+`POST /period/transition` 打它。本刀補上畫面，整條流程第一次以**期間**串起來。
 
-期間工作台唯一的實質風險是**在畫面層重寫一份遷移表**——「下一步」必須由 DB 的
-同一份事實推導，切片驗收第 2 與第 7 條就是為了釘住這一點。
+**0028　遷移規格的唯一可查詢來源**：`fn_period_transition_spec(from_status)` 唯讀，
+0022 的 trigger 改為呼叫它，B-02 讀同一份。不是新增控制，是換存放形式——既有期間
+測試（DB 29＋端到端 37）斷言一字未改全綠。`required_role` 對 `NOT_IMPLEMENTED` 的列
+一律 NULL：守衛未實作＝誰可發起也未決定，填角色會憑空發明規則，並讓角色檢查搶在
+fail closed 之前觸發。
+
+**授權**：完整 B-02 為案件層 R2／R3／R4。**R1 排除**——§24.6 註③限制「R1 僅看得到
+自身提交狀態，非期間全貌」；R1 維持 B-00 與上傳入口。B-00 補上 B-02 入口，可見範圍
+與 B-02 授權**同一組角色**（用比 B-02 寬的角色列期間，等於在 B-00 洩漏 B-02 擋掉的東西）。
+
+**0029　期間發起人的角色作用域**（走查後追加）：0022 起的角色驗證寫成
+`(ra.engagement_id IS NULL OR ra.engagement_id = v_eng)`，`IS NULL` 分支把租戶層
+指派當成對所有案件有效——畫面擋得住，DB 擋不住。改為嚴格相等（§26.3：遷移用的
+R2／R4 都屬 EngagementAssignment）。同時 `REVOKE ALL … FROM PUBLIC`：PostgreSQL 預設
+把新函式的 EXECUTE 授予 PUBLIC，0028 只寫了 GRANT，權限敘述與實況不符。
+
+**兩個可重用的教訓**：
+1. 實機走查抓到「首期的 SETUP → OPEN 按鈕可用、畫面卻印非首期不可用」——
+   **CONDITIONAL 只有條件成立時才該畫成不可用**。對可用功能謊稱不存在，
+   與把未實作畫成可點是同一種錯，只是方向相反。
+2. DB 整合套件會重建資料庫並重跑 migration，**直接改資料庫裡的函式做反證會假綠**；
+   反證必須改 migration 檔案本身。
+
+下一刀：**MVP 3 折算與對帳**（REQ-FX-001／REQ-CFS-001）。屬**第一級風險**，
+依既定節奏先寫事前契約、再寫 migration，**不先做畫面**。契約至少須凍結：
+幣別角色（`ReportingUnitCurrencyAssignment`，INV-22）、匯率版本（`ExchangeRate` ＋
+G-07 凍結）、折算方法（期末／期中／歷史）、金額精度與尾差（D-26-05／INV-24）、
+**CTA 顯式物化**（INV-20，不得由兩幣別相減推導）、`CalculationRun` 凍結集合與重演
+（AC-FX-001：同實體、期間、匯率版本重跑結果一致）。
 
 **不要再做結構重構**——拆層已於 2e19c9b 結束，server.ts 54 行已達目標，
 不得為了行數繼續拆。
