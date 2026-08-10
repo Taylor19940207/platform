@@ -30,16 +30,20 @@
  *   * 「已保存」只在**伺服器確認**後才顯示；前端不得自行宣告。
  */
 export const AUTOSAVE_WINDOW_MS = 5000;
+/** 強制送出上限。必須早於 W——W 量的是**確認**，送出得留出往返時間。 */
+export const AUTOSAVE_FORCE_MS = 2500;
 
 /** 瀏覽器端狀態機原始碼。單元測試直接在 vm 沙箱執行**這個字串**，不是它的副本。 */
 export const autosaveClientSource = `
 (function () {
-  var W = ${AUTOSAVE_WINDOW_MS};          // 確認新鮮度上限
+  var W = ${AUTOSAVE_WINDOW_MS};          // **伺服器確認**新鮮度上限
+  var FORCE = ${AUTOSAVE_FORCE_MS};          // 強制送出上限（須早於 W，留出往返時間）
   var f = document.getElementById("draft");
   if (!f) return;
   var st = document.getElementById("savestate"), note = document.getElementById("savenote");
   f.edit_session_id.value = crypto.randomUUID();   // 每個分頁一個編輯來源
   var seq = 0, gen = 0, savedGen = 0;
+  var dirtySince = 0;                              // 本輪 dirty 的起點（計時基準）
   var inflight = null, debounce = null, hardCap = null, slowTimer = null, backoff = null;
   var attempts = 0, halted = "";                   // halted：停止自動重送的原因
 
@@ -56,7 +60,21 @@ export const autosaveClientSource = `
     if (halted) return;
     if (debounce) clearTimeout(debounce);
     debounce = setTimeout(function () { debounce = null; save(); }, 800);
-    if (!hardCap) hardCap = setTimeout(function () { hardCap = null; save(); }, W);
+    if (!hardCap) {
+      // 強制送出早於確認上限：W 是**確認**的期限，送出必須留出往返時間，
+      // 否則持續輸入時「W 內送出」成立、但「W 內確認」永遠差一個 RTT。
+      dirtySince = Date.now();
+      hardCap = setTimeout(function () { hardCap = null; save(); }, FORCE);
+      // 延遲指示器自 dirty 起算，不是自 fetch 起算——使用者關心的是
+      // 「我改的東西多久沒進去」，不是「這個請求送了多久」。
+      if (slowTimer) clearTimeout(slowTimer);
+      slowTimer = setTimeout(function () {
+        slowTimer = null;
+        // halted（衝突／失效／失敗）已有更明確的狀態，不得被「儲存延遲」蓋掉
+        if (dirty() && !halted) show("UPLOADED", "儲存延遲",
+          "超過 " + (W / 1000) + " 秒未獲伺服器確認");
+      }, W);
+    }
   }
   function retryLater() {                          // 只有傳輸層失敗才退避重試
     attempts += 1;
@@ -74,10 +92,6 @@ export const autosaveClientSource = `
     seq += 1;
     f.client_save_sequence.value = String(seq);
     show("VALIDATING", "保存中");
-    slowTimer = setTimeout(function () {
-      slowTimer = null;
-      if (inflight) show("UPLOADED", "儲存延遲", "超過 " + (W / 1000) + " 秒未獲伺服器確認");
-    }, W);
     var body = new URLSearchParams(new FormData(f));
     body.set("mode", "auto");
     inflight = fetch("/b05/save", { method: "POST", body: body,
@@ -94,6 +108,7 @@ export const autosaveClientSource = `
           f.base_object_version.value = String(r.j.object_version);
           if (gen === sending) {
             savedGen = sending;
+            if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
             show("MATCHED", "已保存", "ov=" + r.j.object_version
               + (r.j.kind === "IDEMPOTENT_REPLAY" ? "（重送，已是最新）" : ""));
             return true;
@@ -108,9 +123,10 @@ export const autosaveClientSource = `
             "草稿已被他人或另一分頁更新；請重新載入後再編輯，系統不會靜默覆蓋");
           return false;
         }
-        if (r.j.kind === "IDEMPOTENCY_KEY_REUSED") {
-          show("UPLOADED", "未保存", "序號重用，改以新序號重送");
-          return false;                          // 序號已遞增，尾端補送即可
+        if (r.j.kind === "IDEMPOTENCY_KEY_REUSED" || r.j.kind === "STALE_SEQUENCE") {
+          // 兩者都代表**沒有被套用**——dirty 不得清除，以新序號補送
+          show("UPLOADED", "未保存", "序號問題，改以新序號重送");
+          return false;
         }
         halted = "FAILED";
         show("QUARANTINED", "保存失敗", r.j.kind || "");
@@ -123,7 +139,7 @@ export const autosaveClientSource = `
       })
       .then(function (ok) {
         inflight = null;
-        if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
+        if (ok && slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
         if (!ok && !halted && !backoff && dirty()) return save();
         return ok;
       });

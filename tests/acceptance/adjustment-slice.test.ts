@@ -217,9 +217,11 @@ try {
   const stale = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),
     title: "亂序舊內容", ...EVIDENCE, lines: "1002,99,0\n6602,0,99",
     edit_session_id: ES_A, client_save_sequence: "0" });
-  check("同來源舊序號晚到 → 忽略，且未覆蓋較新內容",
-    stale.body.kind === "STALE_SEQUENCE" && adjField(ADJ_AS, "title") === "自動保存 v1"
-    && ovNow() === ov0 + 1);
+  // 舊請求沒有被套用——回報成功會讓前端清掉 dirty，那正是「已保存卻沒存」
+  check("同來源舊序號晚到 → 409 拒絕（非成功），且未覆蓋較新內容",
+    stale.status === 409 && stale.body.saved === false
+    && stale.body.kind === "STALE_SEQUENCE"
+    && adjField(ADJ_AS, "title") === "自動保存 v1" && ovNow() === ov0 + 1);
 
   // 兩個分頁：同一自然人、不同 edit_session_id，後到者不得靜默覆蓋
   const tabB = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),

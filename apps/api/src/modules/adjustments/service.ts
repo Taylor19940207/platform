@@ -27,8 +27,11 @@ export type AdjustmentOutcome =
   | { ok: true; kind: "IDEMPOTENT_REPLAY"; objectVersion: number }
   /** 同來源同序號但**內容不同**：序號被重用，必須拒絕——否則會宣稱保存成功而存的是舊內容。 */
   | { ok: false; kind: "IDEMPOTENCY_KEY_REUSED"; objectVersion: number }
-  /** 同來源的舊請求晚到：忽略，且**不得**覆蓋較新的內容。 */
-  | { ok: true; kind: "STALE_SEQUENCE"; objectVersion: number };
+  /**
+   * 同來源的舊請求晚到：**拒絕**，不是成功。
+   * 它沒有被套用，回報成功會讓前端清掉 dirty——那正是「已保存卻沒存」。
+   */
+  | { ok: false; kind: "STALE_SEQUENCE"; objectVersion: number };
 
 export interface Actor { userId: string; tenantId: string; roles: Set<string> }
 
@@ -169,7 +172,7 @@ export function save(a: Actor, r: AdjRow, input: SaveInput): AdjustmentOutcome {
       return { ok: false, kind: "IDEMPOTENCY_KEY_REUSED", objectVersion: r.object_version };
     }
     if (input.clientSaveSequence < lastSeq) {
-      return { ok: true, kind: "STALE_SEQUENCE", objectVersion: r.object_version };
+      return { ok: false, kind: "STALE_SEQUENCE", objectVersion: r.object_version };
     }
   }
   const base = input.baseObjectVersion;

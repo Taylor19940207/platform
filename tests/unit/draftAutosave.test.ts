@@ -9,10 +9,10 @@
 import { test } from "node:test";
 import assert from "node:assert";
 import vm from "node:vm";
-import { autosaveClientSource, AUTOSAVE_WINDOW_MS as W }
+import { autosaveClientSource, AUTOSAVE_WINDOW_MS as W, AUTOSAVE_FORCE_MS }
   from "../../apps/api/src/modules/adjustments/views.ts";
 
-interface Sent { seq: number; title: string; at: number }
+interface Sent { seq: number; title: string; at: number; confirmedAt?: number }
 interface Harness {
   tick(ms: number): Promise<void>;
   type(title: string): Promise<void>;
@@ -71,6 +71,7 @@ function harness(responder: Responder): Harness {
   const ctx = vm.createContext({
     console,
     Math, Promise, String, Number, JSON, Object, Array,
+    Date: { now: () => now },
     crypto: { randomUUID: () => "11110000-0000-4000-8000-00000000000a" },
     URLSearchParams: class {
       m = new Map<string, string>();
@@ -104,9 +105,10 @@ function harness(responder: Responder): Harness {
       sent.push(rec);
       const r = responder(rec, n);
       if (!r) return Promise.reject(new Error("network"));
-      const respond = () => Promise.resolve({
-        status: r.status, json: () => Promise.resolve(r.body),
-      });
+      const respond = () => {
+        rec.confirmedAt = now;                 // 伺服器確認的時刻
+        return Promise.resolve({ status: r.status, json: () => Promise.resolve(r.body) });
+      };
       if (!r.delay) return respond();
       return new Promise((res) => {
         const id = nextId++;
@@ -151,31 +153,39 @@ function harness(responder: Responder): Harness {
 
 const ok = (ov: number) => ({ status: 200, body: { saved: true, kind: "SAVED", object_version: ov } });
 
-test("持續輸入時，每一次編輯都在 W 內送達伺服器（不因持續打字而無限延後）", async () => {
+test("持續輸入時，每一次編輯都在 W 內取得**伺服器確認**（不因持續打字而無限延後）", async () => {
   let ov = 1;
-  const h = harness(() => ok(++ov));
+  // 往返時間必須是**非零**的：零延遲的假伺服器會讓「W 內送出」與
+  // 「W 內確認」無法區分，測試就永遠分不出強制送出上限是否留了往返餘裕。
+  const RTT = 400;
+  const h = harness(() => ({ ...ok(++ov), delay: RTT }));
   // 每 700ms 打一個字，連續 20 次（14 秒）——短 debounce 每次都被重設。
   // 量的是**每次編輯到它被送出的延遲**，不是兩次保存的間隔：
   // 間隔會包含「保存後到下次輸入」的閒置時間，那段不算新鮮度。
   const edits: number[] = [];
   for (let i = 0; i < 20; i++) { edits.push(h.now()); await h.type("v" + i); await h.tick(700); }
-  await h.tick(W + 1000);
+  await h.tick(W + 2000);
   assert.ok(h.sent.length >= 3, `應多次保存，實際 ${h.sent.length}`);
   for (const t of edits) {
-    const covered = h.sent.find((s) => s.at >= t);
-    assert.ok(covered, `${t}ms 的編輯從未被送出`);
-    assert.ok(covered!.at - t <= W,
-      `${t}ms 的編輯延遲 ${covered!.at - t}ms 才送出，超過 W=${W}ms`);
+    // 基線要的是「W 內取得**伺服器確認**」，不是「W 內送出」——
+    // 只量送出的話，持續輸入時永遠差一個往返時間。
+    const covered = h.sent.find((s) => s.at >= t && s.confirmedAt !== undefined);
+    assert.ok(covered, `${t}ms 的編輯從未獲得確認`);
+    assert.ok(covered!.confirmedAt! - t <= W,
+      `${t}ms 的編輯到確認耗時 ${covered!.confirmedAt! - t}ms，超過 W=${W}ms`);
   }
 });
 
-test("回應延遲超過 W → 顯示「儲存延遲」，確認後回「已保存」", async () => {
+test("儲存延遲的計時自 dirty 起算，不是自 fetch 起算", async () => {
   const h = harness(() => ({ ...ok(2), delay: W * 2 }));
-  await h.type("x");
+  await h.type("x");                    // dirty 起點 t=0
   await h.tick(900);
   assert.equal(h.state(), "保存中");
-  await h.tick(W + 100);
-  assert.equal(h.state(), "儲存延遲");
+  // 推進到「dirty 起算剛好 W」的那一刻。若計時是自 fetch（t≈800）起算，
+  // 此刻還差 800ms 才會翻——那就是「等到 fetch 開始 + W」的錯誤基準。
+  await h.tick(W - 900 + 10);
+  assert.equal(h.state(), "儲存延遲",
+    `dirty 後 ${W}ms 仍未獲確認，當下就必須顯示儲存延遲`);
   await h.tick(W * 2);
   assert.equal(h.state(), "已保存");
 });
@@ -228,6 +238,28 @@ test("斷線 → 顯示「未同步（離線）」並退避重試；online 事�
   assert.ok(h.sent.length > beforeOnline, "恢復連線應立即重送");
   await h.tick(100);
   assert.equal(h.state(), "已保存");
+});
+
+test("STALE_SEQUENCE 是拒絕：不得清除 dirty，且以新序號補送", async () => {
+  let ov = 1;
+  // 第一次回應刻意延遲，才觀察得到「被拒絕當下」的狀態；
+  // 不延遲的話補送會在同一個微任務鏈內完成，中間狀態看不到。
+  const h = harness((_s, n) => n === 1
+    ? { status: 409, body: { saved: false, kind: "STALE_SEQUENCE", object_version: ov },
+        delay: 1000 }
+    : { ...ok(++ov), delay: 1000 });      // 補送也延遲，才觀察得到中間狀態
+  await h.type("x");
+  await h.tick(900);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.state(), "保存中");
+  await h.tick(1100);                   // 第一次（被拒絕的）回應落地
+  assert.notEqual(h.state(), "已保存", "被拒絕的保存不得標成已保存");
+  assert.equal(h.sent.length, 2, "必須以新序號補送");
+  assert.ok(h.sent[1].seq > h.sent[0].seq, "補送的序號必須遞增");
+  await h.tick(1100);                   // 補送的回應落地
+  assert.equal(h.state(), "已保存");
+  await h.tick(60_000);
+  assert.equal(h.sent.length, 2, "成功後不得繼續重送");
 });
 
 test("dirty 時關閉分頁 → beforeunload 警告（UX-h）", async () => {
