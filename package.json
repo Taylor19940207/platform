@@ -31,7 +31,8 @@
     "test:acceptance:workbench-identity": "node tests/acceptance/workbench-identity.test.ts",
     "test:acceptance:period-lifecycle": "node tests/acceptance/period-lifecycle.test.ts",
     "test:acceptance:multi-basis": "node tests/acceptance/multi-basis.test.ts",
-    "test:acceptance:period-workbench": "node tests/acceptance/period-workbench.test.ts"
+    "test:acceptance:period-workbench": "node tests/acceptance/period-workbench.test.ts",
+    "test:db:fx": "bash tests/integration/db/fx.test.sh"
   },
   "packageManager": "pnpm@10.28.0",
   "engines": {

@@ -63,6 +63,10 @@ INSERT INTO fiscal_calendar (fiscal_calendar_id, tenant_id, engagement_id, name,
 INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id, fiscal_calendar_id, label, start_date, end_date, is_initial_period) VALUES
   ('dddddddd-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001','ffffffff-0000-0000-0000-000000000001','2026-03','2026-03-01','2026-03-31',true),
   ('dddddddd-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001','ffffffff-0000-0000-0000-000000000001','2026-04','2026-04-01','2026-04-30',false);
+-- 顯式前期連結（0030）：2026-04 的前期是 2026-03。這是**人明示的事實**，
+-- 不由日期推導——期初已折算權益餘額的延續鏈就靠它。
+UPDATE reporting_period SET previous_reporting_period_id = 'dddddddd-0000-0000-0000-000000000001'
+ WHERE reporting_period_id = 'dddddddd-0000-0000-0000-000000000002';
 INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id) VALUES
   ('99999999-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000001'),
   ('99999999-0000-0000-0000-000000000002','11111111-1111-1111-1111-111111111111','dddddddd-0000-0000-0000-000000000002');
