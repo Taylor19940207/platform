@@ -1,0 +1,44 @@
+// 上傳的 HTTP route。
+//
+// 授權與歸屬全部在 guard；交易編排全部在 service。這裡只做：讀表單、
+// 從 Session 取身分、呼叫兩者、把結果轉成 HTTP。
+import { randomUUID } from "node:crypto";
+import type { AuthenticatedContext } from "../../http/context.ts";
+import { esc, page, type Respond } from "../../http/respond.ts";
+import { audit } from "../audit.ts";
+import { checkUpload } from "./guard.ts";
+import { upload as uploadService } from "./service.ts";
+
+/** 識別規則版本：與 worker 一致，構成 job 冪等鍵的一部分。 */
+const DETECTION_RULE_VERSION = "detect-r1";
+
+export async function upload(ctx: AuthenticatedContext, send: Respond): Promise<void> {
+  const s = ctx.session;
+  const fields = await ctx.form();
+  const engagement = fields["engagement"] ?? "";
+  const legalEntity = fields["legal_entity"] ?? "";
+  const periodRevision = fields["period_revision"] ?? "";
+  const csv = (fields["csv"] ?? "").replace(/\r\n/g, "\n");
+
+  // 伺服器端授權與歸屬驗證：繞過 UI 直接呼叫也會被擋，並記錄違規嘗試（CTX-a）
+  const v = checkUpload(s, engagement, legalEntity, periodRevision);
+  if (!v.ok) {
+    audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "context.mismatch", s.userId,
+      "import_batch", randomUUID(),
+      { code: v.code, reason: v.reason, engagement, legal_entity: legalEntity,
+        period_revision: periodRevision,
+        engagement_roles: v.engagementRoles, tenant_roles: v.tenantRoles });
+    return send(403, page("拒絕", "<b>⛔ 歸屬驗證失敗</b>",
+      `<h2>⛔ ${esc(v.reason)}</h2><p>此次嘗試已寫入稽核軌跡。</p><p><a href="/">回 B-00</a></p>`));
+  }
+
+  // uploaded_by 一律取自 Session；表單傳什麼都不採信。
+  // provided_by 目前等於上傳者——**這是現況不是規則**：R2 代傳時應記真正的
+  // 提供者，選單屬 B-00 那一刀（見 service 的說明與 BACKLOG）。
+  uploadService({
+    tenantId: s.tenantId, engagementId: engagement, legalEntityId: legalEntity,
+    periodRevisionId: periodRevision, csv,
+    uploadedBy: s.userId, providedBy: s.userId,
+    detectionRuleVersion: DETECTION_RULE_VERSION });
+  return send(302, "", { location: "/" });
+}

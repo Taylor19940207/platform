@@ -28,27 +28,6 @@ import { b04CtxBar } from "./modules/imports/views.ts";
 const DETECTION_RULE_VERSION = "detect-r1";
 
 const PORT = config.port;
-// ── EngagementContext 伺服器端驗證（§24.1A：不得信任前端下拉選單） ──
-function validateContext(s: Session, engagementId: string, legalEntityId: string,
-                         periodRevisionId: string): { ok: boolean; reason?: string } {
-  const rows = query<{ n: string }>(
-    `SELECT count(*) AS n FROM legal_entity le
-       JOIN period_revision pr ON pr.period_revision_id = :'pr'::uuid
-       JOIN reporting_period rp ON rp.reporting_period_id = pr.reporting_period_id
-      WHERE le.legal_entity_id = :'le'::uuid
-        AND le.engagement_id = :'e'::uuid
-        AND rp.engagement_id = :'e'::uuid`,
-    { pr: periodRevisionId, le: legalEntityId, e: engagementId }, { tenantId: s.tenantId });
-  if (Number(rows[0]?.n) !== 1) return { ok: false, reason: "物件與 Engagement 不一致" };
-  const assigned = query<{ n: string }>(
-    `SELECT count(*) AS n FROM role_assignment
-      WHERE user_id = :'u'::uuid AND revoked_at IS NULL
-        AND (engagement_id IS NULL OR engagement_id = :'e'::uuid)`,
-    { u: s.userId, e: engagementId }, { tenantId: s.tenantId });
-  if (Number(assigned[0]?.n) === 0) return { ok: false, reason: "未被指派此案件" };
-  return { ok: true };
-}
-
 /** 使用者在該案件的角色集合（含租戶層指派）。 */
 /**
  * 目前生效映射：每來源科目取「該報告期間生效」的最高已批准版本。
@@ -302,59 +281,6 @@ account_code,account_name,debit,credit
 
 
     // ── 上傳（POST /upload；走查骨架用 urlencoded 表單。分段續傳 A7/A8 屬下一里程碑） ──
-    if (url.pathname === "/upload" && req.method === "POST") {
-      const raw = (await readBody(req)).toString("utf8");
-      const fields = Object.fromEntries(new URLSearchParams(raw));
-      const engagement = fields["engagement"] ?? "";
-      const legal_entity = fields["legal_entity"] ?? "";
-      const period_revision = fields["period_revision"] ?? "";
-      const csv = (fields["csv"] ?? "").replace(/\r\n/g, "\n");
-
-      // 伺服器端脈絡驗證：繞過 UI 直接呼叫也會被擋，並記錄違規嘗試（CTX-a）
-      const v = validateContext(s, engagement, legal_entity, period_revision);
-      if (!v.ok) {
-        audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", "context.mismatch", s.userId,
-          "import_batch", randomUUID(), { reason: v.reason, engagement, legal_entity, period_revision });
-        return send(403, page("拒絕", "<b>⛔ 歸屬驗證失敗</b>",
-          `<h2>⛔ ${esc(v.reason)}</h2><p>此次嘗試已寫入稽核軌跡。</p><p><a href="/">回 B-00</a></p>`));
-      }
-
-      const data = Buffer.from(csv, "utf8");
-      const sha = createHash("sha256").update(data).digest("hex");
-      const batchId = randomUUID();
-      const key = `${s.tenantId}/${batchId}/tb.csv`;
-      putObject(key, data);
-      // 上傳為單一交易：ImportBatch、SourceDocument、BackgroundJob 與 uploaded 事件同進同出。
-      //
-      // job 若改在「認領時」才建立，會留下這條路徑：批次已 UPLOADED → 程式崩潰
-      // → job 從未建立 → 永遠沒人處理。那與原本的卡住問題等價，只是換了位置。
-      //
-      // 原檔紀錄先落地，最後才轉 UPLOADED——§25.5「UPLOADED＝檔案已落地」。
-      const ev = auditSql(s.tenantId, "DOMAIN_EVENT", "import_batch.uploaded", s.userId,
-        "import_batch", batchId, { sha256: sha, bytes: data.length });
-      exec(`BEGIN;
-            INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id,
-                    declared_legal_entity_id, declared_period_revision_id,
-                    uploaded_by, provided_by, file_name, file_sha256, status)
-            VALUES ('${batchId}'::uuid, :'t'::uuid, :'e'::uuid, :'le'::uuid, :'pr'::uuid,
-                    :'u'::uuid, :'u'::uuid, 'tb.csv', :'sha', 'DRAFT');
-            INSERT INTO source_document (tenant_id, import_batch_id, file_name,
-                    content_sha256, object_key, byte_size)
-            VALUES (:'t'::uuid, '${batchId}'::uuid, 'tb.csv', :'sha', :'k', ${data.length});
-            UPDATE import_batch SET status='UPLOADED' WHERE import_batch_id = '${batchId}'::uuid;
-            INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version,
-                    rule_version, idempotency_key, max_attempts)
-            SELECT :'t'::uuid, 'IMPORT_VALIDATION', '${batchId}'::uuid, ib.batch_version,
-                   :'rv', :'ik', ${config.jobMaxAttempts}
-              FROM import_batch ib WHERE ib.import_batch_id = '${batchId}'::uuid;
-            ${ev.sql}
-            COMMIT;`,
-        { t: s.tenantId, e: engagement, le: legal_entity, pr: period_revision,
-          u: s.userId, sha, k: key, rv: DETECTION_RULE_VERSION,
-          ik: idempotencyKey("IMPORT_VALIDATION", batchId, 1, DETECTION_RULE_VERSION),
-          ...ev.params }, { tenantId: s.tenantId });
-      return send(302, "", { location: "/" });
-    }
     send(404, page("404", "", "<h2>找不到頁面</h2>"));
   } catch (e) {
     send(500, page("錯誤", "", `<h2>伺服器錯誤</h2><pre>${esc(String(e))}</pre>`));

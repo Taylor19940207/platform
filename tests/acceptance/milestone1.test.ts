@@ -11,6 +11,12 @@ const T1 = "11111111-1111-1111-1111-111111111111";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const ENG_B = "eeeeeeee-0000-0000-0000-000000000002";  // 甲未被指派
 const LE_A = "cccccccc-0000-0000-0000-000000000001";   // A 商事，代碼 1234567890123
+const LE_A2 = "cccccccc-0000-0000-0000-000000000002";  // A 商事（上海）——同案件的第二法人
+const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";   // 資深乙：案件層 R2
+const U_BING = "aaaaaaaa-0000-0000-0000-000000000003"; // 經理丙：案件層 R4（不得上傳）
+const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";  // 系管丁：租戶層 R6
+const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";  // 稅務擔當戊：案件層 R1（可上傳）
+const U_TR2 = "aaaaaaaa-0000-0000-0000-000000000008";  // 租戶層辛：R2 但 engagement_id IS NULL
 const PR = "99999999-0000-0000-0000-000000000001";
 
 const results: [string, boolean, string][] = [];
@@ -66,6 +72,54 @@ try {
   // 7 繞過 UI：對未指派案件上傳 → 403 ＋ 違規紀錄（CTX-a）
   const st = await upload(cookie, ENG_B, LE_A, PR, okCsv);
   check("繞過 UI 對未指派案件上傳 → 403", st === 403);
+
+  // ── 7b §24.6 ImportBatch 列：建立為 R1／R2，且必須是**案件層**指派 ──
+  const login2 = async (u: string) => (await fetch(`${API}/login?u=${u}&t=${T1}`,
+    { redirect: "manual" })).headers.get("set-cookie")?.split(";")[0] ?? "";
+  const cYi = await login2(U_YI), cBing = await login2(U_BING);
+  const cOps = await login2(U_OPS), cTax = await login2(U_TAX), cTr2 = await login2(U_TR2);
+  const okCsv2 = "#legal_entity_code=1234567890123\naccount_code,account_name,debit,credit\n1100,現金,10,0\n4000,売上,0,10";
+  const before = () => ({
+    batches: Number(sql("SELECT count(*) FROM import_batch")),
+    docs: Number(sql("SELECT count(*) FROM source_document")),
+    jobs: Number(sql("SELECT count(*) FROM background_job")),
+    events: Number(sql(`SELECT count(*) FROM audit_event WHERE event_type='import_batch.uploaded'`)),
+  });
+  const b0 = before();
+  check("案件層 R1（戊）與 R2（乙）皆可上傳",
+    await upload(cTax, ENG_A, LE_A, PR, okCsv2) === 302
+    && await upload(cYi, ENG_A, LE_A, PR, okCsv2) === 302);
+  const b1 = before();
+  check("R3／R4／R6／租戶層 R2 皆 403（丙 R4、丁 R6、辛租戶層 R2）",
+    await upload(cBing, ENG_A, LE_A, PR, okCsv2) === 403
+    && await upload(cOps, ENG_A, LE_A, PR, okCsv2) === 403
+    && await upload(cTr2, ENG_A, LE_A, PR, okCsv2) === 403);
+  check("越權未寫入任何 Batch／Document／Job／DomainEvent",
+    JSON.stringify(before()) === JSON.stringify(b1));
+
+  // 同案件跨法人錯配：PR 的 ReportingUnit 是 LE_A，卻宣告 LE_A2
+  check("前置成立：LE_A2 與 LE_A 同案件，且 PR 的報告單位指向 LE_A",
+    sql(`SELECT count(*) FROM legal_entity WHERE legal_entity_id='${LE_A2}'
+          AND engagement_id='${ENG_A}'`) === "1"
+    && sql(`SELECT ru.legal_entity_id FROM period_revision pr
+              JOIN reporting_period rp ON rp.reporting_period_id=pr.reporting_period_id
+              JOIN reporting_unit ru ON ru.reporting_unit_id=rp.reporting_unit_id
+             WHERE pr.period_revision_id='${PR}'`) === LE_A);
+  const b2 = before();
+  check("API：同案件 A 法人＋B 法人期間 → 403",
+    await upload(cYi, ENG_A, LE_A2, PR, okCsv2) === 403);
+  check("錯配未寫入任何 Batch／Document／Job／DomainEvent",
+    JSON.stringify(before()) === JSON.stringify(b2));
+  // DB 為最後防線：繞過應用層直接 INSERT 同樣被擋
+  let dbBlocked = "";
+  try {
+    sql(`SET app.tenant_id='${T1}';
+         INSERT INTO import_batch (tenant_id, engagement_id, declared_legal_entity_id,
+                 declared_period_revision_id, uploaded_by, provided_by)
+         VALUES ('${T1}','${ENG_A}','${LE_A2}','${PR}','${U_YI}','${U_YI}')`);
+  } catch (e) { dbBlocked = String(e); }
+  check("DB：直接 INSERT 跨法人錯配 → BATCH_ATTRIBUTION_MISMATCH",
+    dbBlocked.includes("BATCH_ATTRIBUTION_MISMATCH"), dbBlocked.split("\n")[0].slice(0, 70));
 
   // 等 worker 消化
   for (let i = 0; i < 20; i++) {
