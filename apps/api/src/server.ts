@@ -44,6 +44,14 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
 
     const s = sessionOf(req);
     if (!s) {
+      // 背景請求（自動保存）不能被 302 靜默吞掉：那會讓瀏覽器把登入頁當成
+      // 成功回應，畫面顯示「已保存」而伺服器根本沒收到內容。改回 401，
+      // 由前端保留分頁與表單內容，讓使用者另頁登入後選擇重試或放棄。
+      if ((req.headers.accept ?? "").includes("application/json")) {
+        return send.bytes(401, Buffer.from(JSON.stringify({
+          saved: false, kind: "SESSION_EXPIRED" })),
+          { "content-type": "application/json; charset=utf-8" });
+      }
       // 記下原本要去的畫面，登入後回到同一個案件、期間與 Adjustment
       const resume = req.method === "GET" ? url.pathname + url.search : "/";
       return send(302, "", {

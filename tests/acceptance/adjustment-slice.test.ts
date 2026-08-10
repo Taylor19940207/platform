@@ -231,6 +231,41 @@ try {
   check("已獲伺服器確認的草稿未遺失（分頁衝突後內容仍是確認過的那一版）",
     adjField(ADJ_AS, "edit_session_id") === ES_A && ovNow() === ov0 + 1);
 
+  // 冪等鍵必須涵蓋內容：同序號帶不同內容時回報成功，等於宣稱存了實際沒存的東西
+  const reuse = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),
+    title: "序號重用的不同內容", ...EVIDENCE, lines: "1002,55,0\n6602,0,55",
+    edit_session_id: ES_A, client_save_sequence: "1" });
+  check("同序號**不同內容** → 409 IDEMPOTENCY_KEY_REUSED（不得宣稱已保存）",
+    reuse.status === 409 && reuse.body.kind === "IDEMPOTENCY_KEY_REUSED"
+    && adjField(ADJ_AS, "title") === "自動保存 v1");
+  check("序號重用留下 CVA",
+    Number(sql(`SELECT count(*) FROM audit_event WHERE kind='CONTROL_VIOLATION_ATTEMPT'
+                 AND payload->>'code'='IDEMPOTENCY_KEY_REUSED'`)) >= 1);
+
+  // 保存中繼續編輯：新序號帶新內容必須真的落地（不得被舊回應標成已保存）
+  const nextSeq = await autosave(jia, { adj: ADJ_AS, base_object_version: adjField(ADJ_AS, "object_version"),
+    title: "保存中又改的內容", ...EVIDENCE, lines: "1002,66,0\n6602,0,66",
+    edit_session_id: ES_A, client_save_sequence: "2" });
+  check("同來源新序號新內容 → 正常保存，內容確實更新",
+    nextSeq.status === 200 && nextSeq.body.saved === true
+    && adjField(ADJ_AS, "title") === "保存中又改的內容");
+
+  // Session 失效：背景保存必須回 401 而不是被 302 導到登入頁
+  const noAuth = await fetch(`${API}/b05/save`, { method: "POST", redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    body: new URLSearchParams({ adj: ADJ_AS, mode: "auto", base_object_version: "1",
+      title: "x", edit_session_id: ES_A, client_save_sequence: "9" }).toString() });
+  check("Session 失效時自動保存回 401 SESSION_EXPIRED（非 302 靜默吞掉）",
+    noAuth.status === 401
+    && (await noAuth.json() as Record<string, string>).kind === "SESSION_EXPIRED");
+  check("失效請求未寫入任何內容", adjField(ADJ_AS, "title") === "保存中又改的內容");
+
+  // 前端契約：五秒硬上限、編輯世代號、提交前等待保存、失效處理都在頁面腳本內
+  const b05Html = await get(jia, `/b05?adj=${ADJ_AS}`);
+  check("前端具備 5 秒硬上限、編輯世代號、ensureSaved 與 SESSION_EXPIRED 處理",
+    b05Html.includes("5000") && b05Html.includes("savedGen")
+    && b05Html.includes("ensureSaved") && b05Html.includes("SESSION_EXPIRED"));
+
   // Session 到期後回到原案件、期間與 Adjustment（INT-b）
   const noSession = await fetch(`${API}/b05?adj=${ADJ_AS}`, { redirect: "manual" });
   const resumeCookie = (noSession.headers.get("set-cookie") ?? "").split(";")[0];

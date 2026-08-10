@@ -15,6 +15,7 @@ export interface AdjRow {
   prepared_by: string; reviewed_by: string | null; approved_by: string | null;
   object_version: number; business_version: number;
   edit_session_id: string | null; client_save_sequence: string | null;
+  last_save_content_hash: string | null;
   last_saved_at: string | null; last_saved_by: string | null;
   output_capability: string | null; control_reasons: string[];
   period_end: string; period_label: string; client: string;
@@ -29,7 +30,7 @@ export const loadAdj = (tenantId: string, adjId: string): AdjRow | null => query
           adj.legal_basis, adj.evidence_ref, adj.judgment_reason, adj.language_tag,
           adj.prepared_by, adj.reviewed_by, adj.approved_by,
           adj.object_version, adj.business_version,
-          adj.edit_session_id, adj.client_save_sequence,
+          adj.edit_session_id, adj.client_save_sequence, adj.last_save_content_hash,
           adj.last_saved_at, adj.last_saved_by,
           adj.output_capability, adj.control_reasons,
           rp.end_date AS period_end, rp.label AS period_label, ce.name AS client

@@ -253,6 +253,32 @@ try {
             WHERE calculation_run_id='${RUN2}' AND account_code='6401'`) === "31300000.00"
     && runField(RUN2, "result_content_hash") !== runField(RUN1, "result_content_hash"));
 
+  // 7c 自動保存草稿不得影響既有 run 的重演（INV-29：重演只讀 manifest 凍結內容）
+  // manifest 只凍結**已批准**的調整；草稿再怎麼改都不該進入既有 run。
+  await post(jia, "/b05/create", { batch: B1, title: "run 建立後才編輯的草稿" });
+  const DRAFT = sql(`SELECT adjustment_id FROM adjustment ORDER BY created_at DESC LIMIT 1`);
+  const draftSave = await post(jia, "/b05/save", { adj: DRAFT, mode: "auto",
+    base_object_version: "1", title: "自動保存於 run 之後", legal_basis: "x",
+    evidence_ref: "y", judgment_reason: "z", language_tag: "ja-JP",
+    lines: "6602,500000,0\n1601,0,500000",
+    edit_session_id: "22220000-0000-4000-8000-000000000001", client_save_sequence: "1" });
+  check("run 建立後仍可自動保存草稿（草稿不受既有 run 影響）",
+    draftSave.status === 200
+    && sql(`SELECT title FROM adjustment WHERE adjustment_id='${DRAFT}'`) === "自動保存於 run 之後");
+  await post(jia, "/b06/replay", { run: RUN1 });
+  const REPLAY_AS = sql(`SELECT calculation_run_id FROM calculation_run
+                          WHERE replay_of_run_id='${RUN1}' AND calculation_run_id <> '${REPLAY1}'
+                          ORDER BY created_at DESC LIMIT 1`);
+  check("既有 run 重演結果仍與原 run 逐位元一致（只讀凍結內容，未讀到新草稿）",
+    await waitFor(() => runField(REPLAY_AS, "status") === "COMPLETED", 20000)
+    && runField(REPLAY_AS, "result_content_hash") === runField(RUN1, "result_content_hash"),
+    `replay=${runField(REPLAY_AS, "status")}`);
+  check("新草稿未進入既有 run 的凍結清單",
+    sql(`SELECT count(*) FROM calculation_manifest_entry e
+          JOIN calculation_run r ON r.manifest_id = e.manifest_id
+         WHERE r.calculation_run_id='${RUN1}' AND e.object_type='ADJUSTMENT'
+           AND e.object_id='${DRAFT}'`) === "0");
+
   // 10 竄改凍結內容 → 重演外顯失敗（REPLAY_FAILED），原 run 不變
   sql(`ALTER TABLE calculation_manifest_entry DISABLE TRIGGER trg_cme_immutable`);
   sql(`UPDATE calculation_manifest_entry SET content_canonical = content_canonical || 'X'
@@ -260,8 +286,10 @@ try {
          (SELECT manifest_id FROM calculation_run WHERE calculation_run_id='${RUN1}')`);
   sql(`ALTER TABLE calculation_manifest_entry ENABLE TRIGGER trg_cme_immutable`);
   await post(jia, "/b06/replay", { run: RUN1 });
+  // RUN1 現在有多筆重演（含 7c 的一致性驗證），以最新一筆識別本次竄改後的 replay
   const REPLAY2 = sql(`SELECT calculation_run_id FROM calculation_run
-                       WHERE replay_of_run_id='${RUN1}' AND calculation_run_id <> '${REPLAY1}'`);
+                       WHERE replay_of_run_id='${RUN1}' AND calculation_run_id <> '${REPLAY1}'
+                       ORDER BY created_at DESC LIMIT 1`);
   check("凍結內容損壞 → replay run FAILED（REPLAY_FAILED 外顯，INT-e）",
     await waitFor(() => runField(REPLAY2, "status") === "FAILED", 20000)
     && runField(REPLAY2, "failure_reason_code") === "REPLAY_FAILED"
