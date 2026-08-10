@@ -49,6 +49,18 @@ INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id) VALUES
 SQL
 R6USER=a6220000-0000-0000-0000-000000000001
 
+# 專用的「租戶層 R4」使用者（0029）：角色**種類**在遷移矩陣內、**作用域**卻是
+# 整個租戶。§26.3 的 R1～R5、R7 屬 EngagementAssignment，未指定案件的指派對
+# 期間遷移沒有意義——這是「種類正確、範圍錯誤」的樣本，釘住作用域判定本身。
+PSQL_C <<SQL >/dev/null 2>&1
+$T1
+INSERT INTO app_user (user_id, tenant_id, email, display_name)
+VALUES ('a6220000-0000-0000-0000-000000000002','$TEN','tenant-r4-m205@t1.jp','M2-05 租戶層 R4');
+INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id)
+VALUES ('$TEN','a6220000-0000-0000-0000-000000000002','R4',NULL);
+SQL
+TENANT_R4=a6220000-0000-0000-0000-000000000002
+
 PA=dd220000-0000-0000-0000-000000000001; RA=9d220000-0000-0000-0000-000000000001
 mkperiod "$PA" "$RA" true "M2-05-初" "$PU" "2026-09-01" "2026-09-30"
 ok "0022 種子：首期 ＋ 修訂（預設應為 SETUP）"
@@ -99,6 +111,12 @@ expect_err "0022：跳關 SETUP → ADJ_APPROVED" "$(att "$RA" SETUP ADJ_APPROVE
 expect_err "0022：SETUP → OPEN 角色須 R4（R2 拒絕）" "$(att "$RA" SETUP OPEN "$YI" R2)" "ROLE_NOT_PERMITTED"
 expect_err "0022：樂觀鎖——expected_from 不符" "$(att "$RA" OPEN IN_PREPARATION "$YI" R2)" "OPTIMISTIC_LOCK_CONFLICT"
 expect_err "0022：同狀態請求不構成遷移" "$(att "$RA" SETUP SETUP "$YI" R4)" "NO_OP_TRANSITION"
+# 0029：租戶層 R4 不得發起期間遷移。放在成功案例**之前**——若順序相反，
+# 期間已離開 SETUP，這條就會被 OPTIMISTIC_LOCK_CONFLICT 以錯誤理由擋住而假綠。
+expect_err "0029：租戶層 R4 不得發起期間遷移（作用域錯誤）" \
+  "$(att "$RA" SETUP OPEN "$TENANT_R4" R4)" "ACTOR_ROLE_NOT_HELD"
+st=$(APP_C <<<"$T1 SELECT status FROM period_revision WHERE period_revision_id='$RA'")
+[ "$st" = "SETUP" ] && ok "0029：被拒後狀態未變（仍 SETUP）" || ng "0029：狀態被改為 ${st}"
 expect_ok  "0022：首期 SETUP → OPEN（R4）" "$(att "$RA" SETUP OPEN "$YI" R4)"
 expect_err "0022：OPEN → IN_PREPARATION 無完整 TB → 拒絕" \
   "$(att "$RA" OPEN IN_PREPARATION "$YI" R2)" "REQUIRED_DATA_INCOMPLETE"

@@ -144,6 +144,81 @@ try {
   check("期間狀態未被改變",
     sql(`SELECT status FROM period_revision WHERE period_revision_id='${PR1}'`) === "OPEN");
 
+  // ── 3B 作用域反證：角色種類正確、作用域錯誤者直接 POST（0029）──
+  // 第 3 節的樣本是「案件層 R4 用錯角色」，那只證明角色矩陣，不證明作用域。
+  // 0022 原本寫成 (ra.engagement_id IS NULL OR ra.engagement_id = v_eng)，
+  // 租戶層指派因此對所有案件有效——畫面擋得住，DB 擋不住。
+  const post = async (cookie: string, revision: string, from: string, to: string, role: string) => {
+    const r = await fetch(`${API}/period/transition`, { method: "POST", redirect: "manual",
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ revision, expected_from: from, to, acting_role: role }).toString() });
+    return { status: r.status, code: r.headers.get("x-error-code"),
+             landed: r.headers.get("x-period-status") };
+  };
+  const pstatus = (): string =>
+    sql(`SELECT status FROM period_revision WHERE period_revision_id='${PR1}'`);
+
+  force(PR1, "SETUP");
+  {
+    const before = cvaCount();
+    const r = await post(await login(U_JI), PR1, "SETUP", "OPEN", "R4");
+    check("租戶層 R4 直接 POST 首期 SETUP → OPEN：403 ACTOR_ROLE_NOT_HELD",
+      r.status === 403 && r.code === "ACTOR_ROLE_NOT_HELD", `${r.status}/${r.code}`);
+    check("租戶層 R4 被拒後期間狀態不變（仍 SETUP）", pstatus() === "SETUP");
+    check("租戶層 R4 的嘗試留下 CVA", cvaCount() > before);
+  }
+
+  // 第二條要證明拒絕**來自作用域**，不是來自 G-01 缺完整 TB——
+  // 因此先建立完整 TB 前置，並在 POST 之前斷言它成立。
+  const BATCH = "b0290000-0000-0000-0000-000000000001";
+  // 覆蓋度必須在批次 ACCEPTED **之前**寫入——已接受的批次來源集合已封存。
+  sql(`INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id,
+         declared_legal_entity_id, declared_period_revision_id, batch_version,
+         status, identity_status, file_name)
+       VALUES ('${BATCH}','${T1}','eeeeeeee-0000-0000-0000-000000000001',
+               'cccccccc-0000-0000-0000-000000000001','${PR1}',1,
+               'VALIDATING','MATCHED','0029-前置.csv');
+       INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version,
+         granularity, completeness_status)
+       VALUES ('${T1}','${BATCH}',1,'BALANCE','COMPLETE');
+       ALTER TABLE import_batch DISABLE TRIGGER USER;
+       UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id='${BATCH}';
+       ALTER TABLE import_batch ENABLE TRIGGER USER`);
+  const tbReady = (): string => sql(
+    `SELECT count(*) FROM import_batch ib
+       JOIN data_coverage dc ON dc.import_batch_id = ib.import_batch_id
+        AND dc.batch_version = ib.batch_version
+      WHERE ib.declared_period_revision_id = '${PR1}' AND ib.status = 'ACCEPTED'
+        AND dc.granularity = 'BALANCE' AND dc.completeness_status = 'COMPLETE'`);
+  check("前置成立：本期已有「已接受且聲明完整」的 BALANCE 批次（G-01 不會成為拒絕理由）",
+    tbReady() === "1", tbReady());
+  force(PR1, "OPEN");
+  check("且畫面不再顯示該未達成條件（讀模型與守衛同一份事實）",
+    !nextSteps((await b02(jia, PR1)).body).includes("尚無「已接受且聲明完整」"));
+  {
+    const before = cvaCount();
+    const r = await post(await login(U_XIN), PR1, "OPEN", "IN_PREPARATION", "R2");
+    check("租戶層 R2 直接 POST OPEN → IN_PREPARATION：403 ACTOR_ROLE_NOT_HELD",
+      r.status === 403 && r.code === "ACTOR_ROLE_NOT_HELD", `${r.status}/${r.code}`);
+    check("拒絕理由不是 G-01（否則就是被錯誤理由擋住的假綠）",
+      r.code !== "REQUIRED_DATA_INCOMPLETE");
+    check("租戶層 R2 被拒後期間狀態不變（仍 OPEN）", pstatus() === "OPEN");
+    check("租戶層 R2 的嘗試留下 CVA", cvaCount() > before);
+  }
+  // 正控制：同一條遷移由**案件層** R2 發起必須成功——否則「前置成立」只是嘴上說。
+  const okR2 = await post(jia, PR1, "OPEN", "IN_PREPARATION", "R2");
+  check("正控制：案件層 R2 在同一前置下真的走得過去",
+    okR2.status === 200 && okR2.landed === "IN_PREPARATION", `${okR2.status}/${okR2.code}`);
+  // 拆除前置：data_coverage 為 append-only，import_batch 身分凍結——
+  // 兩者都得明確停用觸發器才移得掉，這正是「不可變事實」該有的阻力。
+  sql(`ALTER TABLE data_coverage DISABLE TRIGGER USER;
+       ALTER TABLE import_batch DISABLE TRIGGER USER;
+       DELETE FROM data_coverage WHERE import_batch_id='${BATCH}';
+       DELETE FROM import_batch WHERE import_batch_id='${BATCH}';
+       ALTER TABLE import_batch ENABLE TRIGGER USER;
+       ALTER TABLE data_coverage ENABLE TRIGGER USER`);
+  check("前置已清除，後續各節的前提回復（本期無完整 TB）", tbReady() === "0");
+
   // ── 4 尚未實作的遷移不得被畫成可點（驗收 4）──
   force(PR1, "ADJ_APPROVED");
   const pAdj = await b02(jia, PR1);
