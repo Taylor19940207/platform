@@ -3,11 +3,13 @@
 // 這裡不做任何會計裁決，也不寫使用案例層的稽核——被拒時的 CVA 由 service 寫。
 // 唯一留在本層的稽核是「未被指派此案件」：那是存取閘，發生在使用案例被呼叫之前，
 // 且它的兩種結果（404 物件不存在／403 無指派）本身就是 HTTP 形狀的判斷。
+import { randomUUID } from "node:crypto";
 import { query } from "../../../../../packages/database/src/psql.ts";
 import type { Session } from "../../../../../packages/auth/src/session.ts";
 import { g08Check, balanceCheck } from "../../../../../packages/domain/src/adjustment.ts";
 import type { AuthenticatedContext } from "../../http/context.ts";
 import { esc, page, type Respond } from "../../http/respond.ts";
+import { autosaveScript } from "./views.ts";
 import { audit } from "../audit.ts";
 import { engagementRolesOf, tenantRolesOf } from "../engagements/access.ts";
 import { loadBatch } from "../imports/access.ts";
@@ -139,9 +141,13 @@ export async function view(ctx: AuthenticatedContext, send: Respond): Promise<vo
        .map(([label, v]) => `<tr><td>${label}</td><td>${v ? esc(v)
          : `<span class="badge st-QUARANTINED">未填</span>`}</td></tr>`).join("")}
      </table>
-     ${editable ? `<form class="up" method="post" action="/b05/save">
+     ${editable ? `<form class="up" id="draft" method="post" action="/b05/save">
        <input type="hidden" name="adj" value="${r.adjustment_id}">
        <input type="hidden" name="base_object_version" value="${r.object_version}">
+       <input type="hidden" name="edit_session_id" value="">
+       <input type="hidden" name="client_save_sequence" value="0">
+       <p>保存狀態 <span id="savestate" class="badge st-MATCHED">已保存</span>
+          <span class="note" id="savenote">最後保存：${esc(r.last_saved_at ?? "尚未自動保存")}</span></p>
        標題 <input name="title" size="40" value="${esc(r.title)}"><br>
        法源／政策依據 <input name="legal_basis" size="50" value="${esc(r.legal_basis ?? "")}"><br>
        附件／支持文件 <input name="evidence_ref" size="50" value="${esc(r.evidence_ref ?? "")}"><br>
@@ -153,8 +159,10 @@ export async function view(ctx: AuthenticatedContext, send: Respond): Promise<vo
        分錄明細（每行 <code>集團科目代碼,借方,貸方</code>）<br>
        <textarea name="lines" rows="4" cols="60">${esc(lines.map((l) => `${l.code},${l.debit},${l.credit}`).join("\n"))}</textarea><br>
        <button>儲存草稿</button>
-       <span class="note">儲存只遞增 object_version（併發控制），不產生 business_version 節點</span>
-     </form>` : ""}
+       <span class="note">儲存只遞增 object_version（併發控制），不產生 business_version 節點；
+         編輯後 5 秒內自動保存，離開欄位與送覆核前立即保存</span>
+     </form>
+     ${autosaveScript}` : ""}
 
      <h2>分錄明細</h2>
      <table><tr><th>#</th><th>集團科目</th><th>名稱</th><th>借方</th><th>貸方</th></tr>
@@ -206,7 +214,23 @@ export async function save(ctx: AuthenticatedContext, send: Respond): Promise<vo
     baseObjectVersion: Number(f["base_object_version"] ?? "0"),
     title: f["title"] ?? r.title, legalBasis: f["legal_basis"] ?? "",
     evidenceRef: f["evidence_ref"] ?? "", judgmentReason: f["judgment_reason"] ?? "",
-    languageTag: f["language_tag"] ?? "", linesText: f["lines"] ?? "" });
+    languageTag: f["language_tag"] ?? "", linesText: f["lines"] ?? "",
+    // 無 JS 的整頁表單提交沒有 edit_session_id——那本來就是「每次提交＝一個
+    // 獨立的編輯來源」，補一個新的即可；冪等與亂序判定對它自然不適用。
+    // 自動保存則一律帶同一個 edit_session_id 與遞增的 client_save_sequence。
+    editSessionId: f["edit_session_id"] || randomUUID(),
+    clientSaveSequence: f["client_save_sequence"] === undefined
+      ? 1 : Number(f["client_save_sequence"]) });
+  // 自動保存以 fetch 呼叫，需要機器可讀的結果；表單提交仍走 302。
+  // **保存狀態一律由伺服器確認後才回報**——前端不得自行宣告「已保存」。
+  if (f["mode"] === "auto") {
+    const ov = out.ok
+      ? (out.kind ? out.objectVersion : adjSvc.currentObjectVersion(s.tenantId, r.adjustment_id))
+      : r.object_version;
+    return send.bytes(out.ok ? 200 : 409, Buffer.from(JSON.stringify({
+      saved: out.ok, kind: out.kind ?? (out.ok ? "SAVED" : out.kind), object_version: ov,
+    })), { "content-type": "application/json; charset=utf-8" });
+  }
   if (out.ok) return send(302, "", { location: `/b05?adj=${r.adjustment_id}` });
   return renderAdjFailure(send, r, out);
 }

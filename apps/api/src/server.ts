@@ -8,7 +8,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { query } from "../../../packages/database/src/psql.ts";
 import { sign, type Session } from "../../../packages/auth/src/session.ts";
 import { config } from "../../../packages/config/src/index.ts";
-import { authenticatedContext, sessionOf } from "./http/context.ts";
+import { authenticatedContext, cookies, sessionOf } from "./http/context.ts";
 import { dispatch } from "./http/dispatch.ts";
 import { esc, page, responder } from "./http/respond.ts";
 
@@ -25,6 +25,8 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
 
     // ── 登入（開發用：列出種子使用者；真機換 SSO） ──
+    // Session 到期後回到原畫面（NFR-INT-002 INT-b）：把原本要去的位址記在
+    // 短期 cookie，登入後導回。**只記路徑**，不記任何業務內容。
     if (url.pathname === "/" && !sessionOf(req)) {
       const users = query<{ user_id: string; email: string; display_name: string; tenant_id: string }>(
         "SELECT user_id, email, display_name, tenant_id FROM app_user WHERE is_active", {}, { asRuntime: false });
@@ -34,11 +36,20 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
     }
     if (url.pathname === "/login") {
       const s: Session = { userId: url.searchParams.get("u") ?? "", tenantId: url.searchParams.get("t") ?? "" };
-      return send(302, "", { "set-cookie": `s=${sign(s)}; HttpOnly; Path=/`, location: "/" });
+      // 只接受本站相對路徑，避免開放轉址
+      const raw = cookies(req)["resume"] ?? "";
+      const next = /^\/[^/\\]/.test(decodeURIComponent(raw)) ? decodeURIComponent(raw) : "/";
+      return send(302, "", { "set-cookie": `s=${sign(s)}; HttpOnly; Path=/`, location: next });
     }
 
     const s = sessionOf(req);
-    if (!s) return send(302, "", { location: "/" });
+    if (!s) {
+      // 記下原本要去的畫面，登入後回到同一個案件、期間與 Adjustment
+      const resume = req.method === "GET" ? url.pathname + url.search : "/";
+      return send(302, "", {
+        "set-cookie": `resume=${encodeURIComponent(resume)}; HttpOnly; Path=/; Max-Age=600`,
+        location: "/" });
+    }
 
     // 身分驗證通過後才建立脈絡。Context 此時**不讀請求本體**——
     // 只有實際呼叫 form() 的 route 才會消耗它，未命中的路由不受影響。

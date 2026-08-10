@@ -180,6 +180,68 @@ try {
     await post(jia, "/b05/submit", { adj: ADJ }) === 409);
   check("G-08 缺漏逐項列出於畫面", (await get(jia, `/b05?adj=${ADJ}`)).includes("語言標籤"));
 
+  // ── 2b 自動保存：冪等、亂序、兩分頁、伺服器確認（NFR-UX-001／INT-002） ──
+  const autosave = async (cookie: string, fields: Record<string, string>) => {
+    const r = await fetch(`${API}/b05/save`, { method: "POST", redirect: "manual",
+      headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ ...fields, mode: "auto" }).toString() });
+    return { status: r.status, body: await r.json() as Record<string, string> };
+  };
+  // 自動保存用**獨立的調整**：與主流程共用同一份草稿會讓後續的樂觀鎖與併發
+  // 斷言依賴我這裡留下的版本與標題——那是測試互相污染，不是被測行為。
+  await post(jia, "/b05/create", { batch: B1, title: "自動保存測試" });
+  const ADJ_AS = sql(`SELECT adjustment_id FROM adjustment ORDER BY created_at DESC LIMIT 1`);
+  const ES_A = "11110000-0000-4000-8000-00000000000a";   // 分頁 A 的編輯來源
+  const ES_B = "11110000-0000-4000-8000-00000000000b";   // 分頁 B（同一人，不同分頁）
+  const ovNow = () => Number(adjField(ADJ_AS, "object_version"));
+
+  const ov0 = ovNow();
+  const a1 = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),
+    title: "自動保存 v1", ...EVIDENCE, lines: "1002,10,0\n6602,0,10",
+    edit_session_id: ES_A, client_save_sequence: "1" });
+  check("自動保存回傳伺服器確認的 object_version（不由前端自行宣告）",
+    a1.status === 200 && a1.body.saved === true && Number(a1.body.object_version) === ov0 + 1);
+  check("last_saved_at／last_saved_by／edit_session_id 由伺服器落地",
+    adjField(ADJ_AS, "last_saved_at") !== "" && adjField(ADJ_AS, "last_saved_by") === U_JIA
+    && adjField(ADJ_AS, "edit_session_id") === ES_A);
+
+  // 重送同一序號：不是衝突，是冪等重放
+  const a1r = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),
+    title: "自動保存 v1", ...EVIDENCE, lines: "1002,10,0\n6602,0,10",
+    edit_session_id: ES_A, client_save_sequence: "1" });
+  check("同來源同序號重送 → 冪等重放（200，非假衝突），版本不再前進",
+    a1r.status === 200 && a1r.body.kind === "IDEMPOTENT_REPLAY"
+    && ovNow() === ov0 + 1);
+
+  // 亂序：舊序號晚到，必須被忽略且不得覆蓋較新內容
+  const stale = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),
+    title: "亂序舊內容", ...EVIDENCE, lines: "1002,99,0\n6602,0,99",
+    edit_session_id: ES_A, client_save_sequence: "0" });
+  check("同來源舊序號晚到 → 忽略，且未覆蓋較新內容",
+    stale.body.kind === "STALE_SEQUENCE" && adjField(ADJ_AS, "title") === "自動保存 v1"
+    && ovNow() === ov0 + 1);
+
+  // 兩個分頁：同一自然人、不同 edit_session_id，後到者不得靜默覆蓋
+  const tabB = await autosave(jia, { adj: ADJ_AS, base_object_version: String(ov0),
+    title: "分頁 B 的內容", ...EVIDENCE, lines: "1002,77,0\n6602,0,77",
+    edit_session_id: ES_B, client_save_sequence: "1" });
+  check("同一人的另一分頁以過期版本保存 → 409 版本衝突，內容未被覆蓋",
+    tabB.status === 409 && tabB.body.kind === "VERSION_CONFLICT"
+    && adjField(ADJ_AS, "title") === "自動保存 v1");
+  check("已獲伺服器確認的草稿未遺失（分頁衝突後內容仍是確認過的那一版）",
+    adjField(ADJ_AS, "edit_session_id") === ES_A && ovNow() === ov0 + 1);
+
+  // Session 到期後回到原案件、期間與 Adjustment（INT-b）
+  const noSession = await fetch(`${API}/b05?adj=${ADJ_AS}`, { redirect: "manual" });
+  const resumeCookie = (noSession.headers.get("set-cookie") ?? "").split(";")[0];
+  const relogin = await fetch(`${API}/login?u=${U_JIA}&t=${T1}`,
+    { redirect: "manual", headers: { cookie: resumeCookie } });
+  check("Session 到期 → 登入後導回原 Adjustment（非回首頁）",
+    noSession.status === 302 && resumeCookie.startsWith("resume=")
+    && relogin.headers.get("location") === `/b05?adj=${ADJ_AS}`);
+  check("瀏覽器端不保存客戶財務內容（頁面無 localStorage／IndexedDB 使用）",
+    !(await get(jia, `/b05?adj=${ADJ_AS}`)).match(/localStorage|indexedDB/i));
+
   // ── 3 草稿保存與樂觀鎖 ──
   const ovAfterSave = adjField(ADJ, "object_version");
   check("儲存草稿只遞增 object_version，不動 business_version",

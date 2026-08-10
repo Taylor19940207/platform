@@ -17,12 +17,16 @@ import { adjLines, type AdjRow, type AdjLineRow } from "./access.ts";
 type Refusal = Extract<GuardResult, { ok: false }>;
 
 export type AdjustmentOutcome =
-  | { ok: true }
+  | { ok: true; kind?: undefined }
   | { ok: false; kind: "ROLE"; need: string }
   | { ok: false; kind: "GUARD"; verdict: Refusal }
   | { ok: false; kind: "VERSION_CONFLICT"; base: number; current: number }
   | { ok: false; kind: "LINES_INVALID"; errors: { lineNo: number; error: string }[] }
-  | { ok: false; kind: "CONCURRENT_CONFLICT"; base: number };
+  | { ok: false; kind: "CONCURRENT_CONFLICT"; base: number }
+  /** 同來源同序號重送：已經存過了，不是衝突。回報成功並附目前版本。 */
+  | { ok: true; kind: "IDEMPOTENT_REPLAY"; objectVersion: number }
+  /** 同來源的舊請求晚到：忽略，且**不得**覆蓋較新的內容。 */
+  | { ok: true; kind: "STALE_SEQUENCE"; objectVersion: number };
 
 export interface Actor { userId: string; tenantId: string; roles: Set<string> }
 
@@ -111,6 +115,17 @@ export function createDraft(a: Actor, input: CreateInput):
 export interface SaveInput {
   baseObjectVersion: number; title: string; legalBasis: string; evidenceRef: string;
   judgmentReason: string; languageTag: string; linesText: string;
+  /** 編輯來源。同一自然人的不同分頁**必須**取得不同值（§26.9）。 */
+  editSessionId: string;
+  /** 冪等鍵：同來源遞增。重試與亂序到達靠它去重。 */
+  clientSaveSequence: number;
+}
+
+/** 保存後回讀伺服器確認的版本——前端顯示的「已保存」必須以此為準。 */
+export function currentObjectVersion(tenantId: string, adjustmentId: string): number {
+  return Number(query<{ v: string }>(
+    `SELECT object_version::text AS v FROM adjustment WHERE adjustment_id = :'a'::uuid`,
+    { a: adjustmentId }, { tenantId })[0]?.v ?? 0);
 }
 
 export function save(a: Actor, r: AdjRow, input: SaveInput): AdjustmentOutcome {
@@ -119,6 +134,18 @@ export function save(a: Actor, r: AdjRow, input: SaveInput): AdjustmentOutcome {
       reasons: [`調整已離開草稿階段（${r.status}），不可編輯`] };
     cvaGuard(a, r, "adjustment.save", verdict);
     return { ok: false, kind: "GUARD", verdict };
+  }
+  // 冪等與亂序必須在樂觀鎖**之前**判定：重送的請求其 base 版本必然已過期，
+  // 先判樂觀鎖的話，使用者會看到自己跟自己衝突——那是假衝突。
+  if (input.editSessionId && r.edit_session_id === input.editSessionId
+      && r.client_save_sequence !== null && r.client_save_sequence !== "") {
+    const lastSeq = Number(r.client_save_sequence);
+    if (input.clientSaveSequence === lastSeq) {
+      return { ok: true, kind: "IDEMPOTENT_REPLAY", objectVersion: r.object_version };
+    }
+    if (input.clientSaveSequence < lastSeq) {
+      return { ok: true, kind: "STALE_SEQUENCE", objectVersion: r.object_version };
+    }
   }
   const base = input.baseObjectVersion;
   if (base !== r.object_version) {
@@ -170,7 +197,9 @@ export function save(a: Actor, r: AdjRow, input: SaveInput): AdjustmentOutcome {
           WITH updated AS (
             UPDATE adjustment SET title = :'ti', legal_basis = :'lb', evidence_ref = :'er',
                    judgment_reason = :'jr', language_tag = :'lt',
-                   object_version = object_version + 1
+                   object_version = object_version + 1,
+                   edit_session_id = :'es'::uuid, client_save_sequence = ${input.clientSaveSequence},
+                   last_saved_at = now(), last_saved_by = :'u'::uuid
              WHERE adjustment_id = :'a'::uuid AND object_version = ${base}
             RETURNING 1
           )
@@ -184,6 +213,7 @@ export function save(a: Actor, r: AdjRow, input: SaveInput): AdjustmentOutcome {
       { t: a.tenantId, a: r.adjustment_id, ti: input.title,
         lb: input.legalBasis, er: input.evidenceRef,
         jr: input.judgmentReason, lt: input.languageTag,
+        es: input.editSessionId, u: a.userId,
         ...lineParams, ...ev.params },
       { tenantId: a.tenantId });
   } catch (e) {
