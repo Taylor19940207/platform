@@ -18,6 +18,8 @@ const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";    // R6（不可產包）
 const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";    // R1（本案件資料提供者）
 const U_TR3 = "aaaaaaaa-0000-0000-0000-000000000007";    // 租戶層庚：R3 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）；R1 自己上傳則不需要
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
@@ -66,7 +68,7 @@ try {
   const bing = await login(U_BING); const ops = await login(U_OPS);
 
   // ── 前置：Case-001 完整鏈 ──
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1,
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1,
     csv: readFileSync(`${FIX}/jp_tb_2026-03.csv`, "utf8") });
   await waitFor(() => sql("SELECT count(*) FROM import_batch WHERE status='VALIDATED'") === "1");
   const B1 = sql(`SELECT import_batch_id FROM import_batch LIMIT 1`);

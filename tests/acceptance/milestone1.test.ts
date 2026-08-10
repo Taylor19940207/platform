@@ -8,6 +8,8 @@ import { raw } from "../../packages/database/src/psql.ts";
 const API = "http://127.0.0.1:8091";
 const U1 = "aaaaaaaa-0000-0000-0000-000000000001";   // 職員甲：只被指派 A 案件
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）；R1 自己上傳則不需要
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const ENG_B = "eeeeeeee-0000-0000-0000-000000000002";  // 甲未被指派
 const LE_A = "cccccccc-0000-0000-0000-000000000001";   // A 商事，代碼 1234567890123
@@ -27,7 +29,7 @@ const check = (name: string, ok: boolean, detail = "") => {
 const sql = (q: string): string => raw(q, { db: "cbfc_dev" });
 
 async function upload(cookie: string, eng: string, le: string, pr: string, csv: string): Promise<number> {
-  const body = new URLSearchParams({ engagement: eng, legal_entity: le, period_revision: pr, csv });
+  const body = new URLSearchParams({ engagement: eng, legal_entity: le, period_revision: pr, csv, provided_by: PROVIDER_R1 });
   const r = await fetch(`${API}/upload`, { method: "POST", redirect: "manual",
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: body.toString() });
   return r.status;

@@ -16,6 +16,8 @@ const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";     // 稅務擔當戊：R
 const U_TR4 = "aaaaaaaa-0000-0000-0000-000000000006";     // 租戶層己：R4 但 engagement_id IS NULL
 const U_TR3 = "aaaaaaaa-0000-0000-0000-000000000007";     // 租戶層庚：R3 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）；R1 自己上傳則不需要
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
@@ -44,7 +46,7 @@ const get = async (cookie: string, path: string): Promise<string> =>
   (await fetch(`${API}${path}`, { headers: { cookie } })).text();
 async function upload(cookie: string, pr: string, csvPath: string): Promise<number> {
   return (await post(cookie, "/upload", { engagement: ENG_A, legal_entity: LE_A,
-    period_revision: pr, csv: readFileSync(csvPath, "utf8") })).status;
+    period_revision: pr, provided_by: PROVIDER_R1, csv: readFileSync(csvPath, "utf8") })).status;
 }
 async function waitWorker(): Promise<void> {
   for (let i = 0; i < 20; i++) {

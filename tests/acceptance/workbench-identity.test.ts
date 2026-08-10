@@ -11,7 +11,10 @@ const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";     // 資深乙：R2＋R3�
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";   // 經理丙：僅 R4
 const U_DING = "aaaaaaaa-0000-0000-0000-000000000004";   // 系管丁：R6（租戶層，engagement NULL）
 const U_TR2 = "aaaaaaaa-0000-0000-0000-000000000008";    // 租戶層辛：R2 但 engagement_id IS NULL
+const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";    // 稅務擔當戊：案件層 R1（資料提供者）
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）；R1 自己上傳則不需要
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
@@ -83,9 +86,9 @@ try {
   const ding = await login(U_DING);
 
   // ── 前置：MATCHED 批次 → 接受 → 調整草稿送覆核；另一批 no-id → PENDING_CONFIRMATION ──
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, csv: OK_CSV });
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, csv: NOID_CSV });
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, csv: WRONG_CSV });
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1, csv: OK_CSV });
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1, csv: NOID_CSV });
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1, csv: WRONG_CSV });
   await waitWorker();
   const B1 = sql(`SELECT import_batch_id FROM import_batch WHERE identity_status='MATCHED' LIMIT 1`);
   const BU = sql(`SELECT import_batch_id FROM import_batch WHERE identity_status='PENDING_CONFIRMATION' LIMIT 1`);
@@ -172,6 +175,28 @@ try {
            FROM audit_event WHERE event_type='identity.confirm.denied'
           ORDER BY audit_event_id DESC LIMIT 1`) === '[]|["R2"]');
 
+  // ── B-00 三層授權：資料可見性／動作權限／待辦條件各自獨立 ──
+  const tax = await login(U_TAX);              // 案件層 R1
+  const homeBing2 = await get(bing, "/");      // 案件層 R4
+  const homeTax = await get(tax, "/");
+  const homeTr2 = await get(tr2, "/");         // 租戶層 R2
+  check("R4（丙）看得到自己的待辦，但看不到上傳表單（上傳限 R1／R2）",
+    homeBing2.includes("待批准") && !homeBing2.includes('action="/upload"'));
+  check("R1（戊）看得到上傳表單與批次清單，但看不到調整待辦與 B-04 連結",
+    homeTax.includes('action="/upload"') && homeTax.includes("批次狀態")
+    && !homeTax.includes("/b05?adj=") && !homeTax.includes("/b04?batch="));
+  check("R6（丁）與租戶層 R2（辛）：五佇列、批次清單、客戶名稱全空",
+    ["待身分確認（0）", "待覆核（0）", "待批准（0）", "被退回／待補證據（0）", "未完成草稿（0）"]
+      .every((t) => homeDing.includes(t) && homeTr2.includes(t))
+    && !homeTr2.includes("A 商事") && !homeTr2.includes("B 工業")
+    && !homeTr2.includes('action="/upload"'));
+  check("計數與明細用同一份授權條件（無「看不到內容但計數洩漏」）",
+    !/待身分確認（[1-9]/.test(homeTr2) && !/待覆核（[1-9]/.test(homeTr2)
+    && !/待批准（[1-9]/.test(homeTr2));
+  // 動作按鈕逐案件判斷：R4 不得看到「接受」（僅 R2），但看得到批次列
+  check("R4 的批次列不渲染「接受」按鈕（接受＝資料接受動作，僅 R2）",
+    homeBing2.includes("批次狀態") && !homeBing2.includes('action="/b04/accept"'));
+
   // ── B-03 確認頁內容（決策 4） ──
   const AID = sql(`SELECT current_identity_assessment_id FROM import_batch WHERE import_batch_id='${BU}'`);
   const pageYi = await get(yi, `/b03/identity?batch=${BU}`);
@@ -242,7 +267,7 @@ try {
     && sql(`SELECT status FROM import_batch WHERE import_batch_id='${BU}'`) === "ACCEPTED");
 
   // ── CTX-e：效力只及該批次（版本）——新上傳需重新確認，原紀錄並存 ──
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, csv: NOID_CSV });
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1, csv: NOID_CSV });
   await waitWorker();
   const BU2 = sql(`SELECT import_batch_id FROM import_batch
                    WHERE identity_status='PENDING_CONFIRMATION' AND import_batch_id<>'${BU}' LIMIT 1`);

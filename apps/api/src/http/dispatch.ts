@@ -13,6 +13,8 @@ import * as calculations from "../modules/calculations/routes.ts";
 import * as evidence from "../modules/evidence/routes.ts";
 import * as identities from "../modules/identities/routes.ts";
 import * as uploads from "../modules/uploads/routes.ts";
+import * as workbench from "../modules/workbench/routes.ts";
+import * as admin from "../modules/admin/routes.ts";
 
 export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise<void>;
 
@@ -32,6 +34,8 @@ const ROUTES: Record<string, RouteHandler> = {
   "GET /b07/package": evidence.packageView,
   "GET /b07": evidence.list,
   "GET /b07/download": evidence.download,
+  "GET /": workbench.home,
+  "GET /admin/jobs": admin.jobs,
   "POST /upload": uploads.upload,
   "GET /b03/identity": identities.identityView,
   "POST /b03/identity/confirm": identities.identityConfirm,

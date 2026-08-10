@@ -11,6 +11,8 @@ import { raw } from "../../packages/database/src/psql.ts";
 const API = "http://127.0.0.1:8094";
 const U_JIA = "aaaaaaaa-0000-0000-0000-000000000001";
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
@@ -36,7 +38,7 @@ async function upload(cookie: string, csv: string): Promise<number> {
   const r = await fetch(`${API}/upload`, { method: "POST", redirect: "manual",
     headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ engagement: ENG_A, legal_entity: LE_A,
-      period_revision: PR1, csv }).toString() });
+      period_revision: PR1, provided_by: PROVIDER_R1, csv }).toString() });
   return r.status;
 }
 const latestBatch = (): string =>

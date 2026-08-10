@@ -54,3 +54,38 @@ export function checkUpload(s: Session, engagementId: string, legalEntityId: str
   }
   return { ok: true, roles };
 }
+
+/**
+ * 決定 provided_by——**真正的資料提供者**，不是「誰按了上傳」。
+ *
+ *   R1 自己上傳            → 本人
+ *   R2 代傳                → 表單選定者，且後端重新驗證他確實是**該案件的有效 R1**
+ *   該案件沒有任何 R1      → 拒絕，不靜默把 R2 當提供者
+ *
+ * 永遠把 R2 記成提供者會讓補件與逾期 KPI 算錯人：系統會以為資料是 R2 提供的，
+ * 於是永遠不會有人被追補件。
+ */
+export type ProviderCheck =
+  | { ok: true; providedBy: string }
+  | { ok: false; code: "PROVIDER_REQUIRED" | "PROVIDER_NOT_R1"; reason: string };
+
+export function resolveProvider(s: Session, engagementId: string, roles: Set<string>,
+                                formProvidedBy: string): ProviderCheck {
+  const isValidR1 = (userId: string): boolean => Number(query<{ n: string }>(
+    `SELECT count(*) AS n FROM role_assignment ra JOIN app_user u ON u.user_id = ra.user_id
+      WHERE ra.user_id = :'p'::uuid AND ra.role = 'R1' AND ra.revoked_at IS NULL
+        AND ra.engagement_id = :'e'::uuid AND u.is_active`,
+    { p: userId, e: engagementId }, { tenantId: s.tenantId })[0]?.n) === 1;
+
+  if (formProvidedBy) {
+    // 不信任表單 UUID：重新驗證選定者確實是同案件的有效 R1
+    if (!isValidR1(formProvidedBy)) {
+      return { ok: false, code: "PROVIDER_NOT_R1",
+        reason: "選定的資料提供者不是本案件的有效 R1 指派" };
+    }
+    return { ok: true, providedBy: formProvidedBy };
+  }
+  if (roles.has("R1")) return { ok: true, providedBy: s.userId };   // R1 自己上傳
+  return { ok: false, code: "PROVIDER_REQUIRED",
+    reason: "尚未設定資料提供者：代傳時必須選擇本案件的有效 R1" };
+}

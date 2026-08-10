@@ -17,6 +17,8 @@ const U_JIA = "aaaaaaaa-0000-0000-0000-000000000001";
 const U_YI = "aaaaaaaa-0000-0000-0000-000000000002";
 const U_BING = "aaaaaaaa-0000-0000-0000-000000000003";
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）；R1 自己上傳則不需要
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
@@ -87,7 +89,7 @@ try {
          JOIN posting_layer p ON p.layer_id = i.layer_id WHERE p.code='LOCAL_TAX_ADJ'`) === "0");
 
   // ── 1 前置：TB → 映射 → 調整 → 批准 ──
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1,
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1,
     csv: readFileSync(`${FIX}/jp_tb_2026-03.csv`, "utf8") });
   await waitWorker();
   const B1 = sql(`SELECT import_batch_id FROM import_batch WHERE declared_period_revision_id='${PR1}'`);

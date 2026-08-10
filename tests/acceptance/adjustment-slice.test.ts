@@ -15,6 +15,8 @@ const U_OPS = "aaaaaaaa-0000-0000-0000-000000000004";    // 系管丁：R6（租
 const U_TAX = "aaaaaaaa-0000-0000-0000-000000000005";    // 稅務擔當戊：R1（本案件）
 const U_TR4 = "aaaaaaaa-0000-0000-0000-000000000006";    // 租戶層己：R4 但 engagement_id IS NULL
 const T1 = "11111111-1111-1111-1111-111111111111";
+// R2 代傳時必須指定真正的資料提供者（該案件的有效 R1）；R1 自己上傳則不需要
+const PROVIDER_R1 = "aaaaaaaa-0000-0000-0000-000000000005";
 const ENG_A = "eeeeeeee-0000-0000-0000-000000000001";
 const LE_A = "cccccccc-0000-0000-0000-000000000001";
 const PR1 = "99999999-0000-0000-0000-000000000001";
@@ -82,7 +84,7 @@ try {
   const bing = await login(U_BING);
 
   // ── 前置：一份 ACCEPTED 批次，提供 engagement × period 脈絡 ──
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1,
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1,
     csv: "#legal_entity_code=1234567890123\naccount_code,account_name,debit,credit\n1002,現金,1000,0\n4000,売上,0,1000\n" });
   await waitWorker();
   const B1 = sql(`SELECT import_batch_id FROM import_batch ORDER BY created_at DESC LIMIT 1`);
@@ -156,7 +158,7 @@ try {
           ORDER BY audit_event_id DESC LIMIT 1`) === "編製調整需本案件的 R2 角色（§24.6 調整列 C）"
     && Number(sql(`SELECT count(*) FROM adjustment`)) === preCreate);
   // 未接受的批次其來源事實尚非正式，不得成為調整的期間脈絡
-  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1,
+  await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1,
     csv: "#legal_entity_code=1234567890123\naccount_code,account_name,debit,credit\n1002,現金,50,0\n4000,売上,0,50\n" });
   await waitWorker();
   const B_DRAFT = sql(`SELECT import_batch_id FROM import_batch
