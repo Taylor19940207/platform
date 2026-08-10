@@ -440,7 +440,7 @@ expect_err "0013③：Run 與 Manifest 案件不一致 → 拒絕（§24.1A）" 
            gen_random_uuid(),'rc8','calc-engine-1','aaaaaaaa-0000-0000-0000-000000000001')" "歸屬違規"
 n=$(PSQL_C <<<"SELECT count(*) FROM pg_constraint WHERE conname='calculation_run_tenant_request_key_uq'")
 [ "$n" = "1" ] && ok "0013：request_key 唯一改為（tenant_id, request_key）" \
-               || ng "request_key 約束未改名（$n）"
+               || ng "request_key 約束未改名（${n}）"
 expect_ok "BackgroundJob 支援 CALCULATION_RUN 型別" \
   "$T1 INSERT INTO background_job (tenant_id, job_type, subject_id, subject_version, rule_version, idempotency_key)
    VALUES ('11111111-1111-1111-1111-111111111111','CALCULATION_RUN','$RUNA',1,'calc-engine-1','ck1')"

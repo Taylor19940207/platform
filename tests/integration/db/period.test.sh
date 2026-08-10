@@ -54,7 +54,7 @@ mkperiod "$PA" "$RA" true "M2-05-初" "$PU" "2026-09-01" "2026-09-30"
 ok "0022 種子：首期 ＋ 修訂（預設應為 SETUP）"
 st=$(APP_C <<<"$T1 SELECT status FROM period_revision WHERE period_revision_id='$RA'")
 [ "$st" = "SETUP" ] && ok "0022：新建修訂預設 SETUP（DEFAULT 已由 OPEN 改為 SETUP）" \
-  || ng "0022：新建修訂預設為 $st（應為 SETUP）"
+  || ng "0022：新建修訂預設為 ${st}（應為 SETUP）"
 
 # ── 繞道 1：INSERT 跳過狀態機 ──
 expect_err "0022 繞道：INSERT status='DELIVERED' → 拒絕" \

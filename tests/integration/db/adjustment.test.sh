@@ -281,3 +281,32 @@ n=$(APP_C <<<"$T2 SELECT count(*) FROM journal_line")
 [ "$n" = "0" ] && ok "RLS：T2 看不到 T1 的正式分錄" || ng "RLS：journal_line 洩漏 $n 筆"
 
 [ "${STANDALONE:-0}" = "1" ] && summary
+
+# ── 自動保存併發欄位（0025／0026／0027） ──
+expect_err "0027：三欄不得只寫一部分（無來源卻有序號）" \
+  "$T1 UPDATE adjustment SET client_save_sequence = 9 WHERE adjustment_id='$ADJ2'" \
+  "adjustment_autosave_all_or_none"
+# 這個方向由 0026 的觸發器先擋下（觸發器早於 CHECK 執行）——記錄實際擋下的那一層，
+# 不假裝是 CHECK 攔的。反向（無來源卻有序號）觸發器管不到，才由上一條的 CHECK 兜底。
+expect_err "0026：有來源卻缺內容雜湊 → 拒絕（觸發器層）" \
+  "$T1 UPDATE adjustment SET edit_session_id='11110000-0000-4000-8000-00000000000a',
+       client_save_sequence=1, last_saved_at=now(), last_saved_by='$JIA'
+   WHERE adjustment_id='$ADJ2'" "AUTOSAVE_FIELDS_PAIRED"
+expect_ok "三欄成組寫入（DRAFTING 階段）→ 通過" \
+  "$T1 UPDATE adjustment SET edit_session_id='11110000-0000-4000-8000-00000000000a',
+       client_save_sequence=1, last_save_content_hash='h1', last_saved_at=now(), last_saved_by='$JIA'
+   WHERE adjustment_id='$ADJ2'"
+expect_err "0025：同一來源的序號不得倒退（亂序舊請求不得覆蓋新內容）" \
+  "$T1 UPDATE adjustment SET client_save_sequence=0, last_save_content_hash='h0'
+   WHERE adjustment_id='$ADJ2'" "SAVE_SEQUENCE_REGRESSION"
+# 離開草稿後併發控制欄位即凍結。用 ADJ4（PENDING_REVIEW）而非 ADJ（APPROVED）：
+# 已批准的列會先被「已批准調整不可修改」擋下，那樣就驗不到本條守衛。
+n=$(APP_C <<<"$T1 SELECT status FROM adjustment WHERE adjustment_id='$ADJ4'")
+[ "$n" != "DRAFTING" ] && [ "$n" != "APPROVED" ] \
+  && ok "前置成立：ADJ4 已離開 DRAFTING（${n}）但尚未批准" \
+  || ng "前置不成立：ADJ4 狀態為 $n"
+expect_err "0025：離開 DRAFTING 後併發控制欄位不可再變更" \
+  "$T1 UPDATE adjustment SET edit_session_id='11110000-0000-4000-8000-00000000000b',
+       client_save_sequence=5, last_save_content_hash='h5', last_saved_at=now(), last_saved_by='$JIA'
+   WHERE adjustment_id='$ADJ4'" "AUTOSAVE_FIELDS_DRAFT_ONLY"
+
