@@ -18,8 +18,12 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、二十三份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`、API 與 Worker。
-8. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
+7. `packages/domain/src/importBatch.ts`、二十四份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
+   dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
+   `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
+   讀 API 請從 `http/dispatch.ts` 的路由表起手，不要從 server.ts 找功能。
+9. 三層測試：`tests/unit/`、`tests/integration/`、`tests/acceptance/`。
 
 CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時閱讀，不得取代已合併的 v1.2／v1.1 正式基線。工程細節以 repo 內 Markdown 與現行程式為準，PDF 供閱讀。
 
@@ -41,20 +45,61 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 
 里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05`／`M2-06`
 均已完成並關閉。
-現有 23 份 migration；完整實跑結果為 **712/712**（單元 58、DB 整合 357、端到端 297），連續兩輪全綠。
+現有 24 份 migration；完整實跑結果為 **764/764**（單元 58、DB 整合 357、端到端 349），
+最新一輪全綠（HEAD `2e19c9b`，已 push）。
 
 `SLICE-M2-04` 的關閉收口為 **0021**：映射來源批次必須為 `ACCEPTED`——未經接受的批次
 （含 QUARANTINED）不得成為正式映射的來源脈絡。DB 以 `FOR UPDATE` 鎖住來源批次列消除
 TOCTOU；應用層 `/b04/map` 先判定並回 409 ＋ `SOURCE_BATCH_NOT_ACCEPTED`，DB 仍是最後防線。
 既有映射不因來源批次日後轉 `SUPERSEDED` 而被追溯刪除或改寫。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 712 條：
+## API 模組化拆層已完成（2026-08-08～10）
+
+`server.ts` 由 2,018 行降為 **54 行**。這不是為了行數——是為了讓「授權在哪裡判斷」
+變成看得見的事。舊結構有一個萬用守衛（`b04Guard`）同時替映射、調整、計算與證據包
+授權，且用「案件層 ∪ 租戶層」的聯集；六類既有授權缺口就藏在那裡面。
+
+    apps/api/src/
+    ├── server.ts        health、開發登入、Session 建構、dispatcher、listen
+    ├── http/            context（已驗證身分的請求脈絡）／respond／dispatch（路由表）
+    └── modules/<domain>/  access（事實讀取）・guard（逐動作授權）
+                           service（交易編排）・views／routes（HTTP 與 HTML）
+
+**分層契約**（每個模組一致）：
+route 讀表單、從 Session 取身分、呼叫 guard 與 service、轉成 HTTP；
+service 不 import `node:http` 型別也不產生 HTML，未知 DB 錯誤原樣上拋不偽裝成 409；
+**DB 守衛不搬進 TypeScript**，仍是最後防線。不加 Repository 層——現有 SQL 與 DB
+守衛是控制的本體，多包一層泛型只會隱藏交易邊界。
+
+**授權原則（不可退讓）**：一律**案件層逐動作**判斷。
+`engagementRolesOf()` 只查 `engagement_id = :e`；`tenantRolesOf()` 只查 `IS NULL`；
+兩者**不得聯集**——§26.3 明定 R1～R5、R7 屬 EngagementAssignment，Tenant 內每個
+Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
+拒絕時 CVA 分開記錄 `engagement_roles` 與 `tenant_roles`，稽核軌跡才答得出
+「缺的是角色種類還是授權範圍」。
+
+**拆層期間封閉的六類既有授權缺口**（皆非拆層造成，皆有反證過的負面測試）：
+
+| # | 缺口 | 修補 |
+|---|---|---|
+| 1 | R1／R6 可讀 Adjustment（只判 `roles.size > 0`） | §24.6 白名單 `ADJUSTMENT_READERS` |
+| 2 | 租戶層 R2／R3／R4 可跨案件讀寫 | `engagementRolesOf` 拆出，聯集函式刪除 |
+| 3 | `/b04/submit` **完全沒有角色檢查** | 逐動作白名單（`imports/guard.ts` 的 `B04`） |
+| 4 | B-06／B-07 用萬用守衛，且信任請求附帶的 batch | `runGate`／`packageGate` 沿父鏈反查歸屬 |
+| 5 | `/upload` 把租戶層角色算進授權 | 只接受案件層 R1／R2 |
+| 6 | 同案件跨法人錯配（A 法人 TB 掛 B 法人期間） | 應用層驗到 ReportingUnit．legal_entity_id ＋ **migration 0024 DB 守衛** |
+
+**驗證紀律**：每個授權修補都以「反轉該條件後測試必須轉紅」實測過。
+只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
+否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
+
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 764 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis 各自單跑（自行重建 DB 並補齊前置） | 9～15 秒 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
-| `pnpm test`（＝`test:full`） | 完整 712 條 | **262 秒（4.7 分鐘）** |
+| `pnpm test`（＝`test:full`） | 完整 764 條 | **約 4～5 分鐘** |
 | `pnpm test:acceptance:<suite>` | 九支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
@@ -86,8 +131,10 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   人工確認；0019／0020 硬化與 **0021 關閉收口**；M2-04 已正式關閉）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-05.md`（期間生命週期
   §25.8 完整狀態機、DB 唯一裁決點、fail closed 穩定代碼）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-06.md`（**最新接續入口**：多基礎與
-  四類規則最小資料模型、0023、審查節奏決議）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-07_SLICE-M2-06.md`（多基礎與四類規則最小
+  資料模型、0023、審查節奏決議）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-10_ROUTE-SERVICE.md`（**最新接續入口**：
+  API 模組化拆層、六類授權缺口封閉、0024、測試分級）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -139,8 +186,19 @@ DB 為唯一裁決點（`app_runtime` 對 `period_revision` 只餘 INSERT／SELE
 `AUTO_POST_NOT_IMPLEMENTED:`、`RECON_RUN_PREDATES_BASIS_MODEL:`）。
 
 下一刀：**自動保存、儲存狀態與 Session 恢復**（NFR-UX-001／NFR-INT-002）——
-完成後里程碑 2 離開盤點的阻擋清單即清空，可重跑離開複核，
-之後把重心轉向可操作產品（B-00 工作台、期間工作台、匯入、映射、調整覆核與預覽流程）。
+**這是里程碑 2 離開盤點的最後一個阻擋項**，完成後即可重跑離開複核。
+
+範圍限定在 **B-05 Adjustment 草稿**，不做全平台通用編輯框架：
+dirty 時 5 秒內嘗試自動保存；blur、切換案件、送覆核、Session 到期前立即保存；
+畫面顯示「未保存／保存中／已保存／保存失敗／版本衝突」；
+`object_version` ＋ `edit_session_id` ＋ `client_save_sequence`（§26.9 三層版本語意）；
+已獲伺服器確認的草稿不得遺失；**不使用 IndexedDB／localStorage 保存客戶財務內容**；
+Session 恢復後回到原案件、期間與 Adjustment；兩個分頁衝突不得互相覆蓋；
+PREVIEW run 繼續只讀 manifest 凍結內容。
+Adjustment 驗證完成後，再把同一套能力擴到映射草稿。
+
+**不要再做結構重構**——拆層已於 2e19c9b 結束，server.ts 54 行已達目標，
+不得為了行數繼續拆。
 
 **審查節奏（2026-08-07 決議）**：審查預算按不可逆性投放。
 第一級（資料模型、跨租戶、安全、會計口徑、金額精度、狀態機、版本與稽核軌跡）
