@@ -1,269 +1,382 @@
 # SLICE-M3-02　折算與外幣報表折算差額（CTA）
 
-> 狀態：**事前契約草案，待走查確認**。風險：**第一級**（幣別、金額精度、CTA 物化、
-> 匯率版本凍結）。依 2026-08-07 的審查節奏決議，第一級風險先寫契約與負面測試，
-> **契約確認後才寫 migration，不先做畫面**。
+> 狀態：**事前契約 第二版（走查修訂後）**，待確認；**尚未批准進 migration**。
+> 風險：**第一級**（幣別、金額精度、CTA 物化、匯率版本凍結、權益折算）。
 >
 > 對應基線：手冊 v1.2 REQ-FX-001／AC-FX-001／§20 MVP 3；設計書 v1.1 §25.3、§26.6、
-> §26.11、§26.12（INV-19／20／22／24）、D-26-05／D-26-06、§28 B-06。
+> §26.11、§26.12（INV-19／20／22）、D-26-06、§28 B-06。
+> 會計法源：《企業會計準則第 19 號——外幣折算》第十二條及應用指南。
 
 ## 為什麼是這一刀
 
-里程碑 2 交付的 `CalculationRun` 一律 `calculation_scope = 'NO_FX'`（0012 的 CHECK），
-所有金額只有一種幣別。中國母公司要的是**人民幣**口徑，而日本子公司的帳是**日圓**——
-沒有折算，整條鏈的終點就還不是母公司拿得到的東西。這是 MVP 3 的第一個必要條件。
+里程碑 2 交付的計算一律 `calculation_scope = 'NO_FX'`（0012 的 CHECK 寫在
+`calculation_input_manifest` 上），所有金額只有一種幣別。中國母公司要的是**人民幣**
+口徑，日本子公司的帳是**日圓**——沒有折算，整條鏈的終點還不是母公司拿得到的東西。
 
-折算也是全案最容易出錯的地方：它同時牽涉幣別角色、匯率版本、方法選擇、精度與尾差，
-而且 **CTA 是「算出來的差」而不是「抄來的數」**——錯了不會有任何來源檔案能對照。
-因此本刀的產出首先是**六項凍結決定**，其次才是實作。
+折算也是全案最容易錯而**沒有來源檔案可對照**的地方：CTA 是算出來的差，不是抄來的數。
+因此本刀先凍結決定，再實作。
 
 ## 一、幣別角色（INV-22／D-26-06）
 
-**決定：新增 `ReportingUnitCurrencyAssignment`（role × currency × 有效期間 × 批准）。**
+**`ReportingUnitCurrencyAssignment`（role × currency × 有效期間 × 批准）。**
 
-- `currency_role`：本刀只實作 **`FUNCTIONAL`（功能幣）** 與 **`REPORTING`（報告幣）**。
-  `TRANSACTION`／`SECONDARY_REPORTING` 明列不做（見 §八）。
-- **INV-22 兩半都要**：
-  (a) 同一 `ReportingUnit` 在**同一時點**只能有一個有效的 `FUNCTIONAL` 指派——
-      以排除約束（`daterange` ＋ `EXCLUDE USING gist`）在 DB 強制，不是應用層檢查；
-  (b) `CalculationRun` 必須**凍結所使用的指派版本**（見 §六）。
-- `ReportingUnit.current_functional_currency` **維持快取語意**（D-26-06），
-  折算一律讀有效期間指派，**不得**讀該欄位。快取與指派不一致時以指派為準；
-  本刀不新增「同步快取」的觸發器（那會讓快取看起來像真相）。
-- 指派需批准（`approved_by`／`approved_at`）。未批准的指派不得被 run 凍結——
+- `currency_role`：本刀實作 **`FUNCTIONAL`** 與 **`REPORTING`**。
+- **兩個角色都限制同一時點各一個有效指派**，以 `daterange` ＋ `EXCLUDE USING gist`
+  在 DB 強制。REPORTING 現在就不允許多值——多值卻沒有選擇規則，等於把「用哪個報告幣」
+  留給實作當下猜。日後要第二報告幣時新增 `SECONDARY_REPORTING`（本刀不做）。
+- **run 同時凍結兩者**（INV-22 (b)），見 §六。
+- `ReportingUnit.current_functional_currency` **維持快取語意**（D-26-06）；折算一律讀
+  有效期間指派，**不得**讀該欄位，也不新增同步觸發器——那會讓快取看起來像真相。
+- 指派需批准（`approved_by`／`approved_at`）。未批准的指派不得被 run 凍結，
   否則「功能幣是誰決定的」在稽核上沒有答案。
-- 幣別代碼採 ISO 4217；每個幣別的**最小單位小數位**（JPY 0、CNY 2）為主檔事實，
-  不寫死在程式（見 §四）。
+- 幣別代碼採 ISO 4217；**最小單位小數位**（JPY 0、CNY 2）是幣別主檔事實，不寫死在程式。
 
-不同功能幣的分公司或海外營運單位建成**獨立 ReportingUnit**（D-26-06），本刀不做
-單一單位內多功能幣。
+## 二、匯率：版本與觀測分離
 
-## 二、匯率版本（G-07）
+**決定：拆成兩層。**
 
-**決定：新增 `ExchangeRate`（來源、`rate_type`、幣別對、日期、版本），版本隨期間鎖定凍結。**
+    ExchangeRateVersion          工作流與不可變版本（DRAFT → SUBMITTED → APPROVED）
+    └─ ExchangeRateObservation   實際匯率列
 
-- `rate_type ∈ {CLOSING（期末）, AVERAGE（期中）, HISTORICAL（歷史）}`。
-- 唯一性：`(rate_version_id, from_currency, to_currency, rate_type, rate_date)`。
-- **匯率版本是不可變的集合**：發布後不得改列。改率＝發新版本，既有 run 仍指向舊版本。
-- **G-07 的落點與嚴格程度**：`output_capability = NONE`——§28 的守衛表明定 G-07
-  「連預覽都不產生」。因此：
-  - 現行 `NO_FX` run **維持合法**，不需要匯率版本（它不宣稱任何折算結果）；
-  - `FX_TRANSLATION` run 若匯率版本未指定或未凍結，**建立即拒絕**，回穩定代碼
-    `G07_RATE_VERSION_NOT_FROZEN:`，不建立半套 run，也不產生預覽。
-- **授權**：§24.6 的 `匯率版本 ExchangeRate` 列為 `R2: R S`、`R3: R V`、`R4: R A`、
-  `R6: C U`。即：**R6 建立與維護匯率資料，R2 提交，R3 覆核，R4 批准**——
-  R2 不得自行批准自己要用的匯率。G-07 的「誰能處理」欄寫 R2／R6，與此一致
-  （指定版本是 R2 的事，補資料是 R6 的事）。發布（凍結）視為批准動作，屬 R4。
-- 缺率的處理：**逐筆 fail closed**，不得回退到其他 rate_type。缺一筆歷史匯率就
-  拒絕整個 run，代碼 `FX_RATE_MISSING:`，並列出缺哪個幣別對、哪個 rate_type、哪一天。
+**報價方向（唯一，不接受另一種寫法）：**
 
-## 三、折算方法（`TranslationPolicyVersion`）
+    target_amount = source_amount × rate        （rate 為 from_currency → to_currency）
 
-**決定：方法是資料，不是程式碼分支。**
+- **只接受直接幣別對**。本刀**不做倒數推算，也不做交叉匯率**：JPY→CNY 就必須有
+  JPY→CNY 的觀測，不得由 CNY→JPY 取倒數，也不得經 USD 換算。缺就 fail closed。
+  倒數與交叉都會引入第二個捨入點，讓重演與勾稽失去唯一解。
+- **各 rate_type 的期間語意不同，不能共用一個模糊的 `rate_date`**：
 
-沿用 0023 已凍結的原則——約束由屬性驅動，不得由代碼驅動。折算政策是一張
-「科目性質 → rate_type」的對照表並版本化：
+  | `rate_type` | 期間欄位 | 語意 |
+  |---|---|---|
+  | `CLOSING` | `measurement_date`（精確計量日） | 資產負債表日即期匯率 |
+  | `AVERAGE` | `coverage_start` ／ `coverage_end` | 該區間的平均或合理近似 |
+  | `HISTORICAL` | `event_date` | 對應某一次權益事件的發生日 |
 
-| 適用範圍（依 `Account.account_class` 與 `balance_behavior`） | rate_type |
-|---|---|
-| 資產、負債（STOCK） | `CLOSING` |
-| 損益（FLOW） | `AVERAGE` |
-| 權益－實收資本等出資項目 | `HISTORICAL`（逐筆） |
-| 權益－期初未分配利潤 | `HISTORICAL`（＝前期期末率） |
+  `AVERAGE` 的覆蓋區間必須**涵蓋**所折算期間，否則拒絕（`FX_RATE_COVERAGE_MISMATCH:`）。
+  「用 3 月平均折算 2 月」是安靜的錯，必須擋。
+- **凍結規則**：`SUBMITTED` 後匯率列與期間欄位凍結；`APPROVED` 後**整版不可變**
+  （含新增觀測）。改率＝發新版本，既有 run 仍指向舊版本。
+- **G-07 的嚴格程度**：`output_capability = NONE`——§28 守衛表明定「連預覽都不產生」。
+  - 既有 `NO_FX` run **維持合法**，不需要匯率版本（它不宣稱任何折算結果）；
+  - `FX_TRANSLATION` run 若匯率版本未指定或未 `APPROVED`，**建立即拒絕**，
+    穩定代碼 `G07_RATE_VERSION_NOT_FROZEN:`，不建立半套 run，不產生預覽。
+- **缺率逐筆 fail closed**：`FX_RATE_MISSING:`，列出缺哪個幣別對、哪個 `rate_type`、
+  哪一天／哪個區間。**不得回退到其他 rate_type**。
+- **授權**（§24.6 `匯率版本 ExchangeRate` 列）：R6 `C U` 建立與維護、R2 `R S` 提交、
+  R3 `R V` 覆核、R4 `R A` 批准。R2 不得自行批准自己要用的匯率。
 
-- 手冊 §233–238 只說「通常」「或以合理方法確定的近似匯率」——因此**方法必須是
-  每個客戶批准的政策版本**，不是平台寫死的規則。MVP 3 的離開條件也寫「方法／粒度
-  獲確認」：`TranslationPolicyVersion` 帶 `approved_by`／`approved_at`，**未批准的
-  政策版本不得被 run 凍結**。
-- **權益的歷史匯率是逐筆的**（§28 B-06 線框寫明「權益：歷史匯率（逐筆）」）。
-  本刀的決定：需要歷史匯率的科目，若找不到對應的 `HISTORICAL` 觀測，
-  **fail closed**（`FX_RATE_MISSING:`），**不得**回退到期末率。
-  「靜默用期末率折算實收資本」會直接把 CTA 算錯，且沒有任何跡象。
-- 政策版本不涵蓋的科目類別 → 同樣 fail closed（`FX_METHOD_UNRESOLVED:`），
-  不設「其他一律期末率」的預設。預設值在這裡就是靜默的錯。
+## 三、折算分類與方法
 
-## 四、金額精度與尾差（D-26-05／INV-24）
+### 3.1 科目模型不足，必須補分類
 
-**決定（在契約層凍結，實作不得自行選擇）：**
+現有 `account` 只有 `balance_behavior = STOCK／FLOW`，不足以選擇方法；即使補上
+ASSET／LIABILITY／EQUITY 也**分不出實收資本、保留盈餘、股利分配與其他權益變動**，
+而這四者的折算處理完全不同。
+
+**決定：新增受控的 `translation_category`（八值，不得由科目代碼推斷）：**
+
+    ASSET  LIABILITY  INCOME  EXPENSE
+    EQUITY_CONTRIBUTED  EQUITY_RETAINED  EQUITY_DISTRIBUTION  EQUITY_OTHER
+
+- 掛在 `Account` 上，屬集團科目表的事實（與 `MappingRule` 的目標科目一致）。
+- **每個納入 run 的科目必須恰好命中一條 policy rule**：缺漏 → `FX_METHOD_UNRESOLVED:`；
+  重疊 → `FX_METHOD_AMBIGUOUS:`。兩者都拒絕整個 run。
+- 不設「其他一律期末率」的預設。預設值在這裡就是靜默的錯。
+
+### 3.2 `TranslationPolicyVersion`：方法是資料，不是程式碼分支
+
+沿用 0023 已凍結的原則（約束由屬性驅動、代碼不驅動約束）。政策版本需批准
+（MVP 3 離開條件寫明「方法／粒度獲確認」），未批准者不得被 run 凍結。
+
+| `translation_category` | 處理 | 法源 |
+|---|---|---|
+| `ASSET`／`LIABILITY` | `CLOSING`（資產負債表日即期匯率） | CAS 19 §12 |
+| `INCOME`／`EXPENSE` | `AVERAGE`（交易發生日匯率或合理近似） | CAS 19 §12 |
+| `EQUITY_CONTRIBUTED` | **逐筆** `HISTORICAL`（見 §3.3） | CAS 19 §12（除未分配利潤外的所有者權益按交易發生日匯率） |
+| `EQUITY_DISTRIBUTION` | 逐筆 `HISTORICAL`（宣告或支付日） | 同上 |
+| `EQUITY_OTHER` | 逐筆 `HISTORICAL` | 同上 |
+| `EQUITY_RETAINED` | **不乘任何匯率**，由延續橋接得出（見 §3.4） | CAS 19 §12 應用指南 |
+
+`TranslationPolicyVersion` 另須凍結 **CTA 落點**（見 §五）。
+
+### 3.3 `EquityTranslationLot`：權益的歷史匯率需要資料來源
+
+「實收資本逐筆歷史匯率」在 TB 上**無法取得**——TB 只有餘額，沒有每次出資的日期。
+
+**決定：新增 `EquityTranslationLot`（權益折算批次）：**
+
+    account_id                  科目
+    event_date                  出資／權益變動日期
+    functional_amount           功能幣金額
+    exchange_rate_observation_id 歷史匯率觀測（HISTORICAL，event_date 相符）
+    evidence_ref / approved_by / approved_at   證據與批准快照
+    version / superseded_by     有效版本鏈
+
+- **合計一致性（fail closed）**：某科目所有 **active** lots 的 `functional_amount` 合計
+  必須等於該科目的功能幣餘額，否則整個 run 拒絕，代碼 `EQUITY_LOT_SUM_MISMATCH:`，
+  並列出科目、餘額與 lots 合計。差一塊錢就代表有一次出資沒被記錄，
+  其歷史匯率也就沒被使用——那筆差額會被靜默吸收進 CTA。
+- lots 集合的版本被 run 凍結（見 §六）。
+
+### 3.4 保留盈餘：延續橋接，不是「餘額 × 某率」
+
+**這是本版最重要的更正。** 保留盈餘不得以 JPY 餘額乘上任何單一匯率。CAS 19 的處理是
+由歷史已折算餘額**延續**：
+
+    期末保留盈餘（報告幣）
+      ＝ 前期已鎖定的期末已折算保留盈餘
+      ＋ 本期已折算損益
+      －  已折算股利／分配
+      ±  其他已批准的權益變動
+
+- 在**試算表**層次（本刀的輸出形式），`EQUITY_RETAINED` 一行呈現的是**期初**已折算
+  保留盈餘；本期損益仍在 `INCOME`／`EXPENSE` 各科目（已按 `AVERAGE` 折算），
+  結帳分錄不在本刀範圍。因此上式在 TB 上自動成立，可作為**勾稽檢查**：
+  期末已折算 RE ＝ 期初已折算 RE ＋ 本期已折算損益淨額。
+- **期初已折算保留盈餘是明示且經批准的輸入**（`EquityOpeningTranslatedBalance`：
+  reporting_unit × period_revision × account × 報告幣金額 × 批准 × 版本），
+  由前期鎖定的期末值產生；**首期或找不到時 fail closed**，
+  代碼 `FX_OPENING_EQUITY_MISSING:`。
+  首次導入的期初橋接方法（REQ-PER-101）本身不在本刀——本刀只要求那個值**存在且經批准**。
+- 該輸入的版本被 run 凍結。
+
+## 四、金額精度
 
 | 項目 | 決定 |
 |---|---|
 | 匯率精度 | `numeric(18,8)`——保存來源提供的位數，不得預先四捨五入 |
 | 金額精度 | 目標幣別的**最小單位**（CNY 2 位、JPY 0 位），由幣別主檔決定 |
-| 捨入模式 | **`ROUND_HALF_UP`**，逐筆（逐 `BalanceSnapshotLine` × `amount_role`）套用 |
-| 捨入時點 | **折算後立即捨入並保存**；不保存未捨入的中間值當作真相 |
-| 合計方式 | 合計＝**已捨入金額的加總**，不得由未捨入值另算一次（兩者會不一致） |
+| 捨入模式 | **`ROUND_HALF_UP`**，**逐行**（逐 `BalanceSnapshotLine`）套用 |
+| 捨入時點 | 折算後立即捨入並保存；不保存未捨入的中間值當作真相 |
+| 合計方式 | 合計＝**已捨入金額的加總**，不得由未捨入值另算一次 |
+| 運算型別 | **全程 `numeric`；任何金額或匯率都不得進入 JavaScript `Number`** |
 
-捨入模式與時點是 AC-FX-001「重跑結果一致」的一部分：兩台機器對同一輸入必須得到
-**逐位元相同**的結果，因此不能依賴任何語言預設的浮點行為——一律 `numeric`。
+最後一條是硬性的：`Number` 是 IEEE 754 雙精度，`0.1 + 0.2 !== 0.3`，一旦金額經過它，
+AC-FX-001 的「重跑結果一致」就只是碰巧成立。折算計算**在 DB 內以 `numeric` 完成**，
+應用層只搬運字串。
 
-**尾差（`RoundingTolerance`）**：
-- 依 D-26-05 獨立於財務重要性，scope 為
-  `ReportingUnit → CurrencyPair → TranslationMethod → AccountClass → OutputProfile`，
-  **另行設定與批准**。
-- **INV-24 兩層同時滿足**才可自動結案：單筆容許值 **且**
-  「同期間 × 同幣別 × 同折算 run」的**累積**容許值。任一層不滿足 → 差異維持 `OPEN`。
-- 自動結案標記 `RESOLVED_BY_POLICY` 並記錄政策版本；**紀錄完整保留**，
-  不得刪除或合併（§28 B-06 要求把「已自動結案」連同政策版本與累計檢查顯示出來）。
-- 本刀**不實作**自動結案的畫面操作，只實作判定與紀錄。
+**`RoundingTolerance` 與尾差自動結案移到下一刀。** 理由有二：
+(a) D-26-05 的 scope 鏈包含尚未實作的 `OutputProfile`；
+(b) INV-24 管的是**調節差異的自動結案**，不是 CTA 計算本身。本刀只凍結逐行
+`ROUND_HALF_UP`，不引入任何容許值概念——沒有門檻，就沒有「被吃掉的差」。
 
-## 五、CTA 顯式物化（INV-20）
+## 五、CTA：獨立的報告層調整，不冒充一般分錄
 
-**決定：CTA 是一筆系統產生的分錄，不是兩個金額的差。**
+### 5.1 為什麼不能塞進 `JournalEntry`
 
-INV-20 已明定不得由兩幣別金額相減推導（JPY 與 CNY 單位不同，相減無意義）。本刀要
-額外解決兩個**現有模型與 INV-20 對不上的地方**——這正是先寫契約的理由：
+現有 `JournalEntry` 的語意是**借貸平衡**（`fn_journal_entry_*` 守衛與 `journal_line`
+的平衡檢查都建立在此）。CTA 是為了補足「折算後借貸總額差」，本質上是**單邊的報告層
+調整**：只記借方 97,159 的普通分錄本身不平；硬補一筆貸方對應列，又等於憑空造出一個
+不存在的科目餘額，反而修正不了折算差額。
 
-**(a) CTA 分錄的 `rule_type` 放哪裡。**
-0023 把 `posting_layer.TRANSLATION_ADJUSTMENT` 的 `rule_type` 設為 `NULL`，
-並在檔頭寫明「NULL 是有意義的值：逐筆分錄的歸屬隨折算刀」，同時以
-`LAYER_RULE_TYPE_UNSET` 顯式拒絕規則版本引用該層。
-**決定：維持該層 `rule_type = NULL`，`rule_type` 落在分錄上**——
-同一個 TRANSLATION_ADJUSTMENT 層同時承載實體層 CTA（`GROUP_GAAP`）與合併層 CTA
-（`CONSOLIDATION`），把它塞回層上就必須拆成兩個層，那是代碼驅動約束的變形。
-CTA 分錄的 `rule_type` 必填且只允許這兩值。
+**決定：獨立成新實體，不動 `JournalEntry`。**
 
-**(b) 系統產生的分錄目前無路可走。**
-現況 `journal_entry.adjustment_id` 為 **NOT NULL**，且 `fn_journal_entry_layer_guard`
-假設分錄一定來自 Adjustment。CTA 沒有 Adjustment。
-**決定：新增 `source_kind ∈ {ADJUSTMENT, SYSTEM_TRANSLATION}` 與 `translation_run_id`**，
-並以 XOR 約束強制：
-- `ADJUSTMENT`：`adjustment_id` 必填、`translation_run_id` 必為 NULL（現行行為不變）；
-- `SYSTEM_TRANSLATION`：`adjustment_id` 必為 NULL、`translation_run_id` 必填、
-  `posting_layer_id` 必為 `TRANSLATION_ADJUSTMENT`、`rule_type` 必填。
-- **`app_runtime` 不得直接寫入 `SYSTEM_TRANSLATION` 分錄**——只能由折算函式在同一
-  交易內產生。人手寫得出來的 CTA 不是算出來的 CTA。
-- 既有的 `adjustment_version_id` 必填規則只適用 `ADJUSTMENT`；
-  `SYSTEM_TRANSLATION` 以 `translation_run_id` 承擔同等的可追溯責任。
+    TranslationAdjustmentEntry
+    ├─ calculation_run_id / reporting_unit_id / period_revision_id
+    ├─ posting_layer_id = TRANSLATION_ADJUSTMENT
+    ├─ rule_type ∈ {GROUP_GAAP, CONSOLIDATION}      本刀只產生 GROUP_GAAP
+    ├─ translation_policy_version_id / exchange_rate_version_id
+    └─ TranslationAdjustmentLine［］
+       └─ account_id / debit / credit / 說明
 
-**(c) CTA 的金額怎麼定。** 折算後**借貸兩方各自加總**（皆為已捨入的目標幣金額），
-差額即為 CTA，記入 TRANSLATION_ADJUSTMENT 層使報表回到平衡。這個數字必須能被
-逐科目重算驗證（見 §七的算例），而不是「補平用的插栓」。
+- `rule_type` **落在分錄上，不落在層上**——0023 已把 `TRANSLATION_ADJUSTMENT` 層的
+  `rule_type` 設為 `NULL` 並註明「逐筆分錄的歸屬隨折算刀」，同時以
+  `LAYER_RULE_TYPE_UNSET` 拒絕規則版本引用該層。同一層要同時承載實體層 CTA
+  （`GROUP_GAAP`）與合併層 CTA（`CONSOLIDATION`），塞回層上就得拆成兩個層，
+  那是代碼驅動約束的變形。
+- **`app_runtime` 不得直接寫入**——只能由折算函式在同一交易內產生。
+  人手寫得出來的 CTA 不是算出來的 CTA。
+- 完成後物化進 `BalanceSnapshotLine`（`posting_layer = TRANSLATION_ADJUSTMENT`），
+  與 `SOURCE_TB`／`ADJUSTMENT` 兩層並列。
+
+### 5.2 CTA 科目必須被凍結
+
+系統若只知道金額而不知道應落在哪個科目，CTA 就無法出現在報表上。
+**`TranslationPolicyVersion` 必須凍結：**
+
+    cta_account_id              CTA 科目
+    cta_coa_id                  該科目所屬的集團科目表（版本）
+    applicable_reporting_unit   適用報告單位
+    approved_by / approved_at   批准版本
+
+`cta_account_id` 的科目必須屬於 `cta_coa_id`，且該 COA 必須是本案件的集團科目表——
+否則拒絕（`CTA_ACCOUNT_SCOPE_INVALID:`）。
+
+### 5.3 CTA 金額怎麼定
+
+折算後借貸兩方各自加總（皆為已捨入的目標幣金額），差額即為 CTA。它必須能被逐科目
+重算驗證（§七），而不是「補平用的插栓」。
 
 ## 六、凍結集合與重演（AC-FX-001）
 
-**決定：擴充既有的 `CalculationInputManifest`，不另立一套。**
-
-現況 `calculation_manifest_entry` 已是通用的
+**擴充既有 `CalculationInputManifest`，不另立一套。** 現況
+`calculation_manifest_entry` 已是通用的
 `(object_type, object_id, domain_version_kind, domain_version_value, content_hash)`
-結構，因此折算只需新增 `object_type`：
+結構，因此只需新增 `object_type`：
 
-    exchange_rate_version         匯率版本
-    translation_policy_version    折算政策版本
-    currency_assignment           幣別角色指派（INV-22 (b)）
-    rounding_tolerance_set        尾差容許值版本集合
+    exchange_rate_version              匯率版本
+    translation_policy_version         折算政策版本（含 CTA 科目凍結）
+    currency_assignment                幣別角色指派（FUNCTIONAL 與 REPORTING 各一筆）
+    equity_translation_lot_set         權益折算批次集合
+    equity_opening_translated_balance  期初已折算權益餘額
 
-- `calculation_run.calculation_scope` 的 CHECK 由 `= 'NO_FX'` 放寬為
-  `IN ('NO_FX','FX_TRANSLATION')`。**`NO_FX` 的既有行為完全不變**——
-  既有 calculation-run 與 evidence-package 測試即為回歸判準，斷言不得修改。
-- `frozen_set_content_hash` 與 `result_content_hash` 涵蓋上述新條目；
-  兩者仍**排除** run_id 與時間戳（0012 已凍結的規則）。
-- **重演**沿用 02B 的語意：新 run 帶 `replay_of_run_id` 引用**同一份 Manifest**，
-  失敗屬 replay run，原 run 永不修改。AC-FX-001 的「指定實體、期間與匯率版本重跑
-  結果一致」即以此證明。
-- **`TranslationResult` 提供反查**：掛在 `BalanceSnapshotLine` 之下，
-  `amount_role` ＋ `currency_code` ＋ `amount` ＋ `source_amount_ref`（被折算的來源金額）
-  ＋ `fx_rate_ref`（用了哪一筆匯率）＋ `translation_method` ＋ `translation_run_id`。
-  **INV-19**：同一 SnapshotLine 下每個 `amount_role` 至多一筆——DB 唯一索引。
-- `balance_snapshot_line.posting_layer` 的 CHECK 由 `('SOURCE_TB','ADJUSTMENT')`
-  增加 `'TRANSLATION_ADJUSTMENT'`。
-- **雙幣寬表不做**：設計書已註明 `amount_functional`／`amount_reporting` 寬表僅為
-  查詢效能，**不是模型的一部分**；`TranslationResult` 是邏輯真相。
+- **每一條都必須同時保存 `object_id` 與 `content_hash`**，不得只存版本 ID——
+  同一 ID 的內容若日後漂移（即使有不可變約束，資料修復或遷移仍可能發生），
+  只比 ID 的重演會宣稱一致而實際不同。
+- `calculation_input_manifest.calculation_scope` 的 CHECK 由 `= 'NO_FX'` 放寬為
+  `IN ('NO_FX','FX_TRANSLATION')`（**該欄在 manifest 上，不在 `calculation_run`**）。
+  **`NO_FX` 的既有行為完全不變**——calculation-run 33 條與 evidence-package 31 條
+  即為回歸判準，斷言不得修改。
+- `frozen_set_content_hash` 與 `result_content_hash` 涵蓋新條目；兩者仍**排除**
+  run_id 與時間戳（0012 已凍結的規則）。
+- **重演**沿用 02B：新 run 帶 `replay_of_run_id` 引用**同一份 Manifest**，失敗屬
+  replay run，原 run 永不修改。
+
+### `TranslationResult`：方向明確、可反查
+
+不使用「一個正負不明的 `amount`」，與既有快照的借貸表示保持一致：
+
+    source_snapshot_line_id       被折算的來源行
+    amount_role                   本刀固定 REPORTING
+    currency_code
+    source_debit / source_credit  來源（功能幣）金額
+    result_debit / result_credit  折算後（報告幣）金額
+    exchange_rate_observation_id  用了哪一筆觀測（HISTORICAL 時指向 lot 的觀測）
+    translation_policy_rule_id    命中哪一條政策規則
+    equity_lot_id                 逐筆權益折算時指向來源 lot（其餘為 NULL）
+    calculation_run_id
+
+- **INV-19**：`(source_snapshot_line_id, amount_role)` 唯一索引。
+- **雙幣寬表不做**：設計書已註明 `amount_functional`／`amount_reporting` 寬表僅為查詢
+  效能，不是模型的一部分；`TranslationResult` 是邏輯真相。
 
 ## 七、驗收算例（Case-001，手算）
 
-沿用 `tests/fixtures/case-001/expected_adjusted_group_tb_2026-03.csv`（JPY，調整後集團 TB，
-借貸各 59,000,000）。功能幣 JPY、報告幣 CNY。匯率版本 `2026-03 v1`：
+來源：`tests/fixtures/case-001/expected_adjusted_group_tb_2026-03.csv`（JPY，調整後集團
+TB，借貸各 59,000,000）。功能幣 JPY、報告幣 CNY。匯率版本 `2026-03 v1`（已 APPROVED）：
 
-| rate_type | 幣別對 | 率 |
+| `rate_type` | 期間欄位 | JPY→CNY |
 |---|---|---|
-| `CLOSING` 2026-03-31 | JPY→CNY | 0.048120 |
-| `AVERAGE` 2026-03 | JPY→CNY | 0.047950 |
-| `HISTORICAL`（實收資本，出資日） | JPY→CNY | 0.050000 |
-| `HISTORICAL`（期初未分配利潤＝前期期末） | JPY→CNY | 0.049000 |
+| `CLOSING` | `measurement_date = 2026-03-31` | 0.048120 |
+| `AVERAGE` | `coverage 2026-03-01 ～ 2026-03-31` | 0.047950 |
+| `HISTORICAL` | `event_date = 2018-06-15` | 0.061000 |
+| `HISTORICAL` | `event_date = 2022-09-01` | 0.051000 |
 
-| 科目 | JPY 淨額 | 方法 | CNY |
+`EquityTranslationLot`（4001 实收资本，合計 JPY 10,000,000 ＝ 該科目功能幣餘額 ✓）：
+
+| `event_date` | 功能幣 | 觀測 | 報告幣 |
 |---|---:|---|---:|
-| 1001 库存现金 | 350,000 D | CLOSING | 16,842.00 D |
-| 1002 银行存款 | 9,650,000 D | CLOSING | 464,358.00 D |
-| 1122 应收账款 | 5,600,000 D | CLOSING | 269,472.00 D |
-| 1405 库存商品 | 2,300,000 D | CLOSING | 110,676.00 D |
-| 1601 固定资产 | 4,600,000 D | CLOSING | 221,352.00 D |
-| 2202 应付账款 | 3,900,000 C | CLOSING | 187,668.00 C |
-| 2221 应交税费 | 800,000 C | CLOSING | 38,496.00 C |
-| 4001 实收资本 | 10,000,000 C | HISTORICAL | 500,000.00 C |
-| 4104 未分配利润 | 2,100,000 C | HISTORICAL | 102,900.00 C |
-| 6001 主营业务收入 | 42,000,000 C | AVERAGE | 2,013,900.00 C |
-| 6401 主营业务成本 | 21,700,000 D | AVERAGE | 1,040,515.00 D |
-| 6602 管理费用 | 14,600,000 D | AVERAGE | 700,070.00 D |
+| 2018-06-15 | 7,000,000 | 0.061000 | 427,000.00 |
+| 2022-09-01 | 3,000,000 | 0.051000 | 153,000.00 |
 
-借方合計 **2,823,285.00**、貸方合計 **2,842,964.00**。
+`EquityOpeningTranslatedBalance`（4104 未分配利润，經批准）：**CNY 100,380.00**。
 
-    CTA ＝ 2,842,964.00 − 2,823,285.00 ＝ 19,679.00（借方）
+| 科目 | 分類 | JPY 淨額 | 方法 | CNY |
+|---|---|---:|---|---:|
+| 1001 库存现金 | ASSET | 350,000 D | CLOSING | 16,842.00 D |
+| 1002 银行存款 | ASSET | 9,650,000 D | CLOSING | 464,358.00 D |
+| 1122 应收账款 | ASSET | 5,600,000 D | CLOSING | 269,472.00 D |
+| 1405 库存商品 | ASSET | 2,300,000 D | CLOSING | 110,676.00 D |
+| 1601 固定资产 | ASSET | 4,600,000 D | CLOSING | 221,352.00 D |
+| 2202 应付账款 | LIABILITY | 3,900,000 C | CLOSING | 187,668.00 C |
+| 2221 应交税费 | LIABILITY | 800,000 C | CLOSING | 38,496.00 C |
+| 4001 实收资本 | EQUITY_CONTRIBUTED | 10,000,000 C | 逐筆 lots | **580,000.00 C** |
+| 4104 未分配利润 | EQUITY_RETAINED | 2,100,000 C | **延續橋接（不乘匯率）** | **100,380.00 C** |
+| 6001 主营业务收入 | INCOME | 42,000,000 C | AVERAGE | 2,013,900.00 C |
+| 6401 主营业务成本 | EXPENSE | 21,700,000 D | AVERAGE | 1,040,515.00 D |
+| 6602 管理费用 | EXPENSE | 14,600,000 D | AVERAGE | 700,070.00 D |
 
-物化為 `PostingLayer = TRANSLATION_ADJUSTMENT`、`rule_type = GROUP_GAAP`、
-`source_kind = SYSTEM_TRANSLATION` 的分錄，帶 `translation_run_id`。加入後借貸皆為
-2,842,964.00。**這個數字是驗收判準**——不是「系統算出多少就是多少」。
+借方合計 **2,823,285.00**、貸方合計 **2,920,444.00**。
 
-**捨入判準另用一個刻意不整除的案例**（上表以整除設計，好讓 CTA 唯一可驗）：
-`HISTORICAL` 改 0.0481233 時，1001 為 350,000 × 0.0481233 ＝ 16,843.155 →
-`ROUND_HALF_UP` 2 位 → **16,843.16**。若實作用了 banker's rounding 會得 16,843.15，
-測試必須轉紅。
+    CTA ＝ 2,920,444.00 − 2,823,285.00 ＝ 97,159.00（借方）
+
+物化為 `TranslationAdjustmentEntry`（`rule_type = GROUP_GAAP`、
+`posting_layer = TRANSLATION_ADJUSTMENT`、落在凍結的 `cta_account_id`），加入後借貸
+皆為 2,920,444.00。
+
+**CTA 為借方（權益減項）是合理的**：出資時 1 JPY 值 0.061／0.051 CNY，期末只值
+0.048120——功能幣相對報告幣貶值，以歷史匯率入帳的權益在報告幣下高於以期末匯率折算的
+淨資產，差額落在借方。**若實作把 CTA 算成貸方，方向就是錯的**，驗收會擋下。
+
+**RE 勾稽**（§3.4 的算式在 TB 上的表現）：
+本期已折算損益淨額 ＝ 2,013,900.00 − 1,040,515.00 − 700,070.00 ＝ **273,315.00**；
+期末已折算保留盈餘 ＝ 100,380.00 ＋ 273,315.00 ＝ **373,695.00**。
+
+**捨入判準另用刻意不整除的案例**（上表以整除設計，好讓 CTA 唯一可驗）：
+觀測改 0.0481233 時，1001 為 350,000 × 0.0481233 ＝ 16,843.155 →
+`ROUND_HALF_UP` 2 位 → **16,843.16**。banker's rounding 會得 16,843.15，測試必須轉紅。
 
 ## 八、不做
 
-- **不解鎖期間狀態機**：`ADJ_APPROVED → CALCULATING` 與其後各段在 0028 的規格函式中
-  維持 `NOT_IMPLEMENTED`。折算在本刀屬 **`CalculationRun` 範圍**（沿用 02B 的
-  `run_type = PREVIEW`），期間仍停在 `ADJ_APPROVED`。理由：解鎖 `CALCULATING` 需要
-  同時具備 G-07、調節核對與 G-03（B 基礎），那是下一刀；現在動它會讓 0028 的規格與
-  期間套件 68 條斷言變成「計畫中的差異」而不是回歸釘子。**解鎖條件寫在本節，
-  不留給下一個 session 猜。**
-- **不做 REQ-CFS-001（現金流）**：它與 REQ-FX-001 同屬 §20 的 MVP 3 列，但本刀只做折算。
-  `CashFlowClass` 維持 P0 的「保存與映射」，不重建現金流量表。
-- 不做 `TRANSACTION`／`SECONDARY_REPORTING` 兩個 `amount_role`。
-- 不做首次導入的期初與歷史匯率橋接（REQ-PER-101／AC-PER-101）——那是獨立一刀。
-- 不做合併層 CTA（`rule_type = CONSOLIDATION`）的**產生**：本刀只保留該值的合法性，
-  合併與抵銷不在 MVP 3。
-- 不做匯率來源的自動抓取或 API 整合（R6 手動維護）。
-- 不做 B-06 的折算畫面。畫面在契約與 DB 驗證完成後另開一刀。
+- **不解鎖期間狀態機**：`ADJ_APPROVED → CALCULATING` 及其後各段在 0028 的規格函式中
+  維持 `NOT_IMPLEMENTED`。本刀只建立可重演的 `FX_TRANSLATION` **PREVIEW**
+  `CalculationRun`；期間仍停在 `ADJ_APPROVED`。**解鎖條件**：下一刀具備調節核對
+  （含 INV-24 與 `RoundingTolerance`）與 G-03／G-07 的期間級判定後，才處理該遷移。
+- **不做 REQ-CFS-001（現金流）**：**另開 MVP 3 現金流切片；未完成前 MVP 3 不得關閉。**
+  現行程式與 schema 中尚無 `CashFlowClass`，不得寫成「維持 P0 保存與映射」。
+- **不做 `RoundingTolerance` 與尾差自動結案**（INV-24）——移到下一刀調節核對（見 §四）。
+- 不做 `TRANSACTION`／`SECONDARY_REPORTING` 兩個 `amount_role`，也不做第二報告幣。
+- 不做首次導入的期初橋接**方法**（REQ-PER-101）；本刀只要求
+  `EquityOpeningTranslatedBalance` 存在且經批准。
+- 不做合併層 CTA（`rule_type = CONSOLIDATION`）的**產生**：只保留該值的合法性。
+- 不做倒數與交叉匯率、不做匯率來源自動抓取（R6 手動維護）。
+- 不做 B-06 的折算畫面。畫面在 DB 驗證完成後另開一刀。
 - 不做雙幣寬表、不做交易級外幣重估（後者是 A 基礎的既有結果，§24 邊界已排除）。
 
 ## 九、驗收
 
-1. **INV-22 (a)**：同一 ReportingUnit 同一時點插入第二個有效 `FUNCTIONAL` → DB 拒絕。
-2. **INV-22 (b)**：run 的 Manifest 含 `currency_assignment` 條目；
-   指派其後變更不影響既有 run 的重演結果。
-3. **G-07**：`FX_TRANSLATION` run 未指定或未凍結匯率版本 → 建立即拒絕、
-   **不產生任何 run 與預覽**、`output_capability = NONE`；`NO_FX` run 不受影響。
-4. **缺率 fail closed**：缺一筆 `HISTORICAL` → 整個 run 拒絕並列出缺哪一筆；
-   **反證：加入「找不到就用期末率」的回退 → 測試必須轉紅**。
-5. **算例**：§七逐科目 12/12 相符，CTA ＝ 19,679.00 借方，且 CTA 為
-   `SYSTEM_TRANSLATION` 分錄而非計算欄位。
-6. **INV-20 反證**：把 CTA 改成由兩幣別合計相減求得 → 測試必須轉紅
-   （相減得到的是同一個數字，因此判準必須釘在**分錄是否存在與可追溯**，不是數值）。
-7. **INV-19**：同一 SnapshotLine 同一 `amount_role` 插入第二筆 → DB 拒絕。
-8. **捨入**：§七的 `ROUND_HALF_UP` 案例；改成 banker's rounding → 轉紅。
-9. **INV-24**：單筆通過但累積超限的尾差 → 維持 `OPEN`，不得自動結案；
-   **反證：只檢查單筆 → 測試必須轉紅**。
-10. **重演**：同一 Manifest 重跑，`result_content_hash` 完全相同；
-    改匯率版本後重跑 → 產生新 run，舊 run 不變。
-11. **`SYSTEM_TRANSLATION` 不可人手寫入**：`app_runtime` 直接 INSERT → 拒絕。
-12. **既有 `NO_FX` 行為不變**：calculation-run 33 條與 evidence-package 31 條
+1. **INV-22 (a)**：同一 ReportingUnit 同一時點插入第二個有效 `FUNCTIONAL` → DB 拒絕；
+   `REPORTING` 同樣拒絕。
+2. **INV-22 (b)**：Manifest 含 `currency_assignment` 兩筆；指派其後變更不影響既有 run 的
+   重演結果。
+3. **G-07**：`FX_TRANSLATION` run 未指定或匯率版本未 `APPROVED` → **建立即拒絕**、
+   不產生任何 run 與預覽；`NO_FX` run 不受影響。
+4. **缺率 fail closed**：缺一筆 `HISTORICAL` → 整個 run 拒絕並列出缺哪一筆。
+   **反證：加入「找不到就用期末率」的回退 → 測試必須轉紅。**
+5. **報價方向與直接幣別對**：只有 CNY→JPY 觀測時，JPY→CNY 折算必須拒絕，
+   **不得取倒數**；反證：加入倒數推算 → 轉紅。
+6. **`AVERAGE` 覆蓋區間**：以 2 月的 AVERAGE 折算 3 月 → 拒絕。
+7. **分類解析**：科目缺 policy rule → `FX_METHOD_UNRESOLVED:`；命中兩條 →
+   `FX_METHOD_AMBIGUOUS:`；兩者皆拒絕整個 run。
+8. **`EQUITY_RETAINED` 不得乘匯率**：反證——把 4104 改成 `餘額 × CLOSING`
+   → 算例轉紅（CTA 不再是 97,159.00）。
+9. **lots 合計一致**：把一筆 lot 的 `functional_amount` 改小 → `EQUITY_LOT_SUM_MISMATCH:`
+   拒絕整個 run，**不得**把差額靜默併入 CTA。
+10. **期初已折算餘額缺失** → `FX_OPENING_EQUITY_MISSING:` 拒絕。
+11. **算例**：§七逐科目 12/12 相符；**CTA ＝ 97,159.00 且在借方**；
+    RE 勾稽 100,380.00 ＋ 273,315.00 ＝ 373,695.00。
+12. **INV-20 反證**：把 CTA 改成由兩幣別合計相減得出 → 轉紅。
+    （相減得到同一個數字，因此判準釘在**分錄是否存在、是否可追溯到政策版本與匯率版本**，
+    不是數值本身。）
+13. **CTA 落點**：`cta_account_id` 不屬於本案件集團科目表 → 拒絕；
+    政策版本未凍結 CTA 科目 → 拒絕。
+14. **INV-19**：同一 `(source_snapshot_line_id, amount_role)` 插入第二筆 → DB 拒絕。
+15. **`TranslationAdjustmentEntry` 不可人手寫入**：`app_runtime` 直接 INSERT → 拒絕。
+16. **捨入**：§七的 `ROUND_HALF_UP` 案例；改 banker's rounding → 轉紅。
+17. **重演**：同一 Manifest 重跑 `result_content_hash` 完全相同；改匯率版本後重跑 →
+    產生新 run，舊 run 不變。**反證：Manifest 只存版本 ID 不存 content hash，
+    再竄改該版本內容 → 重演必須失敗**。
+18. **既有 `NO_FX` 行為不變**：calculation-run 33 條與 evidence-package 31 條
     **斷言一字不改**全綠。
-13. 完整測試一輪全綠。
+19. 完整測試一輪全綠。
 
 ## 十、風險
 
-**第一級。** 三個真正的風險：
+**第一級。** 四個真正的風險：
 
-1. **CTA 算錯而無人察覺**——它沒有來源檔案可對照。緩解：§七的手算算例是唯一判準，
-   且驗收 6 釘住「必須是分錄」而非「數字對就好」。
-2. **靜默回退**（缺率用期末率、未涵蓋科目用預設方法）——會產生看起來正常、實際錯誤的
-   報表。緩解：全部 fail closed，驗收 4 與 §三的方法未解析各有反證。
+1. **權益折算錯而無人察覺**——保留盈餘若被當成「餘額 × 某率」，數字看起來正常，
+   CTA 卻整個錯。緩解：§3.4 的延續橋接、驗收 8 的反證、RE 勾稽等式。
+2. **靜默回退**（缺率用期末率、倒數推算、未涵蓋科目用預設方法、lots 差額併入 CTA）——
+   會產生看起來正常、實際錯誤的報表。緩解：全部 fail closed，驗收 4／5／7／9 各有反證。
 3. **精度與捨入不確定**——重演不一致會讓 AC-FX-001 直接不成立。緩解：精度、捨入模式、
-   捨入時點、合計方式四項在契約層凍結，實作不得自行選擇。
+   捨入時點、合計方式、**不得進 JS `Number`** 五項在契約層凍結。
+4. **CTA 冒充一般分錄**——塞進 `JournalEntry` 會破壞借貸平衡語意或造出假餘額。
+   緩解：獨立實體 `TranslationAdjustmentEntry`。
 
 實作順序（契約確認後）：
-migration（幣別指派 → 匯率 → 政策 → 尾差 → JE 系統來源 → TranslationResult ＋ manifest 擴充）
-→ DB 負面測試（1／2／3／4／7／9／11）→ 折算函式 → 算例驗收（5／6／8／10）
-→ `NO_FX` 回歸（12）→ 完整一輪（13）。**畫面不在本刀。**
+migration（幣別指派 → 匯率版本／觀測 → `translation_category` → 政策版本＋CTA 科目 →
+權益 lots 與期初已折算餘額 → `TranslationAdjustmentEntry`／Line → `TranslationResult`
+＋ manifest 擴充與 `calculation_scope` 放寬）
+→ DB 負面測試（1～10、13～15）→ 折算函式（DB 內 `numeric`）
+→ 算例驗收（11／12／16／17）→ `NO_FX` 回歸（18）→ 完整一輪（19）。**畫面不在本刀。**
