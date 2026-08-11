@@ -116,10 +116,22 @@ expect_err "0030：幣別指派的報告單位須屬本案件" \
   "§24.1A"
 
 # ══ 4　匯率版本工作流與自然人 SoD ══════════════════════════════════
+RSERIES=f0300000-0000-0000-0000-000000000101
+# FX 專屬使用者：同時持有 R3 與 R4，用來驗「覆核人可接著批准」的兩人路徑。
+# 不改動共用的甲乙丙——那會動到前面各套件的前提。
+FXU=af300000-0000-0000-0000-000000000001
+_has app_user "user_id = '$FXU'" || PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO app_user (user_id, tenant_id, email, display_name)
+VALUES ('$FXU','$TEN','fx-reviewer@t1.jp','FX 覆核者');
+INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id) VALUES
+  ('$TEN','$FXU','R2','$ENG'), ('$TEN','$FXU','R3','$ENG'), ('$TEN','$FXU','R4','$ENG');
+SQL
 PSQL_C >/dev/null 2>&1 <<SQL
 $T1
-INSERT INTO exchange_rate_version (rate_version_id, tenant_id, label, created_by)
-VALUES ('$FXV','$TEN','2026-03 v1','$JIA');
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('$FXV','$TEN','$ENG','2026-03 v1','$RSERIES',1,'$JIA');
 INSERT INTO exchange_rate_observation (observation_id, tenant_id, rate_version_id, from_currency,
         to_currency, rate_type, rate, source, measurement_date)
 VALUES ('$OBS_CLOSE','$TEN','$FXV','JPY','CNY','CLOSING',0.04812,'BOJ','2026-03-31');
@@ -132,6 +144,28 @@ VALUES ('$OBS_HIST','$TEN','$FXV','JPY','CNY','HISTORICAL',0.061,'契約','2018-
 SQL
 n=$(PSQL_C <<<"$T1 SELECT count(*) FROM exchange_rate_observation WHERE rate_version_id='$FXV'")
 [ "$n" = "3" ] && ok "0030：DRAFT 匯率版本可自由增減觀測（3 筆）" || ng "0030：觀測建立失敗（${n}）"
+
+# 0031：建立時不得自填操作者，也不得直接以非 DRAFT 建立
+expect_err "0031：建立時自填 submitted_by → 拒絕（操作者由 DB 查證）" \
+  "$T1 INSERT INTO exchange_rate_version (tenant_id, engagement_id, label, series_id, version_no,
+        created_by, submitted_by, submitted_at)
+   VALUES ('$TEN','$ENG','偽造','f0300000-0000-0000-0000-000000000199',1,'$JIA','$JIA',now())" \
+  "RATE_VERSION_ACTOR_NOT_SELF_DECLARED"
+expect_err "0031：不得直接以 APPROVED 建立" \
+  "$T1 INSERT INTO exchange_rate_version (tenant_id, engagement_id, label, series_id, version_no,
+        created_by, status)
+   VALUES ('$TEN','$ENG','偽造2','f0300000-0000-0000-0000-000000000198',1,'$JIA','APPROVED')" \
+  "RATE_VERSION_MUST_START_DRAFT"
+
+# 0031：唯一鍵 NULLS NOT DISTINCT——同一版本不得有兩筆一模一樣的 CLOSING
+expect_err "0031：同版本重複的 CLOSING 觀測 → 拒絕（NULL 必須視為相等）" \
+  "$T1 INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency,
+        to_currency, rate_type, rate, source, measurement_date)
+   VALUES ('$TEN','$FXV','JPY','CNY','CLOSING',0.99,'重複','2026-03-31')" "duplicate key"
+expect_err "0031：同版本重複的 HISTORICAL 觀測 → 拒絕" \
+  "$T1 INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency,
+        to_currency, rate_type, rate, source, event_date)
+   VALUES ('$TEN','$FXV','JPY','CNY','HISTORICAL',0.99,'重複','2018-06-15')" "duplicate key"
 
 expect_err "0030：CLOSING 不得帶 coverage 區間（期間語意不可混用）" \
   "$T1 INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
@@ -154,12 +188,27 @@ expect_err "0030：同一幣別不得互相報價" \
    VALUES ('$TEN','$FXV','JPY','JPY','CLOSING',1,'x','2026-03-31')" \
   "violates check constraint"
 
-expect_err "0030：不得由 DRAFT 直接跳到 APPROVED" \
-  "$T1 UPDATE exchange_rate_version SET status='APPROVED', approved_by='$BING', approved_at=now()
-   WHERE rate_version_id='$FXV'" "RATE_VERSION_ILLEGAL_TRANSITION"
-expect_ok  "0030：DRAFT → SUBMITTED（R2 甲提交）" \
-  "$T1 UPDATE exchange_rate_version SET status='SUBMITTED', submitted_by='$JIA', submitted_at=now()
-   WHERE rate_version_id='$FXV'"
+# ── 0031：狀態遷移只能經函式，且操作者由 DB 查證 ──
+fxt() { echo "$T1 SELECT fn_exchange_rate_transition('$1','$2','$3','$4','$5'"${6:+,'$6'}")"; }
+expect_err "0031：直接 UPDATE 改狀態 → 拒絕（只能經遷移函式）" \
+  "$T1 UPDATE exchange_rate_version SET status='SUBMITTED' WHERE rate_version_id='$FXV'" \
+  "RATE_VERSION_TRANSITION_ONLY"
+expect_err "0031：直接 UPDATE 改標籤 → 拒絕" \
+  "$T1 UPDATE exchange_rate_version SET label='偷改' WHERE rate_version_id='$FXV'" \
+  "RATE_VERSION_TRANSITION_ONLY"
+expect_err "0031：不得跳關（DRAFT → APPROVED）" \
+  "$(fxt "$FXV" DRAFT APPROVED "$BING" R4)" "RATE_VERSION_ILLEGAL_TRANSITION"
+expect_err "0031：角色不符（提交需 R2，帶 R4）" \
+  "$(fxt "$FXV" DRAFT SUBMITTED "$JIA" R4)" "ROLE_NOT_PERMITTED"
+# 丙在 fx_core 只有 R1，是「案件內但無該角色」的樣本
+expect_err "0031：發起人未於本案件持有 R2 → ACTOR_ROLE_NOT_HELD" \
+  "$(fxt "$FXV" DRAFT SUBMITTED "$BING" R2)" "ACTOR_ROLE_NOT_HELD"
+expect_err "0031：樂觀鎖——expected_from 不符" \
+  "$(fxt "$FXV" SUBMITTED REVIEWED "$FXU" R3)" "OPTIMISTIC_LOCK_CONFLICT"
+expect_ok  "0031：甲（R2）提交 → SUBMITTED" "$(fxt "$FXV" DRAFT SUBMITTED "$JIA" R2)"
+sub=$(PSQL_C <<<"$T1 SELECT submitted_by FROM exchange_rate_version WHERE rate_version_id='$FXV'")
+[ "$sub" = "$JIA" ] && ok "0031：提交人由函式依查證結果寫入（非呼叫者自填）" \
+  || ng "0031：提交人為 ${sub}"
 expect_err "0030：SUBMITTED 後觀測列凍結（不得新增）" \
   "$T1 INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
         rate_type, rate, source, measurement_date)
@@ -170,24 +219,31 @@ expect_err "0030：SUBMITTED 後觀測列凍結（不得修改）" \
 expect_err "0030：SUBMITTED 後觀測列凍結（不得刪除）" \
   "$T1 DELETE FROM exchange_rate_observation WHERE observation_id='$OBS_AVG'" \
   "RATE_OBSERVATIONS_FROZEN"
-# 自然人層 SoD：提交人不得覆核自己提交的版本（FX_RATE_SELF_REVIEW_DENIED）
-expect_err "0030 SoD：提交人甲不得覆核自己提交的匯率版本" \
-  "$T1 UPDATE exchange_rate_version SET status='REVIEWED', reviewed_by='$JIA', reviewed_at=now()
-   WHERE rate_version_id='$FXV'" "FX_RATE_SELF_REVIEW_DENIED"
-expect_ok  "0030 SoD：乙獨立覆核 → REVIEWED" \
-  "$T1 UPDATE exchange_rate_version SET status='REVIEWED', reviewed_by='$YI', reviewed_at=now()
-   WHERE rate_version_id='$FXV'"
+# 自然人層 SoD：提交人不得覆核自己提交的版本。
+# 反例必須是「角色齊備、只差不是同一人」——用沒有 R3 的甲來測，
+# 會被 ACTOR_ROLE_NOT_HELD 以另一個理由擋下，證不到 SoD 本身。
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('$FXV2','$TEN','$ENG','SoD 樣本 v1','f0300000-0000-0000-0000-000000000102',1,'$FXU');
+SQL
+expect_ok  "0031 前置：FX 覆核者（持 R2／R3／R4）提交另一個版本" \
+  "$(fxt "$FXV2" DRAFT SUBMITTED "$FXU" R2)"
+expect_err "0030 SoD：同一人提交後不得自行覆核（角色齊備仍被擋）" \
+  "$(fxt "$FXV2" SUBMITTED REVIEWED "$FXU" R3)" "FX_RATE_SELF_REVIEW_DENIED"
+expect_ok  "0030 SoD：FX 覆核者獨立覆核 → REVIEWED" "$(fxt "$FXV" SUBMITTED REVIEWED "$FXU" R3)"
 # 兩人事務所必須能運作：覆核人可以接著批准
-expect_ok  "0030 SoD：覆核人乙可接著批准（兩人即可運作）" \
-  "$T1 UPDATE exchange_rate_version SET status='APPROVED', approved_by='$YI', approved_at=now()
-   WHERE rate_version_id='$FXV'"
-expect_err "0030：APPROVED 後整版不可變" \
-  "$T1 UPDATE exchange_rate_version SET label='改名' WHERE rate_version_id='$FXV'" \
-  "RATE_VERSION_FROZEN"
+expect_ok  "0030 SoD：覆核人可接著批准（兩人即可運作）" \
+  "$(fxt "$FXV" REVIEWED APPROVED "$FXU" R4)"
+expect_err "0031：已批准的版本不得刪除" \
+  "$T1 DELETE FROM exchange_rate_version WHERE rate_version_id='$FXV'" "RATE_VERSION_DELETE_DENIED"
 expect_err "0030：APPROVED 後不得新增觀測" \
   "$T1 INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
         rate_type, rate, source, measurement_date)
    VALUES ('$TEN','$FXV','JPY','CNY','CLOSING',0.05,'x','2026-02-28')" "RATE_OBSERVATIONS_FROZEN"
+n=$(APP_C <<<"$T1 UPDATE exchange_rate_version SET label='x' WHERE rate_version_id='$FXV'" 2>&1 | grep -c "permission denied")
+[ "$n" -ge 1 ] && ok "0031：app_runtime 對匯率版本無 UPDATE 權限" || ng "0031：app_runtime 改得動匯率版本"
 
 # ══ 5　折算分類與政策版本 ═════════════════════════════════════════
 expect_err "0030：translation_category 不接受自創值" \
@@ -299,6 +355,11 @@ INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, p
   ('$MF','$TEN','$ENG','$RPB','NO_FX','sqlcanon-2','fx-fixture-1','$JIA'),
   ('$MF2','$TEN','$ENG','$RPB','NO_FX','sqlcanon-2','fx-fixture-2','$JIA'),
   ('$MF3','$TEN','$ENG','$PR','NO_FX','sqlcanon-2','fx-fixture-3','$JIA');
+-- Manifest 一旦被 run 引用就封存（INV-17），凍結條目必須先寫。
+-- MF2 凍結本案件的匯率版本——component 的「同凍結版本」檢查靠它。
+INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+VALUES ('$TEN','$MF2','EXCHANGE_RATE_VERSION','$FXV','version','1','fx','h-fx','{}'::jsonb);
 -- run 一律建立為 RUNNING（0012：結果狀態只能由執行交易寫入），再推到 COMPLETED
 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
         import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
@@ -408,6 +469,148 @@ done
 n=$(PSQL_C <<<"$T1 SELECT 1 FROM pg_constraint WHERE conname='balance_snapshot_line_posting_layer_check'
     AND pg_get_constraintdef(oid) LIKE '%TRANSLATION_ADJUSTMENT%'")
 [ "$n" = "1" ] && ok "0030：快照分層接受 TRANSLATION_ADJUSTMENT" || ng "0030：快照分層未擴充"
+
+# ══ 11　父鏈一致性與折算產出的不可變性（0031）══════════════════════
+# RLS 只證明「這一列的 tenant_id 是我的」。它擋不住「自己的 tenant_id ＋
+# 別人的父物件」——Adjustment 與 Mapping 已經踩過同一個洞。
+# 快照只能在 RUNNING 的 run 上追加（0012：終態後結果不可再變），
+# 因此折算結果的 fixture 掛在 RUN_RUNNING 上，另建一個 RUNNING 的 run 作跨 run 反例。
+ENTRY=f0350000-0000-0000-0000-000000000001
+MF4=99940000-0000-0000-0000-000000000004
+RUN_SNAP2=99950000-0000-0000-0000-000000000004
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('$MF4','$TEN','$ENG','$PR','NO_FX','sqlcanon-2','fx-fixture-4','$JIA');
+INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+VALUES ('$TEN','$MF4','EXCHANGE_RATE_VERSION','$FXV','version','1','fx','h-fx4','{}'::jsonb);
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by)
+VALUES ('$RUN_SNAP2','$TEN','$ENG','$PR','$B1','$MF4','PREVIEW','RUNNING',gen_random_uuid(),'h4','1.0.0','$JIA');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+VALUES ('$TEN','$RUN_RUNNING','SOURCE_TB','$ACC1','1001','库存现金',350000,0),
+       ('$TEN','$RUN_SNAP2','SOURCE_TB','$ACC1','1001','库存现金',1,0);
+SQL
+SNAP_OK=$(PSQL_C <<<"$T1 SELECT snapshot_line_id FROM balance_snapshot_line
+  WHERE calculation_run_id='$RUN_RUNNING' ORDER BY snapshot_line_id LIMIT 1")
+SNAP_OTHER=$(PSQL_C <<<"$T1 SELECT snapshot_line_id FROM balance_snapshot_line
+  WHERE calculation_run_id='$RUN_SNAP2' ORDER BY snapshot_line_id LIMIT 1")
+[ -n "$SNAP_OK" ] && [ -n "$SNAP_OTHER" ] && ok "0031 前置：兩個 run 各有一列快照" \
+  || ng "0031 前置：快照建立失敗"
+
+entry_sql() {  # $1=run $2=期間修訂 $3=單位 $4=政策 $5=匯率版本 $6=案件
+  echo "$T1 INSERT INTO translation_adjustment_entry (translation_entry_id, tenant_id, engagement_id,
+        reporting_unit_id, period_revision_id, calculation_run_id, posting_layer_id, rule_type,
+        reporting_currency, translation_policy_version_id, exchange_rate_version_id)
+   VALUES (gen_random_uuid(),'$TEN','$6','$3','$2','$1','$LAYER_TA','GROUP_GAAP','CNY','$4','$5')"
+}
+expect_err "0031 父鏈：CTA 分錄的 run 不屬本案件 → 拒絕" \
+  "$(entry_sql "$RUN_RUNNING" "$RPB" "$UNIT" "$POLV" "$FXV" "$ENG99")" "§24.1A"
+expect_err "0031 父鏈：CTA 分錄的期間修訂與 run 不一致 → 拒絕" \
+  "$(entry_sql "$RUN_RUNNING" "$PR" "$UNIT" "$POLV" "$FXV" "$ENG")" "CTA_PERIOD_MISMATCH"
+expect_err "0031 父鏈：匯率版本尚未批准 → G07 fail closed" \
+  "$(entry_sql "$RUN_RUNNING" "$RPB" "$UNIT" "$POLV" "$FXV2" "$ENG")" "G07_RATE_VERSION_NOT_FROZEN"
+expect_ok  "0031 父鏈：全部一致 → 接受（正控制）" \
+  "$T1 INSERT INTO translation_adjustment_entry (translation_entry_id, tenant_id, engagement_id,
+        reporting_unit_id, period_revision_id, calculation_run_id, posting_layer_id, rule_type,
+        reporting_currency, translation_policy_version_id, exchange_rate_version_id)
+   VALUES ('$ENTRY','$TEN','$ENG','$UNIT','$RPB','$RUN_RUNNING','$LAYER_TA','GROUP_GAAP','CNY','$POLV','$FXV')"
+expect_err "0031 父鏈：CTA 明細的科目不屬本案件科目表 → 拒絕" \
+  "$T1 INSERT INTO translation_adjustment_line (tenant_id, translation_entry_id, line_no,
+        account_id, debit) VALUES ('$TEN','$ENTRY',9,'$ACC99',1)" "§24.1A"
+LINE=f0360000-0000-0000-0000-000000000001
+expect_ok  "0031：CTA 明細（正控制）" \
+  "$T1 INSERT INTO translation_adjustment_line (translation_line_id, tenant_id, translation_entry_id,
+        line_no, account_id, debit) VALUES ('$LINE','$TEN','$ENTRY',1,'$CTA_ACC',97159.00)"
+
+expect_err "0031 父鏈：折算結果的來源快照屬於另一個 run → 拒絕" \
+  "$T1 INSERT INTO translation_result (tenant_id, calculation_run_id, source_snapshot_line_id,
+        amount_role, currency_code, source_debit, result_debit)
+   VALUES ('$TEN','$RUN_RUNNING','$SNAP_OTHER','REPORTING','CNY',1,1)" "TRANSLATION_RESULT_RUN_MISMATCH"
+
+# 延遲合計：彙總先建、明細後插，中間狀態不得誤擋；合計不符須在 COMMIT 時被擋下
+RES1=f0370000-0000-0000-0000-000000000001
+expect_ok  "0031：同一交易內先建彙總、再插兩筆明細 → COMMIT 通過（中間狀態不誤擋）" \
+  "$T1 BEGIN;
+   INSERT INTO translation_result (translation_result_id, tenant_id, calculation_run_id,
+     source_snapshot_line_id, amount_role, currency_code, source_debit, result_debit)
+   VALUES ('$RES1','$TEN','$RUN_RUNNING','$SNAP_OK','REPORTING','CNY',350000,16842.00);
+   INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no, source_kind,
+     exchange_rate_observation_id, source_debit, result_debit)
+   VALUES ('$TEN','$RES1',1,'RATE_TRANSLATION','$OBS_CLOSE',200000,9624.00),
+          ('$TEN','$RES1',2,'RATE_TRANSLATION','$OBS_CLOSE',150000,7218.00);
+   COMMIT;"
+expect_err "0031：明細合計與彙總不符 → COMMIT 時擋下" \
+  "$T1 BEGIN;
+   INSERT INTO translation_result (translation_result_id, tenant_id, calculation_run_id,
+     source_snapshot_line_id, amount_role, currency_code, source_debit, result_debit)
+   VALUES ('f0370000-0000-0000-0000-000000000002','$TEN','$RUN_SNAP2','$SNAP_OTHER',
+           'REPORTING','CNY',1,1);
+   INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no, source_kind,
+     exchange_rate_observation_id, source_debit, result_debit)
+   VALUES ('$TEN','f0370000-0000-0000-0000-000000000002',1,'RATE_TRANSLATION','$OBS_CLOSE',1,999);
+   COMMIT;" "TRANSLATION_COMPONENT_SUM_MISMATCH"
+
+# 「同凍結版本」：同租戶同案件的**另一份**匯率版本一樣不能用——
+# 只驗租戶不夠，run 凍結的是哪一版才是重點。
+FXV3=f0300000-0000-0000-0000-000000000003
+OBS_OTHER=f0310000-0000-0000-0000-000000000009
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('$FXV3','$TEN','$ENG','未被凍結的版本','f0300000-0000-0000-0000-000000000103',1,'$JIA');
+INSERT INTO exchange_rate_observation (observation_id, tenant_id, rate_version_id, from_currency,
+        to_currency, rate_type, rate, source, measurement_date)
+VALUES ('$OBS_OTHER','$TEN','$FXV3','JPY','CNY','CLOSING',0.09,'另一版','2026-03-31');
+SQL
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM exchange_rate_observation WHERE observation_id='$OBS_OTHER'")
+[ "$n" = "1" ] && ok "0031 前置：另一份匯率版本的觀測已建立（同租戶同案件）" \
+  || ng "0031 前置：另一版觀測建立失敗"
+expect_err "0031：component 引用未被本 run 凍結的匯率版本 → 拒絕" \
+  "$T1 INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no,
+        source_kind, exchange_rate_observation_id, source_debit, result_debit)
+   VALUES ('$TEN','$RES1',5,'RATE_TRANSLATION','$OBS_OTHER',1,1)" "TRANSLATION_SOURCE_NOT_FROZEN"
+
+expect_err "0031：component 的 XOR——RATE_TRANSLATION 缺匯率觀測" \
+  "$T1 INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no,
+        source_kind, source_debit, result_debit)
+   VALUES ('$TEN','$RES1',8,'RATE_TRANSLATION',1,1)" "violates check constraint"
+expect_err "0031：component 的 XOR——CTA_RESIDUAL 不得帶匯率觀測" \
+  "$T1 INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no,
+        source_kind, exchange_rate_observation_id, translation_adjustment_line_id,
+        source_debit, result_debit)
+   VALUES ('$TEN','$RES1',7,'CTA_RESIDUAL','$OBS_CLOSE','$LINE',1,1)" "violates check constraint"
+expect_err "0031：component 的 XOR——OPENING_TRANSLATED_BALANCE 必須指向期初餘額" \
+  "$T1 INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no,
+        source_kind, source_debit, result_debit)
+   VALUES ('$TEN','$RES1',6,'OPENING_TRANSLATED_BALANCE',1,1)" "violates check constraint"
+
+# 折算產出不可變：重算＝新的 run
+expect_err "0031：折算結果不可 UPDATE" \
+  "$T1 UPDATE translation_result SET result_debit=1 WHERE translation_result_id='$RES1'" \
+  "FX_OUTPUT_IMMUTABLE"
+expect_err "0031：折算明細不可 DELETE（不得改掛到別的彙總）" \
+  "$T1 DELETE FROM translation_result_component WHERE translation_result_id='$RES1'" \
+  "FX_OUTPUT_IMMUTABLE"
+expect_err "0031：CTA 分錄不可 UPDATE" \
+  "$T1 UPDATE translation_adjustment_entry SET rule_type='CONSOLIDATION' WHERE translation_entry_id='$ENTRY'" \
+  "FX_OUTPUT_IMMUTABLE"
+
+# 已批准的主檔物件不得刪除
+expect_err "0031：已批准的折算政策不得刪除" \
+  "$T1 DELETE FROM translation_policy_version WHERE policy_version_id='$POLV'" \
+  "FX_APPROVED_DELETE_DENIED"
+expect_err "0031：已批准的 lot set 不得刪除" \
+  "$T1 DELETE FROM equity_translation_lot_set_version WHERE set_version_id='$SETV'" \
+  "FX_APPROVED_DELETE_DENIED"
+expect_err "0031：已批准的期初餘額不得刪除" \
+  "$T1 DELETE FROM equity_opening_translated_balance WHERE period_revision_id='$PR'" \
+  "FX_APPROVED_DELETE_DENIED"
 
 # ══ 10　RLS ══════════════════════════════════════════════════════
 for t in exchange_rate_version translation_policy_version equity_translation_lot_set_version \
