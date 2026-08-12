@@ -835,6 +835,15 @@ expect_ok "Case-001 前置：批准折算政策、lot set、期初餘額、報�
    SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
      WHERE reporting_unit_id='$UNIT' AND currency_role='REPORTING'),'$FXU')"
 
+# 0038：引擎前置檢查——實際輸入必須等於現行 InputSelection。
+# 這是**預期的 fixture 變更**（M3-02 的斷言一字不改）。
+sel_inputs() {  # $1=來源 run $2=匯率版本 $3=政策版本
+  PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+SELECT fn_period_fx_select_inputs('$PR','$1','$2','$3','$JIA');
+SQL
+}
+sel_inputs "$SRCRUN" "$FXCASE" "$POLCASE"
 FXRUN=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
 [ -n "$FXRUN" ] && ok "Case-001：折算 run 建立成功" || ng "Case-001：折算失敗"
 
@@ -964,9 +973,11 @@ expect_ok "捨入前置：匯率版本走完工作流" \
    SELECT fn_exchange_rate_transition('$FXROUND','REVIEWED','APPROVED','$FXU','R4')"
 # 換匯率版本時，權益 lots 的歷史觀測就不再屬於本 run 凍結的版本——
 # 這是真規則（明細必須可追溯到凍結集合），因此換版本必須連 lot set 一起換。
+sel_inputs "$SRCRUN" "$FXROUND" "$POLCASE"
 expect_err "換匯率版本但 lot set 仍指向舊版觀測 → 拒絕（不是靜默沿用）" \
   "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXROUND','$POLCASE','$JIA','x')" \
   "TRANSLATION_SOURCE_NOT_FROZEN"
+sel_inputs "$SRCRUN" "$FXCASE" "$POLCASE"
 # 捨入判準改用不含權益科目的來源，隔離出「率 × 金額」這一件事
 SRCMF2=99940000-0000-0000-0000-000000000012
 SRCRUN2=99950000-0000-0000-0000-000000000012
@@ -986,6 +997,7 @@ VALUES ('$TEN','$SRCRUN2','SOURCE_TB','$(acc 01001)','C1001','库存现金',3500
 UPDATE calculation_run SET status='COMPLETED', result_content_hash='round-r', completed_at=now()
  WHERE calculation_run_id='$SRCRUN2';
 SQL
+sel_inputs "$SRCRUN2" "$FXROUND" "$POLCASE"
 FXRUN4=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN2','$FXROUND','$POLCASE','$JIA','fx-1.0.0')")
 n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
   JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
@@ -1013,15 +1025,19 @@ VALUES ('$TEN','$SRCRUN3','SOURCE_TB','$(acc 04001)','C4001','实收资本',0,99
 UPDATE calculation_run SET status='COMPLETED', result_content_hash='lm-r', completed_at=now()
  WHERE calculation_run_id='$SRCRUN3';
 SQL
+sel_inputs "$SRCRUN3" "$FXCASE" "$POLCASE"
 expect_err "lots 合計（10,000,000）不等於功能幣餘額（9,999,999）→ 整筆拒絕" \
   "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN3','$FXCASE','$POLCASE','$JIA','x')" \
   "EQUITY_LOT_SUM_MISMATCH"
+sel_inputs "$SRCRUN" "$FXCASE" "$POLCASE"
 
 # ══ 14　整筆拒絕，不留半套 run ══════════════════════════════════════
 pre=$(PSQL_C <<<"$T1 SELECT count(*) FROM calculation_run")
+sel_inputs "$SRCRUN" "$FXV2" "$POLCASE"
 expect_err "缺已批准匯率版本 → 整期折算不可用（G-07）" \
   "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXV2','$POLCASE','$JIA','x')" \
   "G07_RATE_VERSION_NOT_FROZEN"
+sel_inputs "$SRCRUN" "$FXCASE" "$POLCASE"
 expect_err "非 R2 不得發起折算" \
   "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$FXOPS','x')" \
   "ACTOR_ROLE_NOT_HELD"
@@ -1113,12 +1129,17 @@ n=$(PSQL_C <<<"$T1 SELECT payload->>'source_result_hash' FROM calculation_manife
 [ "$n" = "case001-r" ] && ok "凍結：來源 run 與其結果雜湊也在凍結清單內" || ng "來源雜湊為 ${n}"
 
 # source run 的完整驗證
-expect_err "來源 run 非 COMPLETED → 拒絕" \
-  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$RUN_RUNNING','$FXCASE','$POLCASE','$JIA','x')" \
-  "FX_SOURCE_RUN_NOT_COMPLETED\|§24.1A"
-expect_err "來源 run 屬別的期間 → 拒絕（釘住期間檢查本身的訊息）" \
-  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$RPC','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','x')" \
-  "來源 run 的案件或期間與本次折算不一致"
+# 0038 之後，來源 run 的合法性由**選定函式**先擋（第一道防線）；
+# 引擎內的同名檢查保留為縱深防禦，正常路徑走不到。
+expect_err "選定：來源 run 非 COMPLETED → 拒絕" \
+  "$T1 SELECT fn_period_fx_select_inputs('$PR','$RUN_RUNNING','$FXCASE','$POLCASE','$JIA')" \
+  "FX_INPUT_SOURCE_RUN_INVALID"
+expect_err "選定：來源 run 屬別的期間 → 拒絕" \
+  "$T1 SELECT fn_period_fx_select_inputs('$RPC','$SRCRUN','$FXCASE','$POLCASE','$JIA')" \
+  "FX_INPUT_SOURCE_RUN_INVALID\|ACTOR_ROLE_NOT_HELD"
+expect_err "引擎前置：傳入的輸入與現行選定不一致 → 不建立任何 run" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN2','$FXCASE','$POLCASE','$JIA','x')" \
+  "FX_INPUT_NOT_SELECTED"
 
 
 # ══ 16　Manifest 自身的完整性（0035）══════════════════════════════
@@ -1204,5 +1225,219 @@ st=$(PSQL_C <<<"$T1 SELECT status FROM calculation_run WHERE calculation_run_id=
 n=$(APP_C <<<"$T1 SELECT fn_fx_verify_manifest((SELECT manifest_id FROM calculation_run
      WHERE calculation_run_id='$FXRUN4'))" 2>&1 | grep -c "ERROR")
 [ "$n" = "0" ] && ok "0035：app_runtime 可自行驗證凍結集合（稽核用）" || ng "0035：app_runtime 無法驗證"
+
+
+# ══ 17　折算調節核對與期間級判定（0036–0038）══════════════════════
+TOLV=f0380000-0000-0000-0000-000000000001
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO rounding_tolerance_version (tolerance_version_id, tenant_id, engagement_id,
+        reporting_unit_id, source_currency, target_currency, single_limit, cumulative_limit,
+        series_id, version_no, created_by)
+VALUES ('$TOLV','$TEN','$ENG','$UNIT','JPY','CNY',0.05,0.20,
+        'f0380000-0000-0000-0000-000000000101',1,'$JIA');
+SQL
+n=$(APP_C <<<"$T1 INSERT INTO rounding_tolerance_version (tenant_id, engagement_id,
+      reporting_unit_id, source_currency, target_currency, single_limit, cumulative_limit,
+      series_id, version_no, created_by, approved_by, approved_at)
+    VALUES ('$TEN','$ENG','$UNIT','JPY','CNY',9,9,'f0380000-0000-0000-0000-000000000199',1,
+            '$JIA','$JIA',now())" 2>&1 | grep -c "permission denied")
+[ "$n" -ge 1 ] && ok "0036：app_runtime 不得自填容許值的批准欄（欄位級權限）" \
+  || ng "0036：容許值批准欄可自填"
+expect_err "0036：非 R4 不得批准容許值版本" \
+  "$T1 SELECT fn_rounding_tolerance_approve('$TOLV','$JIA')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0036：R4 批准容許值版本" "$T1 SELECT fn_rounding_tolerance_approve('$TOLV','$FXU')"
+expect_err "0036：已批准的容許值版本不可變更" \
+  "$T1 UPDATE rounding_tolerance_version SET single_limit=1 WHERE tolerance_version_id='$TOLV'" \
+  "TOLERANCE_IMMUTABLE"
+
+# 調節：Case-001 的正控制——所有類別零筆（內部核對不產生尾差）。
+# §16 的不可逆竄改破壞了 FXRUN 的凍結集合，因此另建一個乾淨的 run。
+sel_inputs "$SRCRUN" "$FXCASE" "$POLCASE"
+FXRUN5=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
+[ -n "$FXRUN5" ] && ok "0037 前置：另建凍結集合完整的 Case-001 FX run" || ng "0037 前置：建立失敗"
+RECON=$(PSQL_C <<<"$T1 SELECT fn_translation_reconcile('$FXRUN5','$TOLV','$JIA','recon-1.0.0')")
+[ -n "$RECON" ] && ok "0037：調節建立成功（單一交易、直接 FINALIZED）" || ng "0037：調節建立失敗"
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM translation_difference WHERE reconciliation_id='$RECON'")
+[ "$n" = "0" ] && ok "Case-001 調節：所有類別零筆差異（正確結果，非「還沒測到」）" \
+  || ng "Case-001 調節：出現 ${n} 筆差異"
+n=$(PSQL_C <<<"$T1 SELECT status||'/'||single_limit_snapshot||'/'||cumulative_limit_snapshot
+     FROM translation_reconciliation WHERE reconciliation_id='$RECON'")
+[ "$n" = "FINALIZED/0.05/0.20" ] && ok "0037：容許值快照凍結在調節上（不在 FX Manifest）" \
+  || ng "0037：調節快照為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT (reconciliation_engine_version='recon-1.0.0')
+     AND (canonicalization_version='sqlcanon-2') AND (length(reconciliation_input_hash)=64)
+     FROM translation_reconciliation WHERE reconciliation_id='$RECON'")
+[ "$n" = "t" ] && ok "0037：保存 engine／canonicalization 版本與 SHA-256 輸入雜湊" \
+  || ng "0037：版本或雜湊不符"
+expect_err "0037：同一 run 至多一份調節" \
+  "$T1 SELECT fn_translation_reconcile('$FXRUN5','$TOLV','$JIA','recon-1.0.0')" "duplicate key"
+expect_err "0036：調節不可 UPDATE" \
+  "$T1 UPDATE translation_reconciliation SET status='FINALIZED' WHERE reconciliation_id='$RECON'" \
+  "FX_OUTPUT_IMMUTABLE"
+expect_err "0036：調節不可 DELETE" \
+  "$T1 DELETE FROM translation_reconciliation WHERE reconciliation_id='$RECON'" "FX_OUTPUT_IMMUTABLE"
+
+# tolerance 的幣別對與明確指定
+TOLBAD=f0380000-0000-0000-0000-000000000002
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO rounding_tolerance_version (tolerance_version_id, tenant_id, engagement_id,
+        reporting_unit_id, source_currency, target_currency, single_limit, cumulative_limit,
+        series_id, version_no, created_by)
+VALUES ('$TOLBAD','$TEN','$ENG','$UNIT','USD','JPY',1,1,
+        'f0380000-0000-0000-0000-000000000102',1,'$JIA');
+SQL
+PSQL_C >/dev/null 2>&1 <<<"$T1 SELECT fn_rounding_tolerance_approve('$TOLBAD','$FXU')"
+expect_err "0037：容許值的幣別對與本 run 的報告幣不符 → 拒絕" \
+  "$T1 SELECT fn_translation_reconcile('$FXRUN3','$TOLBAD','$JIA','recon-1.0.0')" \
+  "TOLERANCE_CURRENCY_PAIR_MISMATCH"
+TOLDRAFT=f0380000-0000-0000-0000-000000000003
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO rounding_tolerance_version (tolerance_version_id, tenant_id, engagement_id,
+        reporting_unit_id, source_currency, target_currency, single_limit, cumulative_limit,
+        series_id, version_no, created_by)
+VALUES ('$TOLDRAFT','$TEN','$ENG','$UNIT','JPY','CNY',1,1,
+        'f0380000-0000-0000-0000-000000000103',1,'$JIA');
+SQL
+expect_err "0037：未批准的容許值版本不得使用" \
+  "$T1 SELECT fn_translation_reconcile('$FXRUN3','$TOLDRAFT','$JIA','recon-1.0.0')" \
+  "TOLERANCE_NOT_APPROVED"
+
+# ── INV-24：schema-level fixture ──
+# **本樣本不由折算流程產生**，用於驗證 DB 約束與 INV-24 判定。
+# 內部核對不產生尾差（引擎與 C2 同法同率），因此尾差只會來自日後的對外核對。
+RECON2=$(PSQL_C <<<"$T1 SELECT fn_translation_reconcile('$FXRUN3','$TOLV','$JIA','recon-1.0.0')")
+mkdiff() {  # $1=line_no $2=actual $3=comparison $4=unrounded $5=rounded
+  echo "$T1 INSERT INTO translation_difference (tenant_id, reconciliation_id, check_id,
+        comparison_context, actual_amount, comparison_amount, actual_difference, reason_class,
+        rounding_basis, unrounded_amount, rounded_amount, currency_minor_unit, rounding_mode,
+        expected_rounding_residual, detail, line_no)
+   VALUES ('$TEN','$RECON2','C2','EXTERNAL_OUTPUT',$2,$3,$2-$3,'ROUNDING_DIFFERENCE',
+           $4,$4,$5,2,'ROUND_HALF_UP',$5-$4,'schema-level fixture（不由折算流程產生）',$1)"
+}
+expect_err "0036：內部重算的差異不得標為 ROUNDING_DIFFERENCE" \
+  "$T1 INSERT INTO translation_difference (tenant_id, reconciliation_id, check_id,
+        comparison_context, actual_amount, comparison_amount, actual_difference, reason_class,
+        rounding_basis, unrounded_amount, rounded_amount, currency_minor_unit, rounding_mode,
+        expected_rounding_residual, detail, line_no)
+   VALUES ('$TEN','$RECON2','C2','INTERNAL_RECALCULATION',1,0.99,0.01,'ROUNDING_DIFFERENCE',
+           0.99,0.99,1.00,2,'ROUND_HALF_UP',0.01,'x',90)" "violates check constraint"
+expect_err "0036：尾差缺算術推導 → 拒絕" \
+  "$T1 INSERT INTO translation_difference (tenant_id, reconciliation_id, check_id,
+        comparison_context, actual_amount, comparison_amount, actual_difference, reason_class,
+        detail, line_no)
+   VALUES ('$TEN','$RECON2','C2','EXTERNAL_OUTPUT',1,0.99,0.01,'ROUNDING_DIFFERENCE','x',91)" \
+  "violates check constraint"
+expect_err "0036：尾差的方向必須與捨入殘差一致（絕對值相等不夠）" \
+  "$(mkdiff 92 0.99 1.00 1.00 1.01)" "violates check constraint"
+expect_err "0036：非尾差不得被自動結案" \
+  "$T1 INSERT INTO translation_difference (tenant_id, reconciliation_id, check_id,
+        comparison_context, actual_amount, comparison_amount, actual_difference, reason_class,
+        resolution_status, detail, line_no)
+   VALUES ('$TEN','$RECON2','C2','EXTERNAL_OUTPUT',1,0,1,'MISSING_RATE',
+           'RESOLVED_BY_POLICY','x',93)" "violates check constraint"
+
+
+# C2 是獨立重算：竄改產出後，調節必須抓出來（否則「第二次驗算」名不副實）
+sel_inputs "$SRCRUN" "$FXCASE" "$POLCASE"
+FXRUN6=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+ALTER TABLE translation_result DISABLE TRIGGER USER;
+UPDATE translation_result tr SET result_debit = result_debit + 100
+  FROM balance_snapshot_line b
+ WHERE b.snapshot_line_id = tr.source_snapshot_line_id
+   AND tr.calculation_run_id = '$FXRUN6' AND b.account_code = 'C1001';
+ALTER TABLE translation_result ENABLE TRIGGER USER;
+SQL
+n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN6' AND b.account_code='C1001'")
+[ "$n" = "16942.00" ] && ok "C2 前置：產出已被竄改（16,842.00 → 16,942.00）" \
+  || ng "C2 前置：竄改後為 ${n}"
+RECON3=$(PSQL_C <<<"$T1 SELECT fn_translation_reconcile('$FXRUN6','$TOLV','$JIA','recon-1.0.0')")
+n=$(PSQL_C <<<"$T1 SELECT reason_class||':'||actual_difference FROM translation_difference
+     WHERE reconciliation_id='$RECON3' AND check_id='C2'")
+[ "$n" = "UNEXPLAINED:100.00" ] && ok "C2：獨立重算抓出被竄改的產出（UNEXPLAINED 100.00）" \
+  || ng "C2：得 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM translation_difference
+     WHERE reconciliation_id='$RECON3' AND reason_class='ROUNDING_DIFFERENCE'")
+[ "$n" = "0" ] && ok "C2：竄改造成的差異不得被歸為尾差" || ng "C2：出現 ${n} 筆尾差"
+
+# ══ 18　兩支 readiness（0038）══════════════════════════════════════
+inrdy() { PSQL_C <<<"$T1 SELECT COALESCE((SELECT code FROM fn_period_fx_input_readiness('$1')
+          WHERE NOT ok ORDER BY seq LIMIT 1),'READY')"; }
+n=$(inrdy "$PR")
+[ "$n" = "READY" ] && ok "0038 輸入就緒：Case-001 的輸入齊備 → READY" || ng "0038 輸入就緒：${n}"
+n=$(inrdy "$GRP_PR")
+[ "$n" = "G07_INPUT_NOT_SELECTED" ] && ok "0038 輸入就緒：未選定輸入 → G07_INPUT_NOT_SELECTED" \
+  || ng "0038 輸入就緒：未選定時得 ${n}"
+# 兩支各司其職：尚未選定「結果」時，輸入就緒仍可通過
+n=$(PSQL_C <<<"$T1 SELECT fn_period_fx_result_ready('$PR')")
+[ "$n" = "POSTFX_RUN_NOT_SELECTED" ] && ok "0038 結果就緒：尚未選定結果 → POSTFX_RUN_NOT_SELECTED" \
+  || ng "0038 結果就緒：${n}"
+[ "$(inrdy "$PR")" = "READY" ] && ok "0038：輸入就緒不因「尚無結果」而失敗（不形成循環）" \
+  || ng "0038：輸入就緒被結果條件污染"
+
+expect_err "0038 選定結果：非 R4 不得選定" \
+  "$T1 SELECT fn_period_fx_select_run('$PR','$FXRUN5','$RECON','$JIA')" "ACTOR_ROLE_NOT_HELD"
+expect_err "0038 選定結果：replay run 不得作為現行結論" \
+  "$T1 SELECT fn_period_fx_select_run('$PR','$RP','$RECON','$FXU')" \
+  "FX_SELECTION_RUN_IS_REPLAY\|§24.1A"
+expect_err "0038 選定結果：調節不屬選定的 run → 拒絕" \
+  "$T1 SELECT fn_period_fx_select_run('$PR','$FXRUN3','$RECON','$FXU')" "FX_SELECTION_RECON_MISMATCH"
+expect_ok  "0038 選定結果：R4 選定 run 與其調節" \
+  "$T1 SELECT fn_period_fx_select_run('$PR','$FXRUN5','$RECON','$FXU')"
+n=$(PSQL_C <<<"$T1 SELECT fn_period_fx_result_ready('$PR')")
+[ "$n" = "POST_FX_RECONCILIATION_READY" ] && ok "0038 結果就緒：零差異 → POST_FX_RECONCILIATION_READY" \
+  || ng "0038 結果就緒：${n}"
+
+# 硬差異只要存在就失敗，狀態無關
+DIFF=$(PSQL_C <<<"$T1 INSERT INTO translation_difference (tenant_id, reconciliation_id, check_id,
+        comparison_context, actual_amount, comparison_amount, actual_difference, reason_class,
+        detail, line_no)
+   VALUES ('$TEN','$RECON','C2','INTERNAL_RECALCULATION',1,0,1,'MISSING_RATE','注入的硬差異',80)
+   RETURNING difference_id")
+n=$(PSQL_C <<<"$T1 SELECT fn_period_fx_result_ready('$PR')")
+[ "$n" = "POSTFX_HARD_DIFFERENCE_PRESENT" ] && ok "0038：硬差異存在 → 結果就緒失敗" \
+  || ng "0038：硬差異存在卻得 ${n}"
+expect_ok  "0038：R4 可將硬差異標為 ACCEPTED_EXCEPTION（調查紀錄）" \
+  "$T1 SELECT fn_translation_difference_resolve('$DIFF','$FXU','ACCEPTED_EXCEPTION','已調查：缺率')"
+n=$(PSQL_C <<<"$T1 SELECT fn_period_fx_result_ready('$PR')")
+[ "$n" = "POSTFX_HARD_DIFFERENCE_PRESENT" ] && ok "0038：標成 ACCEPTED_EXCEPTION **仍**不通過（G-07 是硬守衛）" \
+  || ng "0038：人工狀態讓硬錯誤放行 → ${n}"
+expect_err "0038：已是終態的差異不得再改" \
+  "$T1 SELECT fn_translation_difference_resolve('$DIFF','$FXU','EXPLAINED','再改一次')" \
+  "FX_DIFFERENCE_ALREADY_RESOLVED"
+expect_err "0036：差異不得經一般 UPDATE 修改" \
+  "$T1 UPDATE translation_difference SET resolution_status='RESOLVED' WHERE difference_id='$DIFF'" \
+  "FX_OUTPUT_IMMUTABLE"
+
+# selection 版本鏈：不得分叉
+SEL1=$(PSQL_C <<<"$T1 SELECT run_selection_id FROM period_fx_run_selection
+       WHERE period_revision_id='$PR' ORDER BY version_no DESC LIMIT 1")
+expect_err "0036：selection 不可修改（換選擇請發新版本）" \
+  "$T1 UPDATE period_fx_run_selection SET selected_by='$JIA' WHERE run_selection_id='$SEL1'" \
+  "FX_SELECTION_IMMUTABLE"
+# v1 已被 v2 指向後，再造一個 v3 也指向 v1 → 唯一索引擋下（不得分叉）
+expect_ok  "0036 前置：R4 改選（發 v2，向後指向 v1）" \
+  "$T1 SELECT fn_period_fx_select_run('$PR','$FXRUN5','$RECON','$FXU')"
+SELV1=$(PSQL_C <<<"$T1 SELECT run_selection_id FROM period_fx_run_selection
+        WHERE period_revision_id='$PR' AND version_no=1")
+expect_err "0036：同一舊版不得被兩個新版指向（不得分叉）" \
+  "$T1 INSERT INTO period_fx_run_selection (tenant_id, engagement_id, period_revision_id,
+        reporting_unit_id, selected_run_id, selected_reconciliation_id, selection_series_id,
+        version_no, supersedes_selection_id, selected_by)
+   SELECT tenant_id, engagement_id, period_revision_id, reporting_unit_id, selected_run_id,
+          selected_reconciliation_id, selection_series_id, 3, '$SELV1', selected_by
+     FROM period_fx_run_selection WHERE run_selection_id='$SELV1'" \
+  "duplicate key"
+
+# 跨租戶：唯讀函式也不得洩漏
+n=$(APP_C <<<"$T2 SELECT fn_period_fx_result_ready('$PR')" 2>&1 | grep -c "CROSS_TENANT_DENIED")
+[ "$n" -ge 1 ] && ok "0038：唯讀判定函式驗 current_tenant()，不因 UUID 可猜而洩漏" \
+  || ng "0038：跨租戶可讀取判定結論"
 
 [ "${STANDALONE:-0}" = "1" ] && summary
