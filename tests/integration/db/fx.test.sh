@@ -1120,4 +1120,89 @@ expect_err "來源 run 屬別的期間 → 拒絕（釘住期間檢查本身的�
   "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$RPC','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','x')" \
   "來源 run 的案件或期間與本次折算不一致"
 
+
+# ══ 16　Manifest 自身的完整性（0035）══════════════════════════════
+# 一般操作有不可變 trigger 擋著；這裡防的是另一類：資料修復、migration，
+# 或 owner 停用 trigger 後的內容漂移。重演的意義就是回答
+# 「這份證據還是不是當初那一份」，所以用之前必須先驗它。
+tamper() {  # $1=SQL（以 owner 身分、停用觸發器後執行）
+  PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+ALTER TABLE calculation_input_manifest DISABLE TRIGGER USER;
+$1
+ALTER TABLE calculation_input_manifest ENABLE TRIGGER USER;
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+}
+MFX=$(PSQL_C <<<"$T1 SELECT manifest_id FROM calculation_run WHERE calculation_run_id='$FXRUN'")
+integ() {  # 竄改 → replay → 應為 FAILED/REPLAY_MANIFEST_INTEGRITY_FAILED 且無產出
+  local name="$1" sqlmod="$2" sqlback="$3"
+  tamper "$sqlmod"
+  local rid st lines
+  rid=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_replay('$FXRUN','$JIA','fx-1.0.0')")
+  st=$(PSQL_C <<<"$T1 SELECT status||'/'||COALESCE(failure_reason_code,'-')
+       FROM calculation_run WHERE calculation_run_id='$rid'")
+  lines=$(PSQL_C <<<"$T1 SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='$rid'")
+  tamper "$sqlback"
+  if [ "$st" = "FAILED/REPLAY_MANIFEST_INTEGRITY_FAILED" ]; then
+    ok "0035：${name} → REPLAY_MANIFEST_INTEGRITY_FAILED"
+  else ng "0035：${name} → 狀態為 ${st}"; fi
+  [ "$lines" = "0" ] && ok "0035：${name} 的 replay 沒有留下任何快照（驗證在物化之前）" \
+    || ng "0035：${name} 留下 ${lines} 列快照"
+}
+integ "竄改 payload（只改內容、雜湊照舊）" \
+  "UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{minor_unit}','9')
+    WHERE manifest_id='$MFX' AND object_type='CURRENCY_DEFINITION' AND payload->>'code'='CNY';" \
+  "UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{minor_unit}','2')
+    WHERE manifest_id='$MFX' AND object_type='CURRENCY_DEFINITION' AND payload->>'code'='CNY';"
+integ "竄改 content_hash" \
+  "UPDATE calculation_manifest_entry SET content_hash = repeat('0',64)
+    WHERE manifest_id='$MFX' AND object_type='TRANSLATION_POLICY_VERSION';" \
+  "UPDATE calculation_manifest_entry SET content_hash = fn_fx_sha(content_canonical)
+    WHERE manifest_id='$MFX' AND object_type='TRANSLATION_POLICY_VERSION';"
+integ "竄改 frozen_set_content_hash" \
+  "UPDATE calculation_input_manifest SET frozen_set_content_hash = repeat('a',64)
+    WHERE manifest_id='$MFX';" \
+  "UPDATE calculation_input_manifest SET frozen_set_content_hash =
+     (SELECT fn_fx_sha(string_agg(content_hash,'|'
+        ORDER BY object_type, COALESCE(object_id::text,''), content_hash))
+        FROM calculation_manifest_entry WHERE manifest_id='$MFX')
+    WHERE manifest_id='$MFX';"
+# 三層檢查互為縱深，因此每一層都要有「只有它抓得到」的竄改：
+# 只改 canonical → payload 重算的雜湊仍等於 content_hash，集合雜湊也沒變。
+integ "只竄改 content_canonical" \
+  "UPDATE calculation_manifest_entry SET content_canonical = content_canonical || ' '
+    WHERE manifest_id='$MFX' AND object_type='EXCHANGE_RATE_VERSION';" \
+  "UPDATE calculation_manifest_entry SET content_canonical = rtrim(content_canonical)
+    WHERE manifest_id='$MFX' AND object_type='EXCHANGE_RATE_VERSION';"
+# payload 與 canonical 一起改（彼此自洽）→ 只有逐條雜湊重算抓得到
+integ "payload 與 canonical 一致地被改寫" \
+  "UPDATE calculation_manifest_entry
+      SET payload = jsonb_set(payload,'{minor_unit}','9'),
+          content_canonical = object_type||':'||COALESCE(object_id::text,'-')||':'||
+                              jsonb_pretty(jsonb_set(payload,'{minor_unit}','9'))
+    WHERE manifest_id='$MFX' AND object_type='CURRENCY_DEFINITION' AND payload->>'code'='CNY';" \
+  "UPDATE calculation_manifest_entry
+      SET payload = jsonb_set(payload,'{minor_unit}','2'),
+          content_canonical = object_type||':'||COALESCE(object_id::text,'-')||':'||
+                              jsonb_pretty(jsonb_set(payload,'{minor_unit}','2'))
+    WHERE manifest_id='$MFX' AND object_type='CURRENCY_DEFINITION' AND payload->>'code'='CNY';"
+
+integ "刪除一筆凍結條目（集合雜湊因此不符）" \
+  "DELETE FROM calculation_manifest_entry WHERE manifest_id='$MFX'
+     AND object_type='ACCOUNT_TRANSLATION_CLASSIFICATION'
+     AND ctid = (SELECT ctid FROM calculation_manifest_entry WHERE manifest_id='$MFX'
+                  AND object_type='ACCOUNT_TRANSLATION_CLASSIFICATION' LIMIT 1);" \
+  "SELECT 1;"
+# 刪除的條目無法還原（因此排在最後——它會讓後續案例都因集合雜湊不符而假綠），
+# 正控制改用另一個未受影響的 run
+RPOK=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_replay('$FXRUN4','$JIA','fx-1.0.0')")
+st=$(PSQL_C <<<"$T1 SELECT status FROM calculation_run WHERE calculation_run_id='$RPOK'")
+[ "$st" = "COMPLETED" ] && ok "0035：未受竄改的 Manifest 仍可正常重演（正控制）" \
+  || ng "0035：正控制的 replay 狀態為 ${st}"
+n=$(APP_C <<<"$T1 SELECT fn_fx_verify_manifest((SELECT manifest_id FROM calculation_run
+     WHERE calculation_run_id='$FXRUN4'))" 2>&1 | grep -c "ERROR")
+[ "$n" = "0" ] && ok "0035：app_runtime 可自行驗證凍結集合（稽核用）" || ng "0035：app_runtime 無法驗證"
+
 [ "${STANDALONE:-0}" = "1" ] && summary
