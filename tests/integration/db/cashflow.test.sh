@@ -91,14 +91,18 @@ INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_le
         declared_period_revision_id, uploaded_by, provided_by, status, file_name)
 VALUES ('${CFB}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}',
         '${JIA}','VALIDATING','cash-flow-support.csv');   -- 已接受的批次來源集合已封存
-INSERT INTO data_coverage (tenant_id, import_batch_id, batch_version, granularity, completeness_status)
-VALUES ('${TEN}','${CFB}',1,'BALANCE','COMPLETE');
+INSERT INTO data_coverage (data_coverage_id, tenant_id, import_batch_id, batch_version,
+        granularity, completeness_status) VALUES
+  ('c0480000-0000-0000-0000-000000000001','${TEN}','${CFB}',1,'BALANCE','COMPLETE'),
+  -- 同一批次另有更細的 DOCUMENT 覆蓋度——0040 的洞就是讓 BALANCE 的 fact 冒用它
+  ('c0480000-0000-0000-0000-000000000002','${TEN}','${CFB}',1,'DOCUMENT','COMPLETE');
 INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, granularity,
         content_sha256, row_count, batch_version)
 VALUES ('${CFSD}','${TEN}','${CFB}','BALANCE','sha-cf',1,1);
 INSERT INTO cash_flow_support_dataset (source_dataset_id, tenant_id, engagement_id,
-        period_revision_id, reporting_unit_id, import_batch_id, content_hash)
-VALUES ('${CFSD}','${TEN}','${ENG}','${PR}','${UNIT}','${CFB}','ds-hash');
+        period_revision_id, reporting_unit_id, import_batch_id, content_hash, data_coverage_id)
+VALUES ('${CFSD}','${TEN}','${ENG}','${PR}','${UNIT}','${CFB}','ds-hash',
+        'c0480000-0000-0000-0000-000000000001');
 ALTER TABLE import_batch DISABLE TRIGGER USER;
 UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id='${CFB}';
 ALTER TABLE import_batch ENABLE TRIGGER USER;
@@ -215,5 +219,55 @@ expect_err "0040：NO_FX run 仍必須指明來源批次（既有行為不變）
         run_type, status, request_key, request_content_hash, engine_version, created_by)
    VALUES ('${TEN}','${ENG}','${PR}','${NOFXMF}','PREVIEW','RUNNING',gen_random_uuid(),'h','1.0.0','${JIA}')" \
   "Run 必須指明來源批次"
+
+
+# ══ 0041：封套必須指向**該 dataset 自己的** DataCoverage ══════════
+CFSD2=c0470000-0000-0000-0000-000000000002
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status, file_name)
+VALUES ('c0460000-0000-0000-0000-000000000002','${TEN}','${ENG}',
+        'cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','VALIDATING','other.csv');
+INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, granularity,
+        content_sha256, row_count, batch_version)
+VALUES ('${CFSD2}','${TEN}','c0460000-0000-0000-0000-000000000002','BALANCE','sha-2',1,1);
+SQL
+# 隔離用第二個批次：同一批次不得有兩個同粒度 dataset（唯一鍵），
+# 因此「BALANCE dataset 冒用 DOCUMENT 覆蓋度」要在自己的批次內構造。
+CFB3=c0460000-0000-0000-0000-000000000003
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status, file_name)
+VALUES ('${CFB3}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}',
+        '${JIA}','VALIDATING','mix.csv');
+INSERT INTO data_coverage (data_coverage_id, tenant_id, import_batch_id, batch_version,
+        granularity, completeness_status) VALUES
+  ('c0480000-0000-0000-0000-000000000011','${TEN}','${CFB3}',1,'BALANCE','COMPLETE'),
+  ('c0480000-0000-0000-0000-000000000012','${TEN}','${CFB3}',1,'DOCUMENT','COMPLETE');
+INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, granularity,
+        content_sha256, row_count, batch_version)
+VALUES ('c0470000-0000-0000-0000-000000000003','${TEN}','${CFB3}','BALANCE','sha-mix',1,1);
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM source_dataset WHERE source_dataset_id='c0470000-0000-0000-0000-000000000003'")
+[ "${n}" = "1" ] && ok "0041 前置：同批次同時有 BALANCE 與 DOCUMENT 覆蓋度" \
+  || ng "0041 前置：混合批次建立失敗"
+expect_err "0041：同批次的 BALANCE dataset 不得冒用 DOCUMENT 覆蓋度" \
+  "${T1} INSERT INTO cash_flow_support_dataset (source_dataset_id, tenant_id, engagement_id,
+        period_revision_id, reporting_unit_id, import_batch_id, content_hash, data_coverage_id)
+   VALUES ('c0470000-0000-0000-0000-000000000003','${TEN}','${ENG}','${PR}','${UNIT}','${CFB3}','h',
+           'c0480000-0000-0000-0000-000000000012')" "CFS_COVERAGE_GRANULARITY_MISMATCH"
+expect_err "0041：封套宣告的批次與底層資料集的批次不同 → 拒絕" \
+  "${T1} INSERT INTO cash_flow_support_dataset (source_dataset_id, tenant_id, engagement_id,
+        period_revision_id, reporting_unit_id, import_batch_id, content_hash, data_coverage_id)
+   VALUES ('${CFSD2}','${TEN}','${ENG}','${PR}','${UNIT}','${CFB}','h',
+           'c0480000-0000-0000-0000-000000000001')" "CFS_DATASET_BATCH_MISMATCH"
+expect_err "0041：封套建立後不可 UPDATE" \
+  "${T1} UPDATE cash_flow_support_dataset SET content_hash='x' WHERE source_dataset_id='${CFSD}'" \
+  "CFS_DATASET_IMMUTABLE"
+n=$(PSQL_C <<<"${T1} SELECT actual_granularity FROM cash_flow_source_fact WHERE content_hash='f1'")
+[ "${n}" = "BALANCE" ] && ok "0041：fact 的粒度取自封套所指的覆蓋度（不是整批最細的）" \
+  || ng "0041：fact 粒度為 ${n}"
 
 [ "${STANDALONE:-0}" = "1" ] && summary
