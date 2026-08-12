@@ -725,4 +725,308 @@ for t in exchange_rate_version translation_policy_version equity_translation_lot
   [ "$n" = "0" ] && ok "0030 RLS：T2 看不到 T1 的 ${t}" || ng "0030 RLS：${t} 洩漏 $n 筆"
 done
 
+
+# ══ 12　Case-001 折算算例（SLICE-M3-02 §七）══════════════════════════
+# 契約的驗收常數：12/12 科目、CTA 97,159.00 借方、RE 勾稽 373,695.00。
+CASE_COA=88888888-0000-0000-0000-000000000001
+FXCASE=f0300000-0000-0000-0000-000000000011
+FXCASE_S=f0300000-0000-0000-0000-000000000111
+POLCASE=f0320000-0000-0000-0000-000000000011
+SETCASE=f0330000-0000-0000-0000-000000000011
+SRCMF=99940000-0000-0000-0000-000000000011
+SRCRUN=99950000-0000-0000-0000-000000000011
+A=(1001 1002 1122 1405 1601 2202 2221 4001 4104 6001 6401 6602)
+acc() { echo "aca00000-0000-0000-0000-0000000$1"; }
+
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO account (account_id, tenant_id, coa_id, code, name, translation_category) VALUES
+  ('$(acc 01001)','$TEN','$CASE_COA','C1001','库存现金','ASSET'),
+  ('$(acc 01002)','$TEN','$CASE_COA','C1002','银行存款','ASSET'),
+  ('$(acc 01122)','$TEN','$CASE_COA','C1122','应收账款','ASSET'),
+  ('$(acc 01405)','$TEN','$CASE_COA','C1405','库存商品','ASSET'),
+  ('$(acc 01601)','$TEN','$CASE_COA','C1601','固定资产','ASSET'),
+  ('$(acc 02202)','$TEN','$CASE_COA','C2202','应付账款','LIABILITY'),
+  ('$(acc 02221)','$TEN','$CASE_COA','C2221','应交税费','LIABILITY'),
+  ('$(acc 04001)','$TEN','$CASE_COA','C4001','实收资本','EQUITY_CONTRIBUTED'),
+  ('$(acc 04104)','$TEN','$CASE_COA','C4104','未分配利润','EQUITY_RETAINED'),
+  ('$(acc 06001)','$TEN','$CASE_COA','C6001','主营业务收入','INCOME'),
+  ('$(acc 06401)','$TEN','$CASE_COA','C6401','主营业务成本','EXPENSE'),
+  ('$(acc 06602)','$TEN','$CASE_COA','C6602','管理费用','EXPENSE'),
+  ('$(acc 03999)','$TEN','$CASE_COA','C3999','外币报表折算差额',NULL);
+-- 匯率版本（含兩筆歷史匯率）
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('$FXCASE','$TEN','$ENG','Case-001 2026-03','$FXCASE_S',1,'$FXOPS');
+INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
+        rate_type, rate, source, measurement_date, coverage_start, coverage_end, event_date) VALUES
+  ('$TEN','$FXCASE','JPY','CNY','CLOSING',0.048120,'BOJ','2026-03-31',NULL,NULL,NULL),
+  ('$TEN','$FXCASE','JPY','CNY','AVERAGE',0.047950,'BOJ',NULL,'2026-03-01','2026-03-31',NULL),
+  ('$TEN','$FXCASE','JPY','CNY','HISTORICAL',0.061000,'出資契約',NULL,NULL,NULL,'2018-06-15'),
+  ('$TEN','$FXCASE','JPY','CNY','HISTORICAL',0.051000,'増資契約',NULL,NULL,NULL,'2022-09-01');
+-- 折算政策
+INSERT INTO translation_policy_version (policy_version_id, tenant_id, engagement_id,
+        reporting_unit_id, label, cta_account_id, cta_coa_id, created_by)
+VALUES ('$POLCASE','$TEN','$ENG','$UNIT','Case-001 折算政策','$(acc 03999)','$CASE_COA','$JIA');
+INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method) VALUES
+  ('$TEN','$POLCASE','ASSET','CLOSING'), ('$TEN','$POLCASE','LIABILITY','CLOSING'),
+  ('$TEN','$POLCASE','INCOME','AVERAGE'), ('$TEN','$POLCASE','EXPENSE','AVERAGE'),
+  ('$TEN','$POLCASE','EQUITY_CONTRIBUTED','HISTORICAL_BY_LOT'),
+  ('$TEN','$POLCASE','EQUITY_RETAINED','OPENING_TRANSLATED_BALANCE');
+-- 權益折算批次（合計 10,000,000 ＝ 4001 的功能幣餘額）
+INSERT INTO equity_translation_lot_set_version (set_version_id, tenant_id, engagement_id,
+        reporting_unit_id, account_id, series_id, version_no, created_by)
+VALUES ('$SETCASE','$TEN','$ENG','$UNIT','$(acc 04001)','f0330000-0000-0000-0000-000000000111',1,'$JIA');
+INSERT INTO equity_translation_lot (tenant_id, set_version_id, event_date, functional_amount,
+        exchange_rate_observation_id, evidence_ref, line_no)
+SELECT '$TEN','$SETCASE','2018-06-15',7000000, observation_id,'出資契約 #1',1
+  FROM exchange_rate_observation WHERE rate_version_id='$FXCASE' AND event_date='2018-06-15';
+INSERT INTO equity_translation_lot (tenant_id, set_version_id, event_date, functional_amount,
+        exchange_rate_observation_id, evidence_ref, line_no)
+SELECT '$TEN','$SETCASE','2022-09-01',3000000, observation_id,'増資契約 #2',2
+  FROM exchange_rate_observation WHERE rate_version_id='$FXCASE' AND event_date='2022-09-01';
+-- 期初已折算保留盈餘（首次轉換，經批准的外部證據）
+INSERT INTO equity_opening_translated_balance (tenant_id, engagement_id, reporting_unit_id,
+        period_revision_id, account_id, reporting_currency, opening_credit, source_kind,
+        evidence_ref, created_by)
+VALUES ('$TEN','$ENG','$UNIT','$PR','$(acc 04104)','CNY',100380.00,'FIRST_CONVERSION','期初橋接底稿','$JIA');
+-- 來源 NO_FX run（Case-001 調整後集團 TB，功能幣 JPY，借貸各 59,000,000）
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('$SRCMF','$TEN','$ENG','$PR','NO_FX','sqlcanon-2','case001-src','$JIA');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by)
+VALUES ('$SRCRUN','$TEN','$ENG','$PR','$B1','$SRCMF','PREVIEW','RUNNING',gen_random_uuid(),
+        'case001','1.0.0','$JIA');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit) VALUES
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 01001)','C1001','库存现金',350000,0),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 01002)','C1002','银行存款',9650000,0),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 01122)','C1122','应收账款',5600000,0),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 01405)','C1405','库存商品',2300000,0),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 01601)','C1601','固定资产',4800000,200000),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 02202)','C2202','应付账款',0,3900000),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 02221)','C2221','应交税费',0,800000),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 04001)','C4001','实收资本',0,10000000),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 04104)','C4104','未分配利润',0,2100000),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 06001)','C6001','主营业务收入',0,42000000),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 06401)','C6401','主营业务成本',21700000,0),
+  ('$TEN','$SRCRUN','SOURCE_TB','$(acc 06602)','C6602','管理费用',14600000,0);
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='case001-r', completed_at=now()
+ WHERE calculation_run_id='$SRCRUN';
+SQL
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='$SRCRUN'")
+[ "$n" = "12" ] && ok "Case-001 前置：來源 NO_FX run 有 12 列（功能幣 JPY）" \
+  || ng "Case-001 前置：來源列數為 ${n}"
+d=$(PSQL_C <<<"$T1 SELECT sum(debit)||'/'||sum(credit) FROM balance_snapshot_line WHERE calculation_run_id='$SRCRUN'")
+[ "$d" = "59000000.00/59000000.00" ] && ok "Case-001 前置：功能幣借貸各 59,000,000" \
+  || ng "Case-001 前置：功能幣合計為 ${d}"
+
+# 匯率版本走完工作流（R6 建立 → R2 提交 → R3 覆核 → R4 批准）
+expect_ok "Case-001 前置：匯率版本 DRAFT → SUBMITTED" "$(fxt "$FXCASE" DRAFT SUBMITTED "$JIA" R2)"
+expect_ok "Case-001 前置：SUBMITTED → REVIEWED" "$(fxt "$FXCASE" SUBMITTED REVIEWED "$FXU" R3)"
+expect_ok "Case-001 前置：REVIEWED → APPROVED" "$(fxt "$FXCASE" REVIEWED APPROVED "$FXU" R4)"
+expect_ok "Case-001 前置：批准折算政策、lot set、期初餘額、報告幣指派" \
+  "$T1 SELECT fn_translation_policy_approve('$POLCASE','$FXU');
+   SELECT fn_equity_lot_set_approve('$SETCASE','$FXU');
+   SELECT fn_equity_opening_approve((SELECT opening_id FROM equity_opening_translated_balance
+     WHERE period_revision_id='$PR' AND account_id='$(acc 04104)'),'$FXU');
+   SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
+     WHERE reporting_unit_id='$UNIT' AND currency_role='REPORTING'),'$FXU')"
+
+FXRUN=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
+[ -n "$FXRUN" ] && ok "Case-001：折算 run 建立成功" || ng "Case-001：折算失敗"
+
+# ── 逐科目比對（契約 §七 的表）──
+fxamt() {  # $1=科目代碼 → "借/貸"（報告幣）
+  PSQL_C <<<"$T1 SELECT tr.result_debit||'/'||tr.result_credit
+    FROM translation_result tr
+    JOIN balance_snapshot_line b ON b.snapshot_line_id = tr.source_snapshot_line_id
+   WHERE tr.calculation_run_id='$FXRUN' AND b.account_code='$1'"
+}
+hit=0
+for pair in "C1001:16842.00/0.00" "C1002:464358.00/0.00" "C1122:269472.00/0.00" \
+            "C1405:110676.00/0.00" "C1601:221352.00/0.00" "C2202:0.00/187668.00" \
+            "C2221:0.00/38496.00" "C4001:0.00/580000.00" "C4104:0.00/100380.00" \
+            "C6001:0.00/2013900.00" "C6401:1040515.00/0.00" "C6602:700070.00/0.00"; do
+  code="${pair%%:*}"; want="${pair#*:}"; got=$(fxamt "$code")
+  if [ "$got" = "$want" ]; then hit=$((hit+1)); else ng "Case-001 ${code}：期望 ${want} 實得 ${got}"; fi
+done
+[ "$hit" = "12" ] && ok "Case-001：逐科目折算 12/12 相符（含權益逐筆與延續橋接）" \
+  || ng "Case-001：僅 ${hit}/12 相符"
+
+tot=$(PSQL_C <<<"$T1 SELECT sum(tr.result_debit)||'/'||sum(tr.result_credit)
+  FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id = tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN' AND b.posting_layer <> 'TRANSLATION_ADJUSTMENT'")
+[ "$tot" = "2823285.00/2920444.00" ] && ok "Case-001：折算後借 2,823,285.00 ／ 貸 2,920,444.00" \
+  || ng "Case-001：合計為 ${tot}"
+
+cta=$(PSQL_C <<<"$T1 SELECT debit||'/'||credit FROM translation_adjustment_line l
+  JOIN translation_adjustment_entry e ON e.translation_entry_id=l.translation_entry_id
+ WHERE e.calculation_run_id='$FXRUN'")
+[ "$cta" = "97159.00/0.00" ] && ok "Case-001：CTA ＝ 97,159.00 且在**借方**（功能幣貶值）" \
+  || ng "Case-001：CTA 為 ${cta}"
+n=$(PSQL_C <<<"$T1 SELECT rule_type FROM translation_adjustment_entry WHERE calculation_run_id='$FXRUN'")
+[ "$n" = "GROUP_GAAP" ] && ok "Case-001：CTA 物化為 TRANSLATION_ADJUSTMENT／GROUP_GAAP 分錄" \
+  || ng "Case-001：CTA rule_type 為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT debit||'/'||credit FROM balance_snapshot_line
+  WHERE calculation_run_id='$FXRUN' AND posting_layer='TRANSLATION_ADJUSTMENT'")
+[ "$n" = "0.00/0.00" ] && ok "Case-001：CTA 的快照列是空殼（功能幣下沒有 CTA）" \
+  || ng "Case-001：CTA 快照列為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT sum(debit)||'/'||sum(credit) FROM balance_snapshot_line
+  WHERE calculation_run_id='$FXRUN'")
+[ "$n" = "59000000.00/59000000.00" ] && ok "Case-001：功能幣 TB 仍借貸各 59,000,000（未被 CNY 污染）" \
+  || ng "Case-001：功能幣合計為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT (sum(tr.result_debit)+97159.00)||'/'||sum(tr.result_credit)
+  FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id = tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN' AND b.posting_layer <> 'TRANSLATION_ADJUSTMENT'")
+[ "$n" = "2920444.00/2920444.00" ] && ok "Case-001：加入 CTA 後報告幣借貸平衡" \
+  || ng "Case-001：加 CTA 後為 ${n}"
+
+# RE 勾稽：期末已折算保留盈餘 ＝ 期初 ＋ 本期已折算損益
+re=$(PSQL_C <<<"$T1 SELECT (100380.00 + sum(CASE WHEN b.account_code IN ('C6001') THEN tr.result_credit
+        ELSE -tr.result_debit END))::text
+  FROM translation_result tr JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN' AND b.account_code IN ('C6001','C6401','C6602')")
+[ "$re" = "373695.00" ] && ok "Case-001：RE 勾稽 100,380.00 ＋ 273,315.00 ＝ 373,695.00" \
+  || ng "Case-001：RE 勾稽得 ${re}"
+
+# 明細追溯：4001 有兩個 EQUITY_LOT component；4104 是延續橋接、不帶匯率
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM translation_result_component c
+  JOIN translation_result tr ON tr.translation_result_id=c.translation_result_id
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN' AND b.account_code='C4001' AND c.source_kind='EQUITY_LOT'")
+[ "$n" = "2" ] && ok "Case-001：实收资本的彙總掛兩筆 EQUITY_LOT 明細（一筆科目對多筆歷史來源）" \
+  || ng "Case-001：4001 的 lot 明細數為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT c.source_kind||':'||COALESCE(c.exchange_rate_observation_id::text,'無匯率')
+  FROM translation_result_component c
+  JOIN translation_result tr ON tr.translation_result_id=c.translation_result_id
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN' AND b.account_code='C4104'")
+[ "$n" = "OPENING_TRANSLATED_BALANCE:無匯率" ] && ok "Case-001：保留盈餘是延續橋接，不帶任何匯率觀測" \
+  || ng "Case-001：4104 的明細為 ${n}"
+
+# ══ 13　重演、版本切換與捨入 ════════════════════════════════════════
+FXRUN2=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
+h1=$(PSQL_C <<<"$T1 SELECT result_content_hash FROM calculation_run WHERE calculation_run_id='$FXRUN'")
+h2=$(PSQL_C <<<"$T1 SELECT result_content_hash FROM calculation_run WHERE calculation_run_id='$FXRUN2'")
+[ -n "$h1" ] && [ "$h1" = "$h2" ] && ok "重演：同一組輸入重跑，result_content_hash 完全相同" \
+  || ng "重演：雜湊不同（${h1} / ${h2}）"
+f1=$(PSQL_C <<<"$T1 SELECT m.frozen_set_content_hash FROM calculation_run r
+  JOIN calculation_input_manifest m ON m.manifest_id=r.manifest_id WHERE r.calculation_run_id='$FXRUN'")
+f2=$(PSQL_C <<<"$T1 SELECT m.frozen_set_content_hash FROM calculation_run r
+  JOIN calculation_input_manifest m ON m.manifest_id=r.manifest_id WHERE r.calculation_run_id='$FXRUN2'")
+[ "$f1" = "$f2" ] && ok "重演：凍結集合雜湊亦相同" || ng "重演：凍結雜湊不同"
+
+# 改動現行主檔不影響既有 run；新 run 才採新值
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+UPDATE currency SET minor_unit = 0 WHERE currency_code = 'CNY';
+SQL
+h3=$(PSQL_C <<<"$T1 SELECT result_content_hash FROM calculation_run WHERE calculation_run_id='$FXRUN'")
+[ "$h3" = "$h1" ] && ok "凍結：改動現行 Currency 後，舊 run 的結果與雜湊不變" || ng "凍結：舊 run 被影響"
+m1=$(PSQL_C <<<"$T1 SELECT e.domain_version_value FROM calculation_run r
+  JOIN calculation_manifest_entry e ON e.manifest_id=r.manifest_id
+ WHERE r.calculation_run_id='$FXRUN' AND e.object_type='CURRENCY_DEFINITION'
+   AND e.content_canonical LIKE 'currency=CNY%'")
+[ "$m1" = "2" ] && ok "凍結：舊 run 的 manifest 仍記著 CNY minor_unit = 2" || ng "凍結：manifest 值為 ${m1}"
+FXRUN3=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
+n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN3' AND b.account_code='C1001'")
+[ "$n" = "16842.00" ] && ok "凍結：新 run 採用改後的 minor_unit = 0（16,842 而非 16,842.00 的分位）" \
+  || ng "凍結：新 run 的 1001 為 ${n}"
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+UPDATE currency SET minor_unit = 2 WHERE currency_code = 'CNY';
+SQL
+
+# 捨入：刻意不整除的匯率必須得到 ROUND_HALF_UP 的結果
+FXROUND=f0300000-0000-0000-0000-000000000021
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('$FXROUND','$TEN','$ENG','捨入判準','f0300000-0000-0000-0000-000000000121',1,'$FXOPS');
+INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
+        rate_type, rate, source, measurement_date, coverage_start, coverage_end, event_date) VALUES
+  ('$TEN','$FXROUND','JPY','CNY','CLOSING',0.0481233,'x','2026-03-31',NULL,NULL,NULL),
+  ('$TEN','$FXROUND','JPY','CNY','AVERAGE',0.047950,'x',NULL,'2026-03-01','2026-03-31',NULL),
+  ('$TEN','$FXROUND','JPY','CNY','HISTORICAL',0.061000,'x',NULL,NULL,NULL,'2018-06-15'),
+  ('$TEN','$FXROUND','JPY','CNY','HISTORICAL',0.051000,'x',NULL,NULL,NULL,'2022-09-01');
+SQL
+expect_ok "捨入前置：匯率版本走完工作流" \
+  "$T1 SELECT fn_exchange_rate_transition('$FXROUND','DRAFT','SUBMITTED','$JIA','R2');
+   SELECT fn_exchange_rate_transition('$FXROUND','SUBMITTED','REVIEWED','$FXU','R3');
+   SELECT fn_exchange_rate_transition('$FXROUND','REVIEWED','APPROVED','$FXU','R4')"
+# 換匯率版本時，權益 lots 的歷史觀測就不再屬於本 run 凍結的版本——
+# 這是真規則（明細必須可追溯到凍結集合），因此換版本必須連 lot set 一起換。
+expect_err "換匯率版本但 lot set 仍指向舊版觀測 → 拒絕（不是靜默沿用）" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXROUND','$POLCASE','$JIA','x')" \
+  "TRANSLATION_SOURCE_NOT_FROZEN"
+# 捨入判準改用不含權益科目的來源，隔離出「率 × 金額」這一件事
+SRCMF2=99940000-0000-0000-0000-000000000012
+SRCRUN2=99950000-0000-0000-0000-000000000012
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('$SRCMF2','$TEN','$ENG','$PR','NO_FX','sqlcanon-2','round-src','$JIA');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by)
+VALUES ('$SRCRUN2','$TEN','$ENG','$PR','$B1','$SRCMF2','PREVIEW','RUNNING',gen_random_uuid(),
+        'round','1.0.0','$JIA');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+VALUES ('$TEN','$SRCRUN2','SOURCE_TB','$(acc 01001)','C1001','库存现金',350000,0);
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='round-r', completed_at=now()
+ WHERE calculation_run_id='$SRCRUN2';
+SQL
+FXRUN4=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN2','$FXROUND','$POLCASE','$JIA','fx-1.0.0')")
+n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$FXRUN4' AND b.account_code='C1001'")
+[ "$n" = "16843.16" ] && ok "捨入：350,000 × 0.0481233 ＝ 16,843.155 → ROUND_HALF_UP 16,843.16" \
+  || ng "捨入：得 ${n}（banker's rounding 會得 16843.15）"
+
+# lots 合計必須等於功能幣餘額——差一塊錢就代表有一次出資沒被記錄，
+# 其歷史匯率沒被使用，差額會被靜默吸收進 CTA。
+SRCMF3=99940000-0000-0000-0000-000000000013
+SRCRUN3=99950000-0000-0000-0000-000000000013
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('$SRCMF3','$TEN','$ENG','$PR','NO_FX','sqlcanon-2','lotmismatch-src','$JIA');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by)
+VALUES ('$SRCRUN3','$TEN','$ENG','$PR','$B1','$SRCMF3','PREVIEW','RUNNING',gen_random_uuid(),
+        'lotmismatch','1.0.0','$JIA');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+VALUES ('$TEN','$SRCRUN3','SOURCE_TB','$(acc 04001)','C4001','实收资本',0,9999999);
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='lm-r', completed_at=now()
+ WHERE calculation_run_id='$SRCRUN3';
+SQL
+expect_err "lots 合計（10,000,000）不等於功能幣餘額（9,999,999）→ 整筆拒絕" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN3','$FXCASE','$POLCASE','$JIA','x')" \
+  "EQUITY_LOT_SUM_MISMATCH"
+
+# ══ 14　整筆拒絕，不留半套 run ══════════════════════════════════════
+pre=$(PSQL_C <<<"$T1 SELECT count(*) FROM calculation_run")
+expect_err "缺已批准匯率版本 → 整期折算不可用（G-07）" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXV2','$POLCASE','$JIA','x')" \
+  "G07_RATE_VERSION_NOT_FROZEN"
+expect_err "非 R2 不得發起折算" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$FXOPS','x')" \
+  "ACTOR_ROLE_NOT_HELD"
+post=$(PSQL_C <<<"$T1 SELECT count(*) FROM calculation_run")
+[ "$pre" = "$post" ] && ok "被拒的折算不留下任何 run（連預覽都不產生）" \
+  || ng "被拒後 run 數由 ${pre} 變為 ${post}"
+
 [ "${STANDALONE:-0}" = "1" ] && summary

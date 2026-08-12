@@ -36,7 +36,10 @@ export function batchGate(ctx: AuthenticatedContext, send: Respond, batchId: str
     // 兩種範圍分開留痕：稽核軌跡要答得出「缺的是角色種類還是授權範圍」
     audit(s.tenantId, "CONTROL_VIOLATION_ATTEMPT", `${action}.denied`, s.userId,
       objectRef?.objectType ?? "import_batch", objectRef?.objectId ?? batchId,
-      { reason: `本動作需本案件的 ${allowed.join("／")} 角色（§24.6）`, action,
+      // `code` 是穩定的機器代碼：稽核查詢要答得出「缺的是哪一條控制」，
+      // 中文文案會改，代碼不會。少了它，CVA 只能用字串比對來分類。
+      { code: "ROLE_REQUIRED",
+        reason: `本動作需本案件的 ${allowed.join("／")} 角色（§24.6）`, action,
         engagement_roles: [...roles].sort(), tenant_roles: [...tenantRolesOf(s)].sort() });
     return { ok: false, res: send(403, page("拒絕", "<b>⛔ 無權執行</b>",
       `<h2>⛔ 本動作需本案件的 ${esc(allowed.join("／"))} 角色</h2>
