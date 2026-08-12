@@ -1,6 +1,6 @@
 # SLICE-M3-04　現金流支持資料（REQ-CFS-001）
 
-> 狀態：**事前契約 第四版（走查三輪修訂後）**，待確認。**尚未批准進 migration。**
+> 狀態：**事前契約 第五版（走查四輪修訂後）**，待確認。**尚未批准進 migration。**
 > 風險：**第一級**（母公司批准的方法版本、完整度判定、控制總額勾稽、凍結與重演）。
 >
 > 對應基線：手冊 v1.2 **REQ-CFS-001（P0）**、§20 MVP 3、§299–301（資料粒度）；
@@ -100,6 +100,34 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
 若直接從這些產生 `CashFlowSupportLine.amount`，實作者只能現場決定怎麼算，
 產品就從「收集支持資料」滑向「自行重建現金流」——正是 GB-04 禁止的那件事。
 
+### 用途封套：DB 必須分得出「這是現金流支持資料集」
+
+契約文字禁止從 TB 推算，但 `CashFlowSourceFact` 只引用現有的 `source_dataset`，
+**而該表沒有用途欄位**——實作者可以把一份普通 TB dataset 包成 fact，DB 仍會
+認為合法。那樣禁令就只剩註解。
+
+因此新增用途封套（**不改既有 `source_dataset`**）：
+
+    CashFlowSupportDataset
+    ├─ source_dataset_id        PK ／ FK
+    ├─ period_revision_id / reporting_unit_id
+    ├─ import_batch_id
+    ├─ content_hash
+    └─ created_at
+
+**表的存在本身就代表 `dataset_purpose = CASH_FLOW_SUPPORT`**——不新增列舉欄位，
+也就沒有「值被改掉」的可能。`CashFlowSourceFact.source_dataset_id` 必須指向
+本表的列。
+
+強制規則（DB）：
+
+1. Dataset、ImportBatch、期間、ReportingUnit、Tenant、Engagement **父鏈一致**。
+2. **只有父 `ImportBatch` 已 `ACCEPTED` 的 facts 可進完整度判定與支持輸出。**
+3. Fact **可以在驗證階段寫入**（與來源三表同節奏），但**在批次接受前不得被使用**。
+4. `CashFlowSourceFact` 建立後**不可 UPDATE／DELETE**——更正走**新批次與新 dataset**
+   （與 `SourceLedgerLine` 同一原則）。
+5. `actual_granularity` 必須**等於**該 dataset 對應的 `DataCoverage.granularity`。
+
 因此補上最小的金額事實：
 
     CashFlowSourceFact
@@ -129,6 +157,20 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
 
 **帶正負號**（`signed_*`）而非借貸兩欄：現金流的方向是流入／流出，
 用借貸表示會在「同一分類同時有流入與流出」時失去可加性。
+
+**`source_kind` 的必填引用矩陣（不符即拒絕）：**
+
+| `source_kind` | 必填引用 | dataset 粒度要求 |
+|---|---|---|
+| `ACCOUNT` | `account_id` ＋ `source_row_id` | ≥ `BALANCE` |
+| `JOURNAL_LINE` | `source_ledger_line_id` | ≥ `JOURNAL` |
+| `SUBLEDGER_ITEM` | `source_ledger_line_id` | ≥ `SUBLEDGER` |
+| `DOCUMENT` | `source_document_id` | ＝ `DOCUMENT` |
+
+- `DOCUMENT` **允許同時帶 `account_id`** 作為追溯輔助，但**映射的權威引用仍是
+  document**——分類規則比對的是 `source_document_id`，不是那個輔助科目。
+- 其餘三種 `source_kind` 不得帶 `source_document_id`；`ACCOUNT` 不得帶
+  `source_ledger_line_id`。
 
 ## 四、映射：`CashFlowSourceFact` → `CashFlowClass`
 
@@ -327,8 +369,9 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 - Manifest 新增條目型別：`CASH_FLOW_POLICY_VERSION`、`CASH_FLOW_CLASS_SET_VERSION`、
   `CASH_FLOW_MAPPING_VERSION`、`CASH_FLOW_COVERAGE_EXCEPTION`、
   `SOURCE_CALCULATION_RUN`（重用）。
-- payload 保存**實際使用到的每一個值**（分類集合、命中的映射規則、例外、
-  來源 TB 的現金科目餘額），canonical 為 payload 的文字投影，SHA-256。
+- payload 保存**實際使用到的每一個值**：實際使用的 `CashFlowSourceFact`
+  （含 signed amount 與 content_hash）、命中的映射規則、分類集合與其現金科目
+  membership、逐分類的粒度例外、以及**期初／期末的已選定來源**，canonical 為 payload 的文字投影，SHA-256。
 - 產出前先驗凍結集合。該驗證與 FX 無關，是通用能力，因此**新增
   `fn_manifest_verify(manifest_id)`**；`fn_fx_verify_manifest` **保留為相容
   wrapper**（直接轉呼叫新函式），**不改名、不移除**——已關閉的 M3-02／M3-03
@@ -392,6 +435,17 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
     `CFS_ZERO_ACTIVITY_UNCONFIRMED`。
 12D. **分類集合的最低要求**：沒有或超過一個 `FX_EFFECT_ON_CASH` → 批准被拒；
     沒有任何現金科目 membership → 批准被拒。
+12D2. **用途封套**：
+    (a) `CashFlowSourceFact` 引用不在 `CashFlowSupportDataset` 中的 dataset → 拒絕
+        （**反證：允許引用任意 `source_dataset` → 轉紅**）；
+    (b) 父 `ImportBatch` 尚未 `ACCEPTED` 時，fact 可寫入但**不得**進入完整度
+        判定與輸出；
+    (c) fact 建立後 UPDATE／DELETE → 拒絕；
+    (d) `actual_granularity` ≠ 該 dataset 的 `DataCoverage.granularity` → 拒絕；
+    (e) 封套的六層父鏈任一不符 → 拒絕。
+12E2. **`source_kind` 矩陣**：四種組合各一條正控制；缺必填引用、帶不該帶的引用、
+    或 dataset 粒度不足 → 皆拒絕；`DOCUMENT` 帶 `account_id` **必須被接受**
+    （追溯輔助），但映射規則比對的仍是 `source_document_id`。
 12E. **金額事實**：
     (a) 沒有 `CashFlowSourceFact` 時不得產生任何 `CashFlowSupportLine`；
     (b) `source_ledger_line` 有餘額但沒有 fact → 完整度判定為未確認，
@@ -426,7 +480,7 @@ migration（`CashFlowPolicyVersion` → `CashFlowClassSetVersion` ＋ 分類
 ＋ 現金科目 membership →
 `CashFlowMappingVersion` ＋ 規則 → `CashFlowCoverageException` →
 `CashFlowOpeningBalanceSetVersion` ＋ 明細 → `PeriodCashFlowSourceSelection` →
-`CashFlowSourceFact` → `CashFlowClassPeriodCoverage` →
+`CashFlowSupportDataset` ＋ `CashFlowSourceFact` → `CashFlowClassPeriodCoverage` →
 `calculation_scope` 擴充與 manifest 新條目 → 支持資料列 →
 完整度與控制總額判定函式 → 期間級就緒判定）
 → DB 負面測試（1～9、13）→ Case-001 的正控制與控制總額勾稽（10）
