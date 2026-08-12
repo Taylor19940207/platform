@@ -32,9 +32,9 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 66 ＋ DB 整合 365 ＋ 端到端驗收 427（里程碑 1 之 27 ＋ 映射 40 ＋ 調整 89 ＋ 工作可靠性 29 ＋ 計算執行 33 ＋ 證據包 31 ＋ 工作台身分確認 64 ＋ 期間生命週期 37 ＋ 多基礎 16 ＋ 期間工作台 61），共 858 條
+pnpm test          # 單元 66 ＋ DB 整合 557 ＋ 端到端驗收 427（里程碑 1 之 27 ＋ 映射 40 ＋ 調整 89 ＋ 工作可靠性 29 ＋ 計算執行 33 ＋ 證據包 31 ＋ 工作台身分確認 64 ＋ 期間生命週期 37 ＋ 多基礎 16 ＋ 期間工作台 61），共 1,050 條
 pnpm test:quick    # 單元＋DB 整合（約 48 秒）——日常改 DB 守衛時跑這個
-pnpm test:db:basis # 只跑一個領域（mapping／adjustment／period／basis，各約 10～15 秒）
+pnpm test:db:fx    # 只跑一個領域（mapping／adjustment／period／basis／fx，各約 10～30 秒）
 pnpm test:timing   # 逐 suite 耗時，決定要優化什麼之前先量
 ```
 
@@ -55,7 +55,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 
 ## 現況
 
-- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋29 份 migration（可從零重建）
+- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋35 份 migration（可從零重建）
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）
@@ -71,7 +71,8 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 - [x] **NFR-UX-001／INT-002 自動保存與 Session 恢復（0025–0027）**：內容雜湊冪等鍵、W 窗口以**伺服器確認**計、離線退避、beforeunload；行為測試在 vm 沙箱執行出貨程式本身
 - [x] **🏁 里程碑 2 離開複核通過**（2026-08-10，`docs/reviews/MILESTONE-2_EXIT_REVIEW_2026-08-10.md`）
 - [x] **SLICE-M3-01 B-02 期間工作台（0028／0029）**：`fn_period_transition_spec` 為遷移規格的**唯一可查詢來源**，trigger 與畫面讀同一份；完整 B-02 為案件層 R2／R3／R4；0029 修正期間發起人的角色**作用域**（租戶層指派不得發起遷移）並撤回 PUBLIC EXECUTE
-- [ ] **MVP 3 折算與對帳**（下一刀，第一級風險：先寫事前契約再寫 migration）
+- [x] **SLICE-M3-02 折算與 CTA（0030–0035）**：`Currency`／幣別角色指派（INV-22）／匯率版本四狀態＋觀測／`translation_category`／折算政策與 CTA 落點／權益折算批次集合／期初已折算餘額；**保留盈餘由延續橋接得出，不乘匯率**（CAS 19 §12）；CTA 物化為 `TranslationAdjustmentEntry`（INV-20）；**Manifest 只讀重演＋自身完整性驗證**（SHA-256）。Case-001 12/12、CTA 97,159.00 借方、RE 373,695.00
+- [ ] **MVP 3 剩餘**：現金流（REQ-CFS-001，未完成前 MVP 3 不得關閉）／B-06 折算畫面／調節核對與 INV-24／G-03・G-07 期間級判定（後二者完成才解鎖 `ADJ_APPROVED → CALCULATING`）
 
 ## 結構
 
@@ -79,6 +80,6 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 apps/        api（模組化單體宿主）｜worker（背景驗證）｜web（Next.js 佔位）
 packages/    domain（狀態機）｜database（migration＋轉接層）｜auth｜contracts｜config
 scripts/     dev.mjs｜env.sh（傳輸層）｜sandbox/（非主流程）
-tests/       unit（66）｜integration（DB 守衛 365 條）｜acceptance（端到端 427 條）｜fixtures/case-001
+tests/       unit（66）｜integration（DB 守衛 557 條）｜acceptance（端到端 427 條）｜fixtures/case-001
 docs/        GOVERNANCE｜BACKLOG｜FUTURE_DISCUSSIONS｜adr/｜slices/｜handoffs/
 ```

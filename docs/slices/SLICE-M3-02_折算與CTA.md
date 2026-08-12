@@ -1,15 +1,20 @@
 # SLICE-M3-02　折算與外幣報表折算差額（CTA）
 
-> 狀態：**APPROVED_FOR_IMPLEMENTATION**（2026-08-11，第四版收口後批准）。
-> 會計算式與 Case-001 算例於第二版走查通過（保留盈餘延續橋接、CTA 97,159.00 借方、
-> 100,380.00 首次轉換輸入），第三版封工程語意，第四版寫死四個實作前細節
-> （Currency 入 manifest、合計約束的執行時點、PRIOR_RUN 的狀態條件、
-> lot set 的版本方向）並裁決匯率的自然人 SoD。**契約至此凍結，開始 migration。**
-> 風險：**第一級**。
+> 狀態：**CLOSED ／ PASS**（2026-08-12）。契約經四輪走查定稿，實作經三輪走查收口。
+> 交付 migration **0030～0035**：
 >
-> 對應基線：手冊 v1.2 REQ-FX-001／AC-FX-001／§20 MVP 3；設計書 v1.1 §25.3、§26.6、
-> §26.11、§26.12（INV-19／20／22）、D-26-06、§28 B-06。
-> 會計法源：《企業會計準則第 19 號——外幣折算》第十二條及應用指南。
+> | migration | 內容 |
+> |---|---|
+> | 0030 | 折算資料模型與守衛（Currency、幣別指派、匯率版本與觀測、`translation_category`、政策版本＋CTA 落點、權益 lot set、期初已折算餘額、`TranslationAdjustmentEntry/Line`、`TranslationResult`＋Component） |
+> | 0031 | 硬化：匯率遷移改走函式、父鏈一致性、`UNIQUE NULLS NOT DISTINCT`、component 具體 FK、折算產出不可變 |
+> | 0032 | 主檔工作流與父鏈收口：system-only 建立／批准函式、批准欄的**欄位級權限**、跨租戶父鏈、非 CTA 結果必須帶政策規則 |
+> | 0033 | 折算引擎與 Case-001 算例 |
+> | 0034 | Manifest 真正可重演：只讀凍結 payload、replay 入口、SHA-256、來源 run 驗證、CTA 分層正規化 |
+> | 0035 | 使用 Manifest 前先驗 Manifest 自身（`REPLAY_MANIFEST_INTEGRITY_FAILED`） |
+>
+> 測試基線：**單元 66 ＋ DB 整合 557 ＋ 端到端 427 ＝ 1,050**，全數通過
+> （其中 fx 領域 192 條）。
+> 風險：**第一級**。
 
 ## 為什麼是這一刀
 
@@ -551,3 +556,43 @@ migration（`Currency` → 幣別指派 → `reporting_period.previous_reporting
 manifest 新條目與 `calculation_scope` 放寬 → `balance_snapshot_line` 的 CHECK）
 → DB 負面測試（1～12A、15～19）→ 折算函式（DB 內 `numeric`，一律讀 manifest 凍結值）
 → 算例驗收（3A／13／14／20／21）→ `NO_FX` 回歸（22）→ 完整一輪（23）。**畫面不在本刀。**
+
+## 十一、關閉判定（2026-08-12）
+
+| 項目 | 判定 |
+|---|---|
+| 折算方法與 CAS 19 §12 處理（含保留盈餘延續橋接） | **PASS** |
+| Case-001 逐科目 12/12、CTA 97,159.00 借方、RE 勾稽 373,695.00 | **PASS** |
+| 匯率、幣別、政策、權益 lots、期初餘額的凍結 | **PASS** |
+| 逐行 `ROUND_HALF_UP`、全程 `numeric`（不進 JS `Number`） | **PASS** |
+| CTA 顯式物化與分層（`posting_layer_id` 正規化） | **PASS** |
+| 真正的 Manifest replay（現行主檔已變仍重算出原結果） | **PASS** |
+| Manifest 自身完整性驗證（六種 owner 級竄改皆攔下） | **PASS** |
+| SHA-256 與 canonicalization 一致 | **PASS** |
+| 來源 run 與父鏈歸屬、角色與批准控制 | **PASS** |
+| `NO_FX` 回歸與完整測試 | **PASS**（斷言未改，全綠） |
+
+### 兩項已接受的邊界
+
+1. **更換匯率版本須同步建立相容的 lot set。** 權益 lots 的歷史觀測屬於某一份
+   匯率版本；換版本而不換 lot set 會被 `TRANSLATION_SOURCE_NOT_FROZEN` 擋下。
+   這符合目前「歷史匯率觀測屬匯率版本」的批准契約，本刀不改模型（已有測試）。
+2. **FAILED replay 的診斷產出保存政策**留待證據包／保存政策（D-26-04）那一刀。
+   結果雜湊不符時，快照與 CTA 已寫入才標成 `FAILED`；狀態明確、正式輸出只接受
+   `COMPLETED`，故不阻擋。**Manifest 完整性失敗的路徑不受影響**——0035 在物化
+   之前攔下，FAILED run 是乾淨的。已記入 `docs/BACKLOG.md`。
+
+### MVP 3 尚未完成（本刀不含）
+
+| # | 項目 |
+|---|---|
+| 1 | **REQ-CFS-001 現金流支持資料**——另開切片；未完成前 **MVP 3 不得關閉** |
+| 2 | **B-06 折算／核對畫面與 replay 入口**（DB 能力已具備，缺 UI） |
+| 3 | **折算調節核對、`RoundingTolerance`／INV-24**（單筆與累積容許值同時滿足） |
+| 4 | **G-03／G-07 的期間級聚合判定** |
+
+**上述 3 與 4 完成後，才解鎖 `ADJ_APPROVED → CALCULATING`**（0028 的規格函式
+目前維持 `NOT_IMPLEMENTED`）。
+
+下一刀：**折算調節核對＋期間級 G-07**（解鎖期間主線的前置），畫面緊接其後，
+現金流必須在 MVP 3 關閉前完成。

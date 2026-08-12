@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、二十九份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、三十五份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -44,9 +44,10 @@ CR-001／CR-002、稽核報告及歷史版本只在需要追查決策原因時�
 macOS 已正式成為權威開發環境；Docker、migration、seed、持久性、API、Worker 與瀏覽器均已實機驗證。macOS bash 3.2 的 `${DB}` 相容修正已提交。
 
 里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05`／`M2-06`
-均已完成並關閉；里程碑 3 的第一刀 **`SLICE-M3-01 B-02 期間工作台`亦已正式關閉**（2026-08-11）。
-現有 29 份 migration；完整實跑結果為 **858/858**（單元 66、DB 整合 365、端到端 427），
-最新一輪全綠（HEAD `4053404`，已 push）。
+均已完成並關閉；里程碑 3 的 **`SLICE-M3-01 B-02 期間工作台`（2026-08-11）與
+`SLICE-M3-02 折算與 CTA`（2026-08-12，CLOSED／PASS）亦已正式關閉**。
+現有 35 份 migration；完整實跑結果為 **1,050**（單元 66、DB 整合 557、端到端 427），
+最新一輪全綠（HEAD `f9fe2e5`，已 push）。
 
 ## 🏁 里程碑 2 已完成（2026-08-10 離開複核通過）
 
@@ -105,13 +106,13 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 858 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,050 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
-| `pnpm test:db:<domain>` | mapping／adjustment／period／basis 各自單跑（自行重建 DB 並補齊前置） | 9～15 秒 |
+| `pnpm test:db:<domain>` | mapping／adjustment／period／basis／**fx** 各自單跑（自行重建 DB 並補齊前置） | 9～30 秒 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
-| `pnpm test`（＝`test:full`） | 完整 858 條 | **約 5～6 分鐘** |
+| `pnpm test`（＝`test:full`） | 完整 1,050 條 | **約 6～7 分鐘** |
 | `pnpm test:acceptance:<suite>` | 十支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
@@ -149,8 +150,10 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   六類授權缺口封閉、0024、測試分級）
 - `docs/reviews/MILESTONE-2_EXIT_REVIEW_2026-08-10.md`（里程碑 2 離開複核通過；
   PASS／ACCEPTED_DEVIATION／DEFERRED 逐條判定）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-11_SLICE-M3-01.md`（**最新接續入口**：
-  B-02 期間工作台、0028 遷移規格函式、0029 角色作用域修補、折算前置）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-11_SLICE-M3-01.md`（B-02 期間工作台、
+  0028 遷移規格函式、0029 角色作用域修補）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-02.md`（**最新接續入口**：
+  折算與 CTA、0030～0035、Manifest 重演與完整性、MVP 3 剩餘項目）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -230,12 +233,40 @@ R2／R4 都屬 EngagementAssignment）。同時 `REVOKE ALL … FROM PUBLIC`：P
 2. DB 整合套件會重建資料庫並重跑 migration，**直接改資料庫裡的函式做反證會假綠**；
    反證必須改 migration 檔案本身。
 
-下一刀：**MVP 3 折算與對帳**（REQ-FX-001／REQ-CFS-001）。屬**第一級風險**，
-依既定節奏先寫事前契約、再寫 migration，**不先做畫面**。契約至少須凍結：
-幣別角色（`ReportingUnitCurrencyAssignment`，INV-22）、匯率版本（`ExchangeRate` ＋
-G-07 凍結）、折算方法（期末／期中／歷史）、金額精度與尾差（D-26-05／INV-24）、
-**CTA 顯式物化**（INV-20，不得由兩幣別相減推導）、`CalculationRun` 凍結集合與重演
-（AC-FX-001：同實體、期間、匯率版本重跑結果一致）。
+## `SLICE-M3-02 折算與 CTA`已完成並關閉（2026-08-12，CLOSED／PASS）
+
+切片文件：`docs/slices/SLICE-M3-02_折算與CTA.md`（含關閉判定表）。
+交付 migration **0030～0035**：資料模型與守衛 → 硬化 → 主檔工作流與父鏈 →
+折算引擎 → Manifest 可重演 → Manifest 完整性驗證。
+
+**會計結論**：Case-001 調整後集團 TB 59,000,000 JPY → 借 2,823,285.00／
+貸 2,920,444.00 CNY，**CTA ＝ 97,159.00 借方**；RE 勾稽 373,695.00；
+捨入 350,000 × 0.0481233 → 16,843.16。
+**保留盈餘不得以餘額乘匯率求得**（CAS 19 §12 應用指南），由前期已鎖定的期末
+已折算值延續；權益的逐筆歷史匯率靠 `EquityTranslationLotSetVersion`。
+
+**三條在該刀確立的原則**：
+1. **權限是邊界，函式是流程，GUC 只是標記**——自訂 GUC 任何連線都能
+   `set_config`，批准欄以**欄位級權限**擋住。
+2. **只讀 Manifest 才叫可重演**——「同一批現行資料跑兩次相同」只是確定性。
+3. **用 Manifest 之前先驗 Manifest**——不可變 trigger 擋不住資料修復與
+   owner 操作；驗證與生成共用同一套 canonical 規則。
+
+**兩項已接受的邊界**：更換匯率版本須同步建立相容的 lot set；
+FAILED replay 的診斷產出保存政策留待證據包切片（BACKLOG 已記）。
+
+### MVP 3 尚未完成
+
+1. **REQ-CFS-001 現金流支持資料**——未完成前 **MVP 3 不得關閉**。
+2. **B-06 折算／核對畫面與 replay 入口**（DB 能力已具備）。
+3. **折算調節核對、`RoundingTolerance`／INV-24**。
+4. **G-03／G-07 的期間級聚合判定**。
+
+**3 與 4 完成後才解鎖 `ADJ_APPROVED → CALCULATING`**（0028 的規格函式維持
+`NOT_IMPLEMENTED`）。
+
+下一刀：**折算調節核對＋期間級 G-07**——解鎖期間主線的前置；畫面緊接其後，
+現金流必須在 MVP 3 關閉前完成。
 
 **不要再做結構重構**——拆層已於 2e19c9b 結束，server.ts 54 行已達目標，
 不得為了行數繼續拆。
