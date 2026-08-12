@@ -127,5 +127,145 @@ UPDATE basis_composition_version
    SET status='APPROVED', approved_by='aaaaaaaa-0000-0000-0000-000000000003',
        approved_at=now(), approval_role='R4'
  WHERE status='DRAFT';
+
+-- ══ 折算（M3-02／M3-03）的開發前置：讓 B-06 折算頁可以實際操作 ══
+-- 這一段只建立**輸入**（幣別、匯率、政策、權益批次、期初值、容許值與一份
+-- NO_FX 來源 run）；折算本身仍由使用者在畫面上執行，才看得到守衛的作用。
+INSERT INTO account (account_id, tenant_id, coa_id, code, name, translation_category)
+VALUES ('a9990000-0000-0000-0000-000000003999','11111111-1111-1111-1111-111111111111',
+        '88888888-0000-0000-0000-000000000001','3999','外币报表折算差额',NULL);
+UPDATE account SET translation_category = CASE code
+    WHEN '1001' THEN 'ASSET' WHEN '1002' THEN 'ASSET' WHEN '1122' THEN 'ASSET'
+    WHEN '1405' THEN 'ASSET' WHEN '1601' THEN 'ASSET'
+    WHEN '2202' THEN 'LIABILITY' WHEN '2221' THEN 'LIABILITY'
+    WHEN '4001' THEN 'EQUITY_CONTRIBUTED' WHEN '4104' THEN 'EQUITY_RETAINED'
+    WHEN '6001' THEN 'INCOME' WHEN '6401' THEN 'EXPENSE' WHEN '6602' THEN 'EXPENSE'
+    ELSE translation_category END
+ WHERE coa_id = '88888888-0000-0000-0000-000000000001';
+
+INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by, approved_by, approved_at) VALUES
+  ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+   'bbbbbbbb-0000-0000-0000-000000000001','FUNCTIONAL','JPY','[2020-01-01,)',
+   'aaaaaaaa-0000-0000-0000-000000000004','aaaaaaaa-0000-0000-0000-000000000003',now()),
+  ('11111111-1111-1111-1111-111111111111','eeeeeeee-0000-0000-0000-000000000001',
+   'bbbbbbbb-0000-0000-0000-000000000001','REPORTING','CNY','[2020-01-01,)',
+   'aaaaaaaa-0000-0000-0000-000000000004','aaaaaaaa-0000-0000-0000-000000000003',now());
+
+-- 匯率版本：R6 建立 → R2 提交 → R3 覆核 → R4 批准（乙覆核、丙批准，符合 SoD）
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('e9990000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111',
+        'eeeeeeee-0000-0000-0000-000000000001','2026-03 JPY→CNY v1',
+        'e9990000-0000-0000-0000-000000000101',1,'aaaaaaaa-0000-0000-0000-000000000004');
+INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
+        rate_type, rate, source, measurement_date, coverage_start, coverage_end, event_date) VALUES
+  ('11111111-1111-1111-1111-111111111111','e9990000-0000-0000-0000-000000000001','JPY','CNY',
+   'CLOSING',0.048120,'BOJ','2026-03-31',NULL,NULL,NULL),
+  ('11111111-1111-1111-1111-111111111111','e9990000-0000-0000-0000-000000000001','JPY','CNY',
+   'AVERAGE',0.047950,'BOJ',NULL,'2026-03-01','2026-03-31',NULL),
+  ('11111111-1111-1111-1111-111111111111','e9990000-0000-0000-0000-000000000001','JPY','CNY',
+   'HISTORICAL',0.061000,'出資契約',NULL,NULL,NULL,'2018-06-15'),
+  ('11111111-1111-1111-1111-111111111111','e9990000-0000-0000-0000-000000000001','JPY','CNY',
+   'HISTORICAL',0.051000,'増資契約',NULL,NULL,NULL,'2022-09-01');
+SET app.tenant_id = '11111111-1111-1111-1111-111111111111';
+SELECT fn_exchange_rate_transition('e9990000-0000-0000-0000-000000000001','DRAFT','SUBMITTED',
+  'aaaaaaaa-0000-0000-0000-000000000001','R2');
+SELECT fn_exchange_rate_transition('e9990000-0000-0000-0000-000000000001','SUBMITTED','REVIEWED',
+  'aaaaaaaa-0000-0000-0000-000000000002','R3');
+SELECT fn_exchange_rate_transition('e9990000-0000-0000-0000-000000000001','REVIEWED','APPROVED',
+  'aaaaaaaa-0000-0000-0000-000000000003','R4');
+
+INSERT INTO translation_policy_version (policy_version_id, tenant_id, engagement_id,
+        reporting_unit_id, label, cta_account_id, cta_coa_id, created_by)
+VALUES ('e9991000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111',
+        'eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001',
+        '折算政策 v1（CAS 19）','a9990000-0000-0000-0000-000000003999',
+        '88888888-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001');
+INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method) VALUES
+  ('11111111-1111-1111-1111-111111111111','e9991000-0000-0000-0000-000000000001','ASSET','CLOSING'),
+  ('11111111-1111-1111-1111-111111111111','e9991000-0000-0000-0000-000000000001','LIABILITY','CLOSING'),
+  ('11111111-1111-1111-1111-111111111111','e9991000-0000-0000-0000-000000000001','INCOME','AVERAGE'),
+  ('11111111-1111-1111-1111-111111111111','e9991000-0000-0000-0000-000000000001','EXPENSE','AVERAGE'),
+  ('11111111-1111-1111-1111-111111111111','e9991000-0000-0000-0000-000000000001',
+   'EQUITY_CONTRIBUTED','HISTORICAL_BY_LOT'),
+  ('11111111-1111-1111-1111-111111111111','e9991000-0000-0000-0000-000000000001',
+   'EQUITY_RETAINED','OPENING_TRANSLATED_BALANCE');
+SELECT fn_translation_policy_approve('e9991000-0000-0000-0000-000000000001',
+  'aaaaaaaa-0000-0000-0000-000000000003');
+
+INSERT INTO equity_translation_lot_set_version (set_version_id, tenant_id, engagement_id,
+        reporting_unit_id, account_id, series_id, version_no, created_by)
+SELECT 'e9992000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111',
+       'eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001',
+       account_id,'e9992000-0000-0000-0000-000000000101',1,'aaaaaaaa-0000-0000-0000-000000000001'
+  FROM account WHERE coa_id='88888888-0000-0000-0000-000000000001' AND code='4001';
+INSERT INTO equity_translation_lot (tenant_id, set_version_id, event_date, functional_amount,
+        exchange_rate_observation_id, evidence_ref, line_no)
+SELECT '11111111-1111-1111-1111-111111111111','e9992000-0000-0000-0000-000000000001',
+       '2018-06-15',7000000, observation_id,'出資契約 #1',1
+  FROM exchange_rate_observation
+ WHERE rate_version_id='e9990000-0000-0000-0000-000000000001' AND event_date='2018-06-15';
+INSERT INTO equity_translation_lot (tenant_id, set_version_id, event_date, functional_amount,
+        exchange_rate_observation_id, evidence_ref, line_no)
+SELECT '11111111-1111-1111-1111-111111111111','e9992000-0000-0000-0000-000000000001',
+       '2022-09-01',3000000, observation_id,'増資契約 #2',2
+  FROM exchange_rate_observation
+ WHERE rate_version_id='e9990000-0000-0000-0000-000000000001' AND event_date='2022-09-01';
+SELECT fn_equity_lot_set_approve('e9992000-0000-0000-0000-000000000001',
+  'aaaaaaaa-0000-0000-0000-000000000003');
+
+INSERT INTO equity_opening_translated_balance (opening_id, tenant_id, engagement_id,
+        reporting_unit_id, period_revision_id, account_id, reporting_currency, opening_credit,
+        source_kind, evidence_ref, created_by)
+SELECT 'e9993000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111',
+       'eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001',
+       '99999999-0000-0000-0000-000000000001', account_id,'CNY',100380.00,
+       'FIRST_CONVERSION','期初橋接底稿','aaaaaaaa-0000-0000-0000-000000000001'
+  FROM account WHERE coa_id='88888888-0000-0000-0000-000000000001' AND code='4104';
+SELECT fn_equity_opening_approve('e9993000-0000-0000-0000-000000000001',
+  'aaaaaaaa-0000-0000-0000-000000000003');
+
+INSERT INTO rounding_tolerance_version (tolerance_version_id, tenant_id, engagement_id,
+        reporting_unit_id, source_currency, target_currency, single_limit, cumulative_limit,
+        series_id, version_no, created_by)
+VALUES ('e9994000-0000-0000-0000-000000000001','11111111-1111-1111-1111-111111111111',
+        'eeeeeeee-0000-0000-0000-000000000001','bbbbbbbb-0000-0000-0000-000000000001',
+        'JPY','CNY',0.05,0.20,'e9994000-0000-0000-0000-000000000101',1,
+        'aaaaaaaa-0000-0000-0000-000000000001');
+SELECT fn_rounding_tolerance_approve('e9994000-0000-0000-0000-000000000001',
+  'aaaaaaaa-0000-0000-0000-000000000003');
+
+-- NO_FX 來源 run（Case-001 調整後集團 TB，借貸各 59,000,000 JPY）
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status, file_name)
+VALUES ('00000000-0000-0000-0000-0000000000f1','11111111-1111-1111-1111-111111111111',
+        'eeeeeeee-0000-0000-0000-000000000001','cccccccc-0000-0000-0000-000000000001',
+        '99999999-0000-0000-0000-000000000001','aaaaaaaa-0000-0000-0000-000000000001',
+        'aaaaaaaa-0000-0000-0000-000000000005','ACCEPTED','case-001-tb.csv');
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('00000000-0000-0000-0000-0000000000f2','11111111-1111-1111-1111-111111111111',
+        'eeeeeeee-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001',
+        'NO_FX','sqlcanon-2','seed-case001','aaaaaaaa-0000-0000-0000-000000000001');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by)
+VALUES ('00000000-0000-0000-0000-0000000000f3','11111111-1111-1111-1111-111111111111',
+        'eeeeeeee-0000-0000-0000-000000000001','99999999-0000-0000-0000-000000000001',
+        '00000000-0000-0000-0000-0000000000f1','00000000-0000-0000-0000-0000000000f2',
+        'PREVIEW','RUNNING',gen_random_uuid(),'seed','1.0.0',
+        'aaaaaaaa-0000-0000-0000-000000000001');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+SELECT '11111111-1111-1111-1111-111111111111','00000000-0000-0000-0000-0000000000f3',
+       'SOURCE_TB', a.account_id, a.code, a.name, v.d, v.c
+  FROM (VALUES ('1001',350000,0),('1002',9650000,0),('1122',5600000,0),('1405',2300000,0),
+               ('1601',4800000,200000),('2202',0,3900000),('2221',0,800000),
+               ('4001',0,10000000),('4104',0,2100000),('6001',0,42000000),
+               ('6401',21700000,0),('6602',14600000,0)) AS v(code,d,c)
+  JOIN account a ON a.code = v.code AND a.coa_id='88888888-0000-0000-0000-000000000001';
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='seed-case001-result',
+       completed_at=now() WHERE calculation_run_id='00000000-0000-0000-0000-0000000000f3';
 SQL
 echo "種子完成（${DB}）"

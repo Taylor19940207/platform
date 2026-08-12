@@ -146,5 +146,6 @@ export async function workbench(ctx: AuthenticatedContext, send: Respond): Promi
          .join("　") || "—"}</td></tr>
        <tr><td>證據包</td><td>${esc(o.packages)}</td><td class="note">見 B-07</td></tr>
      </table>
-     <p><a href="/">← 回 B-00</a></p>`));
+     <p><a href="/b06/fx?revision=${p.period_revision_id}">→ B-06 折算與核對</a>　
+        <a href="/">← 回 B-00</a></p>`));
 }

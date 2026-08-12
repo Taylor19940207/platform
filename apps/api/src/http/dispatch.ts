@@ -6,6 +6,7 @@
 import type { AuthenticatedContext } from "./context.ts";
 import type { Respond } from "./respond.ts";
 import * as periods from "../modules/periods/routes.ts";
+import * as fx from "../modules/calculations/fx.ts";
 import * as adjustments from "../modules/adjustments/routes.ts";
 import * as imports from "../modules/imports/routes.ts";
 import * as mappings from "../modules/mappings/routes.ts";
@@ -20,6 +21,12 @@ export type RouteHandler = (ctx: AuthenticatedContext, send: Respond) => Promise
 
 const ROUTES: Record<string, RouteHandler> = {
   "GET /b02": periods.workbench,
+  "GET /b06/fx": fx.fxPage,
+  "POST /b06/fx/select-inputs": fx.fxSelectInputs,
+  "POST /b06/fx/run": fx.fxRun,
+  "POST /b06/fx/reconcile": fx.fxReconcile,
+  "POST /b06/fx/select-run": fx.fxSelectRun,
+  "POST /b06/fx/replay": fx.fxReplay,
   "POST /period/transition": periods.transition,
   "POST /b04/accept": imports.accept,
   "GET /b04": mappings.view,
