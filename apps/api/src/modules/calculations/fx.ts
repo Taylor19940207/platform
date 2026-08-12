@@ -203,12 +203,12 @@ export async function fxPage(ctx: AuthenticatedContext, send: Respond): Promise<
              <input type="hidden" name="run" value="${r.calculation_run_id}">
              ${opts.tol.length ? sel1("tolerance", opts.tol, "tolerance_version_id", "label")
                                : `<span class="note">無已批准的容許值版本</span>`}
-             ${opts.tol.length ? `<button>核對（R2）</button>` : ""}</form>` : ""}
+             ${opts.tol.length ? `<button>產生調節結果（R2）</button>` : ""}</form>` : ""}
           ${r.recon && roles.has("R4") ? `<form method="post" action="/b06/fx/select-run" style="display:inline">
              <input type="hidden" name="revision" value="${rev}">
              <input type="hidden" name="run" value="${r.calculation_run_id}">
              <input type="hidden" name="recon" value="${r.recon}">
-             <button>選為現行結論（R4）</button></form>` : ""}
+             <button>選定現行結論（R4）</button></form>` : ""}
           ${roles.has("R2") || roles.has("R3") ? `<form method="post" action="/b06/fx/replay" style="display:inline">
              <input type="hidden" name="revision" value="${rev}">
              <input type="hidden" name="run" value="${r.calculation_run_id}">
@@ -216,6 +216,10 @@ export async function fxPage(ctx: AuthenticatedContext, send: Respond): Promise<
       : `<p class="note">本期尚無折算 run。</p>`}
 
     <h2>現行結論</h2>
+    <p class="note">「產生調節結果」是 R2 執行的**系統核對**，不是 R3 的專業覆核——
+       期間尚未進入 <code>RECONCILING</code>。「選定現行結論」是 R4 指定本期採用哪一版
+       折算結果，**不是最終交付批准**：期間包的最終批准在折算與核對之後（§25.3），
+       本頁不解鎖任何期間遷移。</p>
     ${cur ? `<p>run ${esc(cur.selected_run_id.slice(0, 8))}　由 ${esc(cur.by_name)} 選定（第 ${esc(cur.version_no)} 版）</p>
       <table><tr><th>科目</th><th>分層</th><th>幣別</th><th>借</th><th>貸</th></tr>
       ${lines.map((l) => `<tr><td>${esc(l.account_code)}</td><td>${esc(l.posting_layer)}</td>
