@@ -120,18 +120,31 @@ RSERIES=f0300000-0000-0000-0000-000000000101
 # FX 專屬使用者：同時持有 R3 與 R4，用來驗「覆核人可接著批准」的兩人路徑。
 # 不改動共用的甲乙丙——那會動到前面各套件的前提。
 FXU=af300000-0000-0000-0000-000000000001
+FXOPS=af300000-0000-0000-0000-000000000002      # 租戶層 R6（§26.3：系管不逐案件指派）
 _has app_user "user_id = '$FXU'" || PSQL_C >/dev/null 2>&1 <<SQL
 $T1
-INSERT INTO app_user (user_id, tenant_id, email, display_name)
-VALUES ('$FXU','$TEN','fx-reviewer@t1.jp','FX 覆核者');
+INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
+  ('$FXU','$TEN','fx-reviewer@t1.jp','FX 覆核者'),
+  ('$FXOPS','$TEN','fx-ops@t1.jp','FX 系管');
 INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id) VALUES
-  ('$TEN','$FXU','R2','$ENG'), ('$TEN','$FXU','R3','$ENG'), ('$TEN','$FXU','R4','$ENG');
+  ('$TEN','$FXU','R2','$ENG'), ('$TEN','$FXU','R3','$ENG'), ('$TEN','$FXU','R4','$ENG'),
+  ('$TEN','$FXOPS','R6',NULL);
 SQL
+# T2 的案件與報告單位：跨租戶父物件的反例來源
+ENG_T2=ef300000-0000-0000-0000-000000000001
+UNIT_T2=bf300000-0000-0000-0000-000000000001
+_has client_engagement "engagement_id = '$ENG_T2'" || PSQL_C >/dev/null 2>&1 <<SQL
+$T2
+INSERT INTO client_engagement (engagement_id, tenant_id, name) VALUES ('$ENG_T2','$TEN2','T2 客戶案件');
+INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, unit_scope, name)
+VALUES ('$UNIT_T2','$TEN2','$ENG_T2','LEGAL_ENTITY','T2 單位');
+SQL
+# 0032：匯率版本與觀測只能經 system-only 函式建立（要驗租戶層 R6）
 PSQL_C >/dev/null 2>&1 <<SQL
 $T1
 INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
         series_id, version_no, created_by)
-VALUES ('$FXV','$TEN','$ENG','2026-03 v1','$RSERIES',1,'$JIA');
+VALUES ('$FXV','$TEN','$ENG','2026-03 v1','$RSERIES',1,'$FXOPS');
 INSERT INTO exchange_rate_observation (observation_id, tenant_id, rate_version_id, from_currency,
         to_currency, rate_type, rate, source, measurement_date)
 VALUES ('$OBS_CLOSE','$TEN','$FXV','JPY','CNY','CLOSING',0.04812,'BOJ','2026-03-31');
@@ -142,8 +155,27 @@ INSERT INTO exchange_rate_observation (observation_id, tenant_id, rate_version_i
         to_currency, rate_type, rate, source, event_date)
 VALUES ('$OBS_HIST','$TEN','$FXV','JPY','CNY','HISTORICAL',0.061,'契約','2018-06-15');
 SQL
+expect_err "0032：非 R6 不得建立匯率版本" \
+  "$T1 SELECT fn_exchange_rate_version_create('$TEN','$ENG','非 R6 建立',
+       'f0300000-0000-0000-0000-000000000191',1,NULL,'$JIA')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0032：租戶層 R6 可經函式建立匯率版本" \
+  "$T1 SELECT fn_exchange_rate_version_create('$TEN','$ENG','R6 建立',
+       'f0300000-0000-0000-0000-000000000192',1,NULL,'$FXOPS')"
+expect_err "0032：非 R6 不得新增匯率觀測" \
+  "$T1 SELECT fn_exchange_rate_observation_add('$FXV','JPY','CNY','CLOSING',0.5,'x',
+       '2026-02-27',NULL,NULL,NULL,'$JIA')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0032：R6 可經函式新增匯率觀測" \
+  "$T1 SELECT fn_exchange_rate_observation_add('$FXV','JPY','CNY','CLOSING',0.5,'x',
+       '2026-02-27',NULL,NULL,NULL,'$FXOPS')"
+expect_err "0032：跨租戶案件 → 建立匯率版本被拒" \
+  "$T1 SELECT fn_exchange_rate_version_create('$TEN','$ENG_T2','跨租戶',
+       'f0300000-0000-0000-0000-000000000193',1,NULL,'$FXOPS')" "歸屬違規\|ACTOR_ROLE_NOT_HELD"
+n=$(APP_C <<<"$T1 INSERT INTO exchange_rate_version (tenant_id, engagement_id, label, series_id,
+      version_no, created_by) VALUES ('$TEN','$ENG','直插','f0300000-0000-0000-0000-000000000194',1,'$JIA')" 2>&1 | grep -c "permission denied")
+[ "$n" -ge 1 ] && ok "0032：app_runtime 不得直接 INSERT 匯率版本" || ng "0032：app_runtime 直插得進匯率版本"
 n=$(PSQL_C <<<"$T1 SELECT count(*) FROM exchange_rate_observation WHERE rate_version_id='$FXV'")
-[ "$n" = "3" ] && ok "0030：DRAFT 匯率版本可自由增減觀測（3 筆）" || ng "0030：觀測建立失敗（${n}）"
+# 3 筆種子 ＋ 1 筆由上面的 R6 函式加入
+[ "$n" = "4" ] && ok "0030：DRAFT 匯率版本可自由增減觀測（4 筆）" || ng "0030：觀測建立失敗（${n}）"
 
 # 0031：建立時不得自填操作者，也不得直接以非 DRAFT 建立
 expect_err "0031：建立時自填 submitted_by → 拒絕（操作者由 DB 查證）" \
@@ -245,6 +277,37 @@ expect_err "0030：APPROVED 後不得新增觀測" \
 n=$(APP_C <<<"$T1 UPDATE exchange_rate_version SET label='x' WHERE rate_version_id='$FXV'" 2>&1 | grep -c "permission denied")
 [ "$n" -ge 1 ] && ok "0031：app_runtime 對匯率版本無 UPDATE 權限" || ng "0031：app_runtime 改得動匯率版本"
 
+# ── 0032：主檔父鏈必須一路同租戶（RLS 只看列上的 tenant_id）──
+expect_err "0032 父鏈：幣別指派引用其他租戶的案件 → 拒絕" \
+  "$T1 INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by)
+   VALUES ('$TEN','$ENG_T2','$UNIT_T2','FUNCTIONAL','JPY','[2031-01-01,)','$JIA')" "歸屬違規"
+expect_err "0032 父鏈：幣別指派引用同租戶但其他案件的單位 → 拒絕" \
+  "$T1 INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by)
+   VALUES ('$TEN','$ENG99','$UNIT','FUNCTIONAL','JPY','[2032-01-01,)','$JIA')" "§24.1A"
+n=$(APP_C <<<"$T1 INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id,
+      reporting_unit_id, currency_role, currency_code, effective_range, created_by,
+      approved_by, approved_at)
+    VALUES ('$TEN','$ENG','$GRP_UNIT','REPORTING','CNY','[2033-01-01,)','$JIA','$JIA',now())" 2>&1 | grep -c "permission denied")
+[ "$n" -ge 1 ] && ok "0032：app_runtime 不得於 INSERT 時自填批准欄（欄位級權限）" \
+  || ng "0032：app_runtime 自填得了批准欄"
+# 正控制：不自填批准欄時，app_runtime 必須仍能建立草稿列。
+# 沒有這一條，權限收得太緊（例如連父鏈查證函式都撤回）會被誤讀成控制生效。
+out=$(APP_C <<<"$T1 INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id,
+      reporting_unit_id, currency_role, currency_code, effective_range, created_by)
+    VALUES ('$TEN','$ENG','$GRP_UNIT','REPORTING','CNY','[2033-01-01,)','$JIA')" 2>&1)
+[ -z "$out" ] && ok "0032：app_runtime 仍可建立未批准的幣別指派（正控制）" \
+  || ng "0032：合法建立被擋 → ${out}"
+expect_err "0032：非 R4 不得批准幣別指派" \
+  "$T1 SELECT fn_currency_assignment_approve(
+       (SELECT assignment_id FROM reporting_unit_currency_assignment
+         WHERE reporting_unit_id='$UNIT' AND currency_role='FUNCTIONAL'),'$JIA')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0032：R4 可經函式批准幣別指派" \
+  "$T1 SELECT fn_currency_assignment_approve(
+       (SELECT assignment_id FROM reporting_unit_currency_assignment
+         WHERE reporting_unit_id='$UNIT' AND currency_role='FUNCTIONAL'),'$FXU')"
+
 # ══ 5　折算分類與政策版本 ═════════════════════════════════════════
 expect_err "0030：translation_category 不接受自創值" \
   "$T1 UPDATE account SET translation_category='WHATEVER' WHERE account_id='$ACC1'" \
@@ -257,11 +320,11 @@ expect_ok  "0030：建立折算政策版本（含 CTA 落點）" \
         reporting_unit_id, label, cta_account_id, cta_coa_id, created_by)
    VALUES ('$POLV','$TEN','$ENG','$UNIT','FX 政策 v1','$CTA_ACC',
            '88888888-0000-0000-0000-000000000001','$JIA')"
-expect_err "0030：CTA 科目與所宣告的科目表不符 → 拒絕" \
+expect_err "0030／0032：CTA 科目不屬本案件的科目表 → 拒絕" \
   "$T1 INSERT INTO translation_policy_version (tenant_id, engagement_id, reporting_unit_id, label,
         cta_account_id, cta_coa_id, created_by)
    VALUES ('$TEN','$ENG','$UNIT','壞政策','$ACC99','88888888-0000-0000-0000-000000000001','$JIA')" \
-  "CTA_ACCOUNT_SCOPE_INVALID"
+  "§24.1A"
 expect_ok  "0030：政策版本可掛規則（方法是資料）" \
   "$T1 INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method)
    VALUES ('$TEN','$POLV','ASSET','CLOSING'),('$TEN','$POLV','LIABILITY','CLOSING'),
@@ -271,9 +334,10 @@ expect_ok  "0030：政策版本可掛規則（方法是資料）" \
 expect_err "0030：同一政策版本內同一分類不得有兩條規則（重疊在資料層先擋一半）" \
   "$T1 INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method)
    VALUES ('$TEN','$POLV','ASSET','AVERAGE')" "duplicate key"
-expect_ok  "0030：批准政策版本" \
-  "$T1 UPDATE translation_policy_version SET approved_by='$BING', approved_at=now()
-   WHERE policy_version_id='$POLV'"
+expect_err "0032：非 R4 不得批准折算政策" \
+  "$T1 SELECT fn_translation_policy_approve('$POLV','$JIA')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0030／0032：R4 經函式批准政策版本" \
+  "$T1 SELECT fn_translation_policy_approve('$POLV','$FXU')"
 expect_err "0030：已批准的政策版本不可變更" \
   "$T1 UPDATE translation_policy_version SET label='改名' WHERE policy_version_id='$POLV'" \
   "TRANSLATION_POLICY_IMMUTABLE"
@@ -298,9 +362,8 @@ expect_err "0030：lot 的 event_date 必須與觀測相符" \
   "$T1 INSERT INTO equity_translation_lot (tenant_id, set_version_id, event_date, functional_amount,
         exchange_rate_observation_id, evidence_ref, line_no)
    VALUES ('$TEN','$SETV','2020-01-01',1,'$OBS_HIST','x',8)" "EQUITY_LOT_RATE_DATE_MISMATCH"
-expect_ok  "0030：批准 lot set v1" \
-  "$T1 UPDATE equity_translation_lot_set_version SET approved_by='$BING', approved_at=now()
-   WHERE set_version_id='$SETV'"
+expect_ok  "0030／0032：R4 經函式批准 lot set v1" \
+  "$T1 SELECT fn_equity_lot_set_approve('$SETV','$FXU')"
 expect_err "0030：已批准的 set 不可變更" \
   "$T1 UPDATE equity_translation_lot_set_version SET version_no=2 WHERE set_version_id='$SETV'" \
   "EQUITY_LOT_SET_IMMUTABLE"
@@ -359,7 +422,8 @@ INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, p
 -- MF2 凍結本案件的匯率版本——component 的「同凍結版本」檢查靠它。
 INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
         domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
-VALUES ('$TEN','$MF2','EXCHANGE_RATE_VERSION','$FXV','version','1','fx','h-fx','{}'::jsonb);
+VALUES ('$TEN','$MF2','EXCHANGE_RATE_VERSION','$FXV','version','1','fx','h-fx','{}'::jsonb),
+       ('$TEN','$MF2','TRANSLATION_POLICY_VERSION','$POLV','version','1','pol','h-pol','{}'::jsonb);
 -- run 一律建立為 RUNNING（0012：結果狀態只能由執行交易寫入），再推到 COMPLETED
 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
         import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
@@ -430,9 +494,10 @@ expect_err "0030：同一期間同一科目只能有一筆期初已折算餘額"
         evidence_ref, created_by)
    VALUES ('$TEN','$ENG','$UNIT','$PR','$ACC2','CNY',1,'FIRST_CONVERSION','x','$JIA')" \
   "duplicate key"
-expect_ok  "0030：批准期初餘額" \
-  "$T1 UPDATE equity_opening_translated_balance SET approved_by='$BING', approved_at=now()
-   WHERE period_revision_id='$PR' AND account_id='$ACC2'"
+expect_ok  "0030／0032：R4 經函式批准期初餘額" \
+  "$T1 SELECT fn_equity_opening_approve(
+       (SELECT opening_id FROM equity_opening_translated_balance
+         WHERE period_revision_id='$PR' AND account_id='$ACC2'),'$FXU')"
 expect_err "0030：已批准的期初餘額不可變更" \
   "$T1 UPDATE equity_opening_translated_balance SET opening_credit=1
    WHERE period_revision_id='$PR' AND account_id='$ACC2'" "OPENING_BALANCE_IMMUTABLE"
@@ -476,6 +541,10 @@ n=$(PSQL_C <<<"$T1 SELECT 1 FROM pg_constraint WHERE conname='balance_snapshot_l
 # 快照只能在 RUNNING 的 run 上追加（0012：終態後結果不可再變），
 # 因此折算結果的 fixture 掛在 RUN_RUNNING 上，另建一個 RUNNING 的 run 作跨 run 反例。
 ENTRY=f0350000-0000-0000-0000-000000000001
+RULE_ASSET=$(PSQL_C <<<"$T1 SELECT policy_rule_id FROM translation_policy_rule
+  WHERE policy_version_id='$POLV' AND translation_category='ASSET'")
+[ -n "$RULE_ASSET" ] && ok "0032 前置：取得 ASSET 的政策規則（非 CTA 結果必須帶它）" \
+  || ng "0032 前置：找不到 ASSET 政策規則"
 MF4=99940000-0000-0000-0000-000000000004
 RUN_SNAP2=99950000-0000-0000-0000-000000000004
 PSQL_C >/dev/null 2>&1 <<SQL
@@ -485,7 +554,8 @@ INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, p
 VALUES ('$MF4','$TEN','$ENG','$PR','NO_FX','sqlcanon-2','fx-fixture-4','$JIA');
 INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
         domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
-VALUES ('$TEN','$MF4','EXCHANGE_RATE_VERSION','$FXV','version','1','fx','h-fx4','{}'::jsonb);
+VALUES ('$TEN','$MF4','EXCHANGE_RATE_VERSION','$FXV','version','1','fx','h-fx4','{}'::jsonb),
+       ('$TEN','$MF4','TRANSLATION_POLICY_VERSION','$POLV','version','1','pol','h-pol4','{}'::jsonb);
 INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
         import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
         engine_version, created_by)
@@ -529,16 +599,17 @@ expect_ok  "0031：CTA 明細（正控制）" \
 
 expect_err "0031 父鏈：折算結果的來源快照屬於另一個 run → 拒絕" \
   "$T1 INSERT INTO translation_result (tenant_id, calculation_run_id, source_snapshot_line_id,
-        amount_role, currency_code, source_debit, result_debit)
-   VALUES ('$TEN','$RUN_RUNNING','$SNAP_OTHER','REPORTING','CNY',1,1)" "TRANSLATION_RESULT_RUN_MISMATCH"
+        amount_role, currency_code, source_debit, result_debit, translation_policy_rule_id)
+   VALUES ('$TEN','$RUN_RUNNING','$SNAP_OTHER','REPORTING','CNY',1,1,'$RULE_ASSET')" "TRANSLATION_RESULT_RUN_MISMATCH"
 
 # 延遲合計：彙總先建、明細後插，中間狀態不得誤擋；合計不符須在 COMMIT 時被擋下
 RES1=f0370000-0000-0000-0000-000000000001
 expect_ok  "0031：同一交易內先建彙總、再插兩筆明細 → COMMIT 通過（中間狀態不誤擋）" \
   "$T1 BEGIN;
    INSERT INTO translation_result (translation_result_id, tenant_id, calculation_run_id,
-     source_snapshot_line_id, amount_role, currency_code, source_debit, result_debit)
-   VALUES ('$RES1','$TEN','$RUN_RUNNING','$SNAP_OK','REPORTING','CNY',350000,16842.00);
+     source_snapshot_line_id, amount_role, currency_code, source_debit, result_debit,
+     translation_policy_rule_id)
+   VALUES ('$RES1','$TEN','$RUN_RUNNING','$SNAP_OK','REPORTING','CNY',350000,16842.00,'$RULE_ASSET');
    INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no, source_kind,
      exchange_rate_observation_id, source_debit, result_debit)
    VALUES ('$TEN','$RES1',1,'RATE_TRANSLATION','$OBS_CLOSE',200000,9624.00),
@@ -547,9 +618,10 @@ expect_ok  "0031：同一交易內先建彙總、再插兩筆明細 → COMMIT �
 expect_err "0031：明細合計與彙總不符 → COMMIT 時擋下" \
   "$T1 BEGIN;
    INSERT INTO translation_result (translation_result_id, tenant_id, calculation_run_id,
-     source_snapshot_line_id, amount_role, currency_code, source_debit, result_debit)
+     source_snapshot_line_id, amount_role, currency_code, source_debit, result_debit,
+     translation_policy_rule_id)
    VALUES ('f0370000-0000-0000-0000-000000000002','$TEN','$RUN_SNAP2','$SNAP_OTHER',
-           'REPORTING','CNY',1,1);
+           'REPORTING','CNY',1,1,'$RULE_ASSET');
    INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no, source_kind,
      exchange_rate_observation_id, source_debit, result_debit)
    VALUES ('$TEN','f0370000-0000-0000-0000-000000000002',1,'RATE_TRANSLATION','$OBS_CLOSE',1,999);
@@ -575,6 +647,40 @@ expect_err "0031：component 引用未被本 run 凍結的匯率版本 → 拒�
   "$T1 INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no,
         source_kind, exchange_rate_observation_id, source_debit, result_debit)
    VALUES ('$TEN','$RES1',5,'RATE_TRANSLATION','$OBS_OTHER',1,1)" "TRANSLATION_SOURCE_NOT_FROZEN"
+
+# 0032 P2：折算結果必須答得出「憑哪條方法算的」
+POLV2=f0320000-0000-0000-0000-000000000002
+SNAP_CTA=
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO translation_policy_version (policy_version_id, tenant_id, engagement_id,
+        reporting_unit_id, label, cta_account_id, cta_coa_id, created_by)
+VALUES ('$POLV2','$TEN','$ENG','$UNIT','未被凍結的政策','$CTA_ACC',
+        '88888888-0000-0000-0000-000000000001','$JIA');
+INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method)
+VALUES ('$TEN','$POLV2','ASSET','CLOSING');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit)
+VALUES ('$TEN','$RUN_RUNNING','TRANSLATION_ADJUSTMENT','$CTA_ACC','1001','CTA',0,0);
+SQL
+SNAP_CTA=$(PSQL_C <<<"$T1 SELECT snapshot_line_id FROM balance_snapshot_line
+  WHERE calculation_run_id='$RUN_RUNNING' AND posting_layer='TRANSLATION_ADJUSTMENT'")
+RULE_OTHER=$(PSQL_C <<<"$T1 SELECT policy_rule_id FROM translation_policy_rule
+  WHERE policy_version_id='$POLV2'")
+expect_err "0032：非 CTA 的折算結果缺政策規則 → 拒絕" \
+  "$T1 INSERT INTO translation_result (tenant_id, calculation_run_id, source_snapshot_line_id,
+        amount_role, currency_code, source_debit, result_debit)
+   VALUES ('$TEN','$RUN_RUNNING','$SNAP_OK','REPORTING','CNY',1,1)" "TRANSLATION_RULE_REQUIRED"
+expect_err "0032：政策規則不屬本 run 凍結的政策版本 → 拒絕" \
+  "$T1 INSERT INTO translation_result (tenant_id, calculation_run_id, source_snapshot_line_id,
+        amount_role, currency_code, source_debit, result_debit, translation_policy_rule_id)
+   VALUES ('$TEN','$RUN_RUNNING','$SNAP_OK','REPORTING','CNY',1,1,'$RULE_OTHER')" \
+  "TRANSLATION_SOURCE_NOT_FROZEN"
+expect_err "0032：CTA 的折算結果不得帶政策規則（來源是 CTA 殘差）" \
+  "$T1 INSERT INTO translation_result (tenant_id, calculation_run_id, source_snapshot_line_id,
+        amount_role, currency_code, source_debit, result_debit, translation_policy_rule_id)
+   VALUES ('$TEN','$RUN_RUNNING','$SNAP_CTA','REPORTING','CNY',0,97159.00,'$RULE_ASSET')" \
+  "TRANSLATION_CTA_RULE_UNEXPECTED"
 
 expect_err "0031：component 的 XOR——RATE_TRANSLATION 缺匯率觀測" \
   "$T1 INSERT INTO translation_result_component (tenant_id, translation_result_id, line_no,
