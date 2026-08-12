@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、三十八份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、四十一份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -47,8 +47,13 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 均已完成並關閉；里程碑 3 的 **`SLICE-M3-01 B-02 期間工作台`（2026-08-11）與
 `SLICE-M3-02 折算與 CTA`與 `SLICE-M3-03 折算調節核對與期間級 G-07`
 （皆 2026-08-12，CLOSED／PASS）亦已正式關閉**。
-現有 38 份 migration；完整實跑結果為 **1,108**（單元 66、DB 整合 615、端到端 427），
-最新一輪全綠（已 push）。
+現有 41 份 migration；完整實跑結果為 **1,144**（單元 66、DB 整合 651、端到端 427），
+最新一輪全綠（HEAD `b87af36`，已 push）。
+
+**進行中：`SLICE-M3-04 現金流支持資料`第一段已完成**（0039～0041：模型、結構收口、
+用途封套指向該 dataset 自己的覆蓋度）。第二段拆為 **2a 角色工作流函式** 與
+**2b 計算與判定**，**禁止一次混做**；下一步是 2a。
+細節見 `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-04-PHASE1.md`。
 
 ## 🏁 里程碑 2 已完成（2026-08-10 離開複核通過）
 
@@ -107,13 +112,13 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,108 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,144 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis／**fx** 各自單跑（自行重建 DB 並補齊前置） | 9～30 秒 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
-| `pnpm test`（＝`test:full`） | 完整 1,108 條 | **約 6～7 分鐘** |
+| `pnpm test`（＝`test:full`） | 完整 1,144 條 | **約 6～7 分鐘** |
 | `pnpm test:acceptance:<suite>` | 十支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
@@ -155,8 +160,10 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   0028 遷移規格函式、0029 角色作用域修補）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-02.md`（折算與 CTA、
   0030～0035、Manifest 重演與完整性）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-03.md`（**最新接續入口**：
-  折算調節核對、兩支 readiness、0036～0038、MVP 3 剩餘項目）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-03.md`（折算調節核對、
+  兩支 readiness、0036～0038）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-04-PHASE1.md`（**最新接續入口**：
+  現金流支持資料第一段、0039～0041、2a／2b 的拆分與範圍）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
