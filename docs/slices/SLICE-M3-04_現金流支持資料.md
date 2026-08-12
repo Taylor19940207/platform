@@ -1,6 +1,6 @@
 # SLICE-M3-04　現金流支持資料（REQ-CFS-001）
 
-> 狀態：**事前契約 第一版，待走查**。**尚未批准進 migration。**
+> 狀態：**事前契約 第二版（走查修訂後）**，待確認。**尚未批准進 migration。**
 > 風險：**第一級**（母公司批准的方法版本、完整度判定、控制總額勾稽、凍結與重演）。
 >
 > 對應基線：手冊 v1.2 **REQ-CFS-001（P0）**、§20 MVP 3、§299–301（資料粒度）；
@@ -36,13 +36,17 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
 
     CashFlowPolicyVersion
     ├─ engagement_id / reporting_unit_id
-    ├─ method            DIRECT | INDIRECT          母公司採用的列報方法
-    ├─ granularity       ACCOUNT | JOURNAL | SUBLEDGER | DOCUMENT
-    │                    支持資料所需的**最低**粒度；沿用 DataCoverage 的既有四值
-    ├─ required_classes  必要分類集合（見 §五）
-    ├─ evidence_version  母公司確認文件的版本識別（外部證據）
+    ├─ method                 DIRECT | INDIRECT      母公司採用的列報方法
+    ├─ required_granularity   BALANCE | JOURNAL | SUBLEDGER | DOCUMENT
+    │                         支持資料所需的**最低**粒度；沿用 DataCoverage 的既有四值
+    │                         （**不是** ACCOUNT——ACCOUNT 是 source_kind，對應 BALANCE）
+    ├─ class_set_version_id   引用已批准的分類集合；**必要性只由集合的 is_required 定義**
+    ├─ evidence_version       母公司確認文件的版本識別（外部證據）
     ├─ series_id / version_no / supersedes_policy_version_id
     └─ approved_by / approved_at    **案件層 R4**（system-only 函式）
+
+- **必要分類不得在 Policy 與 ClassSet 各存一份**——兩份清單遲早分岔，
+  而分岔時沒有非任意的方式決定哪一份算數。Policy 只引用 `class_set_version_id`。
 
 - **`method` 與 `granularity` 都不得由平台推導**；未經 R4 批准的版本不得被使用。
 - 版本鏈與不可改寫的規則沿用 M3-03（現行版本由**取代鏈**判斷，不按時間；
@@ -58,9 +62,19 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
     ├─ approved_by / approved_at       案件層 R4
     └─ CashFlowClass［］
        ├─ code / name
-       ├─ activity          OPERATING | INVESTING | FINANCING
+       ├─ kind              ACTIVITY | FX_EFFECT_ON_CASH（控制項，不屬三大活動）
+       ├─ activity          OPERATING | INVESTING | FINANCING（kind = ACTIVITY 時必填）
        ├─ direction         INFLOW | OUTFLOW | EITHER
        └─ is_required       是否屬「必要分類」（§五）
+
+    CashFlowCashAccountMembership          現金及約當現金的科目範圍
+    ├─ class_set_version_id
+    ├─ account_id
+    └─ cash_role         CASH | CASH_EQUIVALENT
+
+**現金範圍隨分類集合一起批准、凍結與重演，不放進 `Account`。**
+不同母公司可能對同一科目有不同認定（尤其約當現金的三個月門檻），
+`Account` 上的屬性表達不了「這是誰的口徑」。
 
 - **以集合為批准與凍結單位**：單一分類的版本鏈證明不了「沒有漏掉一個必要分類」
   ——漏掉的那一個不存在，沒有版本鏈會指向它（與 `EquityTranslationLotSetVersion`
@@ -80,8 +94,19 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
        ├─ cash_flow_class_id
        ├─ effective_from / effective_to       生效日（比照 MappingRule）
        └─ evidence_ref
-- **`source_kind` 必須不高於政策的 `granularity`**：政策說只到 `ACCOUNT`，
-  就不得出現 `JOURNAL_LINE` 的規則——那是在宣稱擁有沒有取得的資料。
+- **粒度相容性由**同一支 DB 函式**判定**，不得在各處各寫一份排序：
+
+      fn_granularity_satisfies(p_actual text, p_required text) → boolean
+      序：BALANCE < JOURNAL < SUBLEDGER < DOCUMENT
+      source_kind 的對應：ACCOUNT→BALANCE、JOURNAL_LINE→JOURNAL、
+                          SUBLEDGER_ITEM→SUBLEDGER、DOCUMENT→DOCUMENT
+
+  三條規則：
+  1. **實際 `DataCoverage.granularity` 必須滿足政策的 `required_granularity`**；
+  2. **映射規則的 `source_kind` 也必須被實際 `DataCoverage` 支持**；
+  3. 政策要求 `JOURNAL` 時，**只有 ACCOUNT 層映射不算完整**；
+     政策只要求 `BALANCE` 而實際取得 `JOURNAL` 時，**可以保留更細的來源**
+     （更細不是錯，只有更粗才是）。
 - **一對一，不做條件式映射**（沿用 SLICE-M2-01 的邊界；條件式在 BACKLOG）。
 - 同一 `source_ref` 在同一生效期間內至多一條規則；重疊即拒絕
   （`CFS_MAPPING_AMBIGUOUS`）。
@@ -90,10 +115,24 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
 
 「完整」不是「每一筆都有分類」，而是**母公司宣告的必要分類都拿得到資料**。
 
+**「沒有資料」不等於「不完整」**：某個必要分類本期可能合法地為零活動。
+逼它一定要有金額，會把零活動期間判成失敗，而使用者唯一的出路是造一筆假資料。
+因此改為**逐期確認**：
+
+    CashFlowClassPeriodCoverage
+    ├─ period_revision_id / reporting_unit_id / policy_version_id
+    ├─ cash_flow_class_id
+    ├─ status    DATA_PRESENT              有已映射的支持資料
+    │            | ZERO_ACTIVITY_CONFIRMED 本期確認無活動（需確認人與理由）
+    │            | COVERAGE_EXCEPTION      粒度不足，走已批准例外（§五之二）
+    ├─ confirmed_by / confirmed_at         ZERO_ACTIVITY_CONFIRMED 時必填（R2 確認、R3 覆核）
+    └─ evidence_ref                        ZERO_ACTIVITY_CONFIRMED 時必填
+
     完整度判定（per period_revision × reporting_unit × policy_version）
-    ├─ 每個 is_required 的 CashFlowClass 至少有一筆已映射的支持資料
+    ├─ 每個 is_required 的 CashFlowClass 都有一筆 CashFlowClassPeriodCoverage，
+    │  且 status 為上述三者之一
     ├─ 所有納入的來源事實都命中恰好一條映射規則
-    └─ 實際 DataCoverage.granularity ≥ 政策要求的 granularity
+    └─ 粒度相容（§四的 fn_granularity_satisfies）
 
 未達成時的穩定代碼：
 
@@ -105,9 +144,10 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
 | `CFS_GRANULARITY_INSUFFICIENT` | 實際 `DataCoverage` 粒度低於政策要求（INV-23） |
 | `CFS_UNMAPPED_SOURCE` | 有來源事實未命中任何映射規則 |
 | `CFS_MAPPING_AMBIGUOUS` | 同一來源命中多條規則 |
-| `CFS_REQUIRED_CLASS_EMPTY` | 必要分類沒有任何支持資料 |
+| `CFS_REQUIRED_CLASS_UNCONFIRMED` | 必要分類既無資料、也未確認零活動、也無已批准例外 |
+| `CFS_ZERO_ACTIVITY_UNCONFIRMED` | 標為零活動但缺確認人或證據 |
 
-### 粒度不足：fail closed，或**批准例外**
+### 五之二、粒度不足：fail closed，或**批准例外**
 
 INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常真的拿不到 JOURNAL 粒度，
 因此提供一條**顯式的例外路徑**（比照 G-02 的「已批准例外」）：
@@ -126,7 +166,12 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 
 ## 六、支持資料輸出與控制總額勾稽
 
-    CashFlowSupportRun（沿用 CalculationRun 的形狀？見下）
+**拍板：沿用 `CalculationRun`，新增 `calculation_scope = 'CASH_FLOW_SUPPORT'`。**
+產出用獨立的 `CashFlowSupportLine`，但**共用** Manifest、SHA-256、replay、
+狀態與結果雜湊——不另建 `CashFlowSupportRun`，否則會出現第二份
+「凍結與重演」實作。
+
+    CalculationRun（calculation_scope = 'CASH_FLOW_SUPPORT'）
     └─ CashFlowSupportLine［］
        ├─ cash_flow_class_id / activity
        ├─ amount（功能幣）/ amount_reporting（報告幣，可空）
@@ -134,30 +179,40 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
        ├─ coverage_exception_id（可空）
        └─ period_revision_id / reporting_unit_id
 
-**待走查拍板的一項**：現金流支持資料是**另立 `CashFlowSupportRun`**，
-還是**沿用 `CalculationRun` 並新增 `calculation_scope = 'CASH_FLOW_SUPPORT'`**？
-本契約傾向**後者**——凍結集合、Manifest 完整性驗證、replay 與結果雜湊
-（0034／0035）已經是通用能力，另立一套會出現第二份「凍結與重演」實作，
-那正是 M3-02 走查反覆擋下的模式。若走查同意，本刀只需擴充 `calculation_scope`
-與新增 manifest 條目型別，不重建。
-
 ### 控制總額勾稽（G-09 的資料層對應物）
 
-支持資料必須與**已折算的財務資料**對得起來，否則它只是一堆分類標籤：
+**現金的期初與期末來源必須凍結，不得臨時查詢：**
+
+| 項目 | 來源 |
+|---|---|
+| 期初現金 | **前期已選定的 run**（`PeriodFxRunSelection`／NO_FX 的對應選定）；**首期**則使用**經批准的期初現金證據**（比照 `EquityOpeningTranslatedBalance` 的 `FIRST_CONVERSION`） |
+| 期末現金 | **本期選定的 run** |
+| 現金科目範圍 | 凍結的 `CashFlowCashAccountMembership`（隨分類集合） |
 
 | # | 勾稽 | 判準 |
 |---|---|---|
-| K1 | 現金及約當現金的期初＋淨變動＝期末 | 以現金類科目的 TB 餘額為準（來自選定的 FX run 或 NO_FX run） |
-| K2 | 三大活動（OPERATING／INVESTING／FINANCING）合計＝現金淨變動 | 分類金額加總 |
+| K1 | **功能幣**：期初現金 ＋ 經營 ＋ 投資 ＋ 融資 ＝ 期末現金 | **不含**匯率變動影響 |
+| K2 | **報告幣**：期初現金 ＋ 經營 ＋ 投資 ＋ 融資 ＋ **匯率變動對現金及約當現金的影響** ＝ 期末現金 | 只在引用 FX run 時檢查 |
 | K3 | 每一列都追得到來源事實與映射規則 | `source_ref` 與 `mapping_rule_id` 皆非空 |
 | K4 | 幣別一致 | 支持資料的幣別＝所引用 run 的功能幣；報告幣欄位僅在引用 FX run 時填寫 |
 
+**`FX_EFFECT_ON_CASH` 是獨立的控制項，不是第四種活動。**
+它不得被歸入 OPERATING／INVESTING／FINANCING 任何一類。
+
+**P0 不計算它。** 若由「期末 − 期初 − 三大活動」反推，K2 就變成恆等式，
+永遠成立、永遠驗不出任何事——那既是殘差反推（本刀明令禁止），也讓控制總額
+失去意義。因此：
+
+- `CashFlowClassSetVersion` 必須包含一個 `kind = 'FX_EFFECT_ON_CASH'` 的
+  控制項目（`activity` 為 NULL，不屬三大活動之一）；
+- 它的金額與其他分類一樣，**由映射的支持資料提供**，或以
+  `ZERO_ACTIVITY_CONFIRMED` 確認為零（同一幣別時本來就是零）；
+- K2 因此是**真正的檢查**：提供的值若讓等式不成立即 `CFS_CONTROL_TOTAL_MISMATCH`。
+
+跨幣別時漏掉它，K2 對不上；把它塞進三大活動，分類會失真——兩者都會被擋下。
+
 不成立時 `CFS_CONTROL_TOTAL_MISMATCH`，**輸出標記為不可用**（比照 G-09 的
 `output_capability = NONE`）。
-
-> **K1 的現金科目來自哪裡**是走查要拍的第二項：由 `CashFlowClassSetVersion`
-> 明示「哪些集團科目屬現金及約當現金」，或由 `Account` 上另一個受控屬性？
-> 本契約傾向**前者**（母公司口徑的一部分，隨分類集合一起批准）。
 
 ## 七、凍結與重演
 
@@ -168,8 +223,10 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
   `SOURCE_CALCULATION_RUN`（重用）。
 - payload 保存**實際使用到的每一個值**（分類集合、命中的映射規則、例外、
   來源 TB 的現金科目餘額），canonical 為 payload 的文字投影，SHA-256。
-- 產出前先 `fn_fx_verify_manifest`（該函式與 FX 無關，是通用的凍結集合驗證——
-  本刀順帶改名為 `fn_manifest_verify`，**行為不變**）。
+- 產出前先驗凍結集合。該驗證與 FX 無關，是通用能力，因此**新增
+  `fn_manifest_verify(manifest_id)`**；`fn_fx_verify_manifest` **保留為相容
+  wrapper**（直接轉呼叫新函式），**不改名、不移除**——已關閉的 M3-02／M3-03
+  行為與測試斷言因此完全不動。
 - replay 只讀凍結 payload，結果雜湊涵蓋**金額與來源證據**（分類、映射規則、例外）。
 
 ## 八、期間狀態機邊界
@@ -191,14 +248,26 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 5. **映射唯一**：同一來源同一生效期間兩條規則 → `CFS_MAPPING_AMBIGUOUS`。
 6. **未映射即未映射**：有來源事實未命中規則 → `CFS_UNMAPPED_SOURCE`，
    **不得**被歸入任何預設分類。**反證：加入「其他」預設分類 → 轉紅。**
-7. **必要分類完整度**：某個 `is_required` 分類沒有任何支持資料 →
-   `CFS_REQUIRED_CLASS_EMPTY`。
+7. **必要分類完整度（零活動是合法的）**：
+   (a) 必要分類既無資料、也未確認零活動、也無例外 → `CFS_REQUIRED_CLASS_UNCONFIRMED`；
+   (b) 標為 `ZERO_ACTIVITY_CONFIRMED` 但缺確認人或證據 → `CFS_ZERO_ACTIVITY_UNCONFIRMED`；
+   (c) **零活動期間必須能通過完整度判定**（正控制）。
+   **反證：把判定改回「必要分類至少要有一筆金額」→ (c) 轉紅。**
+7A. **粒度相容性只有一份實作**：政策要 `JOURNAL` 而映射只到 `ACCOUNT` → 拒絕；
+   政策只要 `BALANCE` 而實際取得 `JOURNAL` → **接受**（更細不是錯）。
+   **反證：在判定函式外另寫一份粒度排序 → 兩處不一致時測試轉紅。**
 8. **粒度不足 fail closed**：`DataCoverage.granularity` 低於政策要求且無例外 →
    `CFS_GRANULARITY_INSUFFICIENT`，不產生任何輸出。
 9. **例外必須逐分類且經 R4 批准**：整期一次豁免 → 拒絕；有例外時輸出的相關列
    必須帶 `coverage_exception_id`。**反證：允許整期豁免 → 轉紅。**
 10. **控制總額 K1～K4**：任一不成立 → `CFS_CONTROL_TOTAL_MISMATCH` 且輸出不可用。
-    正控制：Case-001 的現金科目期初＋淨變動＝期末。
+    (a) 功能幣 K1 **不含** FX effect；
+    (b) 跨幣別時 K2 **必須含** FX effect——把它拿掉後等式不成立即轉紅；
+    (c) **`FX_EFFECT_ON_CASH` 不得由殘差反推**：改成「期末 − 期初 − 三大活動」
+        後 K2 變成恆等式，此時應有一條測試證明「即使金額明顯錯誤 K2 仍通過」
+        → 該測試存在即代表反推被引入，必須轉紅；
+    (d) 期初現金來自**前期已選定 run**（首期用經批准的期初證據）、
+        期末來自**本期選定 run**；改成臨時查詢現行餘額 → 轉紅。
 11. **凍結與重演**：改動現行政策／分類集合／映射後，舊 run 重演結果與雜湊不變；
     新 run 才採新版本。**反證：重演時回查現行主檔 → 轉紅。**
 12. **結果雜湊涵蓋來源證據**：只改映射規則而金額不變時，雜湊必須改變。
