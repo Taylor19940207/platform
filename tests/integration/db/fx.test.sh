@@ -1440,4 +1440,222 @@ n=$(APP_C <<<"$T2 SELECT fn_period_fx_result_ready('$PR')" 2>&1 | grep -c "CROSS
 [ "$n" -ge 1 ] && ok "0038：唯讀判定函式驗 current_tenant()，不因 UUID 可猜而洩漏" \
   || ng "0038：跨租戶可讀取判定結論"
 
+
+# ══ 19　每個穩定代碼的專屬案例（0038 的防禦分支）══════════════════
+# 有些狀態會被 Selection 建立函式提前擋住——那是好事，但 readiness 既然
+# **公開承諾**這些代碼，就得用隔離的 owner-level fixture 驗證它自己的分支。
+# 每個案例先斷言前置狀態成立，避免再次以其他守衛的理由假綠。
+RDY_P=dd390000-0000-0000-0000-000000000001; RDY=99390000-0000-0000-0000-000000000001
+RDY2_P=dd390000-0000-0000-0000-000000000002; RDY2=99390000-0000-0000-0000-000000000002
+# 第三個單位：有幣別指派、**沒有**權益 lot set——否則「lot 的觀測不屬選定匯率版本」
+# 會在 seq 3 就攔下，讓 seq 4／5 的分支永遠測不到
+RDY3_U=b0390000-0000-0000-0000-000000000003
+RDY3_P=dd390000-0000-0000-0000-000000000003; RDY3=99390000-0000-0000-0000-000000000003
+FXRDY=f0390000-0000-0000-0000-000000000001
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id,
+        fiscal_calendar_id, label, start_date, end_date) VALUES
+  ('$RDY_P','$TEN','$ENG','$UNIT','$CAL','FX-2029-01','2029-01-01','2029-01-31'),
+  ('$RDY2_P','$TEN','$ENG','b0300000-0000-0000-0000-000000000001','$CAL','FX-2029-02',
+   '2029-02-01','2029-02-28');
+INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, legal_entity_id,
+        unit_scope, name)
+VALUES ('$RDY3_U','$TEN','$ENG','cccccccc-0000-0000-0000-000000000001','LEGAL_ENTITY','readiness 單位');
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id,
+        fiscal_calendar_id, label, start_date, end_date)
+VALUES ('$RDY3_P','$TEN','$ENG','$RDY3_U','$CAL','FX-2029-01c','2029-01-01','2029-01-31');
+INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by, approved_by, approved_at) VALUES
+  ('$TEN','$ENG','$RDY3_U','FUNCTIONAL','JPY','[2020-01-01,)','$JIA','$FXU',now()),
+  ('$TEN','$ENG','$RDY3_U','REPORTING','CNY','[2020-01-01,)','$JIA','$FXU',now());
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id) VALUES
+  ('$RDY','$TEN','$RDY_P'), ('$RDY2','$TEN','$RDY2_P'), ('$RDY3','$TEN','$RDY3_P');
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('$FXRDY','$TEN','$ENG','readiness 用','f0390000-0000-0000-0000-000000000101',1,'$FXOPS');
+INSERT INTO exchange_rate_observation (tenant_id, rate_version_id, from_currency, to_currency,
+        rate_type, rate, source, measurement_date, coverage_start, coverage_end) VALUES
+  ('$TEN','$FXRDY','JPY','CNY','CLOSING',0.05,'x','2029-01-31',NULL,NULL),
+  ('$TEN','$FXRDY','JPY','CNY','AVERAGE',0.05,'x',NULL,'2029-01-01','2029-01-31');
+SQL
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+SELECT fn_exchange_rate_transition('$FXRDY','DRAFT','SUBMITTED','$JIA','R2');
+SELECT fn_exchange_rate_transition('$FXRDY','SUBMITTED','REVIEWED','$FXU','R3');
+SELECT fn_exchange_rate_transition('$FXRDY','REVIEWED','APPROVED','$FXU','R4');
+SQL
+n=$(PSQL_C <<<"$T1 SELECT status FROM exchange_rate_version WHERE rate_version_id='$FXRDY'")
+[ "$n" = "APPROVED" ] && ok "0038 前置：readiness 專用匯率版本已批准（涵蓋 2029-01）" \
+  || ng "0038 前置：匯率版本為 ${n}"
+
+# 直接寫入 selection（建立函式會擋下這些組合——這裡要驗的是 readiness 自己的分支）
+put_in_sel() {  # $1=期間修訂 $2=單位 $3=source run $4=匯率版本 $5=政策版本
+  PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO period_fx_input_selection (tenant_id, engagement_id, period_revision_id,
+        reporting_unit_id, source_run_id, exchange_rate_version_id,
+        translation_policy_version_id, selection_series_id, version_no, selected_by)
+VALUES ('$TEN','$ENG','$1','$2','$3','$4','$5',gen_random_uuid(),1,'$JIA');
+SQL
+}
+inrdy2() { PSQL_C <<<"$T1 SELECT COALESCE((SELECT code FROM fn_period_fx_input_readiness('$1')
+           WHERE NOT ok ORDER BY seq LIMIT 1),'READY')"; }
+
+# 1 幣別指派缺失：FX 第二單位沒有任何幣別指派
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM reporting_unit_currency_assignment
+     WHERE reporting_unit_id='b0300000-0000-0000-0000-000000000001'")
+[ "$n" = "0" ] && ok "前置：FX 第二單位確實沒有幣別指派" || ng "前置：該單位有 ${n} 筆指派"
+put_in_sel "$RDY2" "b0300000-0000-0000-0000-000000000001" "$SRCRUN" "$FXRDY" "$POLCASE"
+n=$(inrdy2 "$RDY2")
+[ "$n" = "G07_CURRENCY_ASSIGNMENT_MISSING" ] && ok "0038：G07_CURRENCY_ASSIGNMENT_MISSING" \
+  || ng "0038：幣別指派缺失得 ${n}"
+
+# 2 匯率版本未批准（FXV3 為 DRAFT）
+n=$(PSQL_C <<<"$T1 SELECT status FROM exchange_rate_version WHERE rate_version_id='$FXV3'")
+[ "$n" = "DRAFT" ] && ok "前置：FXV3 確實為 DRAFT" || ng "前置：FXV3 為 ${n}"
+put_in_sel "$RDY" "$UNIT" "$SRCRUN" "$FXV3" "$POLCASE"
+n=$(inrdy2 "$RDY")
+[ "$n" = "G07_RATE_VERSION_NOT_FROZEN" ] && ok "0038：G07_RATE_VERSION_NOT_FROZEN（readiness 分支）" \
+  || ng "0038：未批准匯率版本得 ${n}"
+
+# 3 匯率不涵蓋本期（FXCASE 只有 2026-03 的率）
+sup_in_sel3() { sup_in_sel "$@"; }
+sup_in_sel() {  # 以新版本取代現行 InputSelection
+  PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO period_fx_input_selection (tenant_id, engagement_id, period_revision_id,
+        reporting_unit_id, source_run_id, exchange_rate_version_id,
+        translation_policy_version_id, selection_series_id, version_no,
+        supersedes_selection_id, selected_by)
+SELECT tenant_id, engagement_id, period_revision_id, reporting_unit_id, '$2','$3','$4',
+       selection_series_id, version_no+1, input_selection_id, selected_by
+  FROM period_fx_input_selection WHERE input_selection_id = fn_current_fx_input_selection('$1');
+SQL
+}
+sup_in_sel "$RDY" "$SRCRUN" "$FXCASE" "$POLCASE"
+n=$(inrdy2 "$RDY")
+[ "$n" = "G07_RATE_INCOMPLETE" ] && ok "0038：G07_RATE_INCOMPLETE（缺 2029-01-31 的 CLOSING）" \
+  || ng "0038：匯率不涵蓋本期得 ${n}"
+
+# 4／5 改在沒有 lot set 的單位上進行（政策必須適用該單位）
+POLRDY=f0320000-0000-0000-0000-000000000031
+POLRDY2=f0320000-0000-0000-0000-000000000032
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO translation_policy_version (policy_version_id, tenant_id, engagement_id,
+        reporting_unit_id, label, cta_account_id, cta_coa_id, created_by) VALUES
+  ('$POLRDY','$TEN','$ENG','$RDY3_U','readiness 政策','$(acc 03999)','$CASE_COA','$JIA'),
+  ('$POLRDY2','$TEN','$ENG','$RDY3_U','未批准政策','$(acc 03999)','$CASE_COA','$JIA');
+INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method)
+VALUES ('$TEN','$POLRDY','ASSET','CLOSING');
+SELECT fn_translation_policy_approve('$POLRDY','$FXU');
+SQL
+
+# 4 政策未批准（POLRDY2）
+n=$(PSQL_C <<<"$T1 SELECT approved_at IS NULL FROM translation_policy_version
+     WHERE policy_version_id='$POLRDY2'")
+[ "$n" = "t" ] && ok "前置：readiness 用的第二個政策確實未批准" || ng "前置：該政策已批准"
+put_in_sel "$RDY3" "$RDY3_U" "$SRCRUN" "$FXRDY" "$POLRDY2"
+n=$(inrdy2 "$RDY3")
+[ "$n" = "G07_POLICY_NOT_APPROVED" ] && ok "0038：G07_POLICY_NOT_APPROVED" \
+  || ng "0038：政策未批准得 ${n}"
+
+# 5 來源 run 未就緒（RUN_SNAP2 為 RUNNING 且不屬本期）
+n=$(PSQL_C <<<"$T1 SELECT status FROM calculation_run WHERE calculation_run_id='$RUN_SNAP2'")
+[ "$n" = "RUNNING" ] && ok "前置：RUN_SNAP2 確實為 RUNNING" || ng "前置：RUN_SNAP2 為 ${n}"
+sup_in_sel3 "$RDY3" "$RUN_SNAP2" "$FXRDY" "$POLRDY"
+n=$(inrdy2 "$RDY3")
+[ "$n" = "G07_SOURCE_RUN_NOT_READY" ] && ok "0038：G07_SOURCE_RUN_NOT_READY" \
+  || ng "0038：來源 run 未就緒得 ${n}"
+
+# ── 結果就緒的五個代碼 ──
+put_run_sel() {  # $1=期間修訂 $2=run $3=調節
+  PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO period_fx_run_selection (tenant_id, engagement_id, period_revision_id,
+        reporting_unit_id, selected_run_id, selected_reconciliation_id,
+        selection_series_id, version_no, selected_by)
+VALUES ('$TEN','$ENG','$1','$UNIT','$2','$3',gen_random_uuid(),1,'$FXU');
+SQL
+}
+sup_run_sel() {
+  PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO period_fx_run_selection (tenant_id, engagement_id, period_revision_id,
+        reporting_unit_id, selected_run_id, selected_reconciliation_id,
+        selection_series_id, version_no, supersedes_selection_id, selected_by)
+SELECT tenant_id, engagement_id, period_revision_id, reporting_unit_id, '$2','$3',
+       selection_series_id, version_no+1, run_selection_id, selected_by
+  FROM period_fx_run_selection WHERE run_selection_id = fn_current_fx_run_selection('$1');
+SQL
+}
+rrdy() { PSQL_C <<<"$T1 SELECT fn_period_fx_result_ready('$1')"; }
+
+# 6 Manifest 完整性（FXRUN 的凍結集合已於 §16 被刪一條）
+put_run_sel "$RDY" "$FXRUN" "$RECON"
+n=$(rrdy "$RDY")
+[ "$n" = "POSTFX_MANIFEST_INTEGRITY_FAILED" ] && ok "0038：POSTFX_MANIFEST_INTEGRITY_FAILED" \
+  || ng "0038：凍結集合已損得 ${n}"
+
+# 7 輸入未凍結：刪掉 CURRENCY_ASSIGNMENT 條目並**重算集合雜湊**，
+#   讓完整性通過、只有「缺條目」這一項失敗
+MF2X=$(PSQL_C <<<"$T1 SELECT manifest_id FROM calculation_run WHERE calculation_run_id='$FXRUN2'")
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+ALTER TABLE calculation_input_manifest DISABLE TRIGGER USER;
+DELETE FROM calculation_manifest_entry WHERE manifest_id='$MF2X' AND object_type='CURRENCY_ASSIGNMENT';
+UPDATE calculation_input_manifest SET frozen_set_content_hash =
+  (SELECT fn_fx_sha(string_agg(content_hash,'|'
+     ORDER BY object_type, COALESCE(object_id::text,''), content_hash))
+     FROM calculation_manifest_entry WHERE manifest_id='$MF2X')
+ WHERE manifest_id='$MF2X';
+ALTER TABLE calculation_input_manifest ENABLE TRIGGER USER;
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM calculation_manifest_entry
+     WHERE manifest_id='$MF2X' AND object_type='CURRENCY_ASSIGNMENT'")
+[ "$n" = "0" ] && ok "前置：已移除幣別指派條目並重算集合雜湊（完整性仍通過）" \
+  || ng "前置：仍有 ${n} 筆幣別指派條目"
+sup_run_sel "$RDY" "$FXRUN2" "$RECON"
+n=$(rrdy "$RDY")
+[ "$n" = "POSTFX_INPUT_NOT_FROZEN" ] && ok "0038：POSTFX_INPUT_NOT_FROZEN" \
+  || ng "0038：缺凍結條目得 ${n}"
+
+# 8 run 未完成／為 replay（RPF 是 FAILED 的 replay）
+n=$(PSQL_C <<<"$T1 SELECT status||'/'||(replay_of_run_id IS NOT NULL)::text
+     FROM calculation_run WHERE calculation_run_id='$RP2'")
+[ "$n" = "COMPLETED/true" ] && ok "前置：RP2 是**已完成的 replay**（凍結集合未受污染）" \
+  || ng "前置：RP2 為 ${n}"
+sup_run_sel "$RDY" "$RP2" "$RECON"
+n=$(rrdy "$RDY")
+[ "$n" = "POSTFX_RUN_NOT_COMPLETED" ] && ok "0038：POSTFX_RUN_NOT_COMPLETED（replay 不算現行結論）" \
+  || ng "0038：replay run 得 ${n}"
+
+# 9 調節不屬選定的 run
+sup_run_sel "$RDY" "$FXRUN5" "$RECON2"
+n=$(rrdy "$RDY")
+[ "$n" = "POSTFX_RECONCILIATION_NOT_FINALIZED" ] && ok "0038：POSTFX_RECONCILIATION_NOT_FINALIZED" \
+  || ng "0038：調節不屬該 run 得 ${n}"
+
+# 10 尾差超限（schema-level fixture：本樣本不由折算流程產生）
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+INSERT INTO translation_difference (tenant_id, reconciliation_id, check_id, comparison_context,
+        actual_amount, comparison_amount, actual_difference, reason_class,
+        rounding_basis, unrounded_amount, rounded_amount, currency_minor_unit, rounding_mode,
+        expected_rounding_residual, detail, line_no)
+VALUES ('$TEN','$RECON2','C2','EXTERNAL_OUTPUT',100.30,100.00,0.30,'ROUNDING_DIFFERENCE',
+        100.00,100.00,100.30,2,'ROUND_HALF_UP',0.30,
+        'schema-level fixture（不由折算流程產生）：單筆 0.30 > 限 0.05',70);
+SQL
+n=$(PSQL_C <<<"$T1 SELECT resolution_status FROM translation_difference
+     WHERE reconciliation_id='$RECON2' AND line_no=70")
+[ "$n" = "OPEN" ] && ok "前置：超限的尾差維持 OPEN（未被自動結案）" || ng "前置：狀態為 ${n}"
+sup_run_sel "$RDY" "$FXRUN3" "$RECON2"
+n=$(rrdy "$RDY")
+[ "$n" = "POSTFX_TOLERANCE_VIOLATION" ] && ok "0038：POSTFX_TOLERANCE_VIOLATION（單筆超限）" \
+  || ng "0038：尾差超限得 ${n}"
+
 [ "${STANDALONE:-0}" = "1" ] && summary

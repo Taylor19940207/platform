@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、三十五份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、三十八份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -45,9 +45,10 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 
 里程碑 1 與里程碑 2 的 `SLICE-M2-01`／`02A`／`03`／`02B`／`02C`／`M2-04`／`M2-05`／`M2-06`
 均已完成並關閉；里程碑 3 的 **`SLICE-M3-01 B-02 期間工作台`（2026-08-11）與
-`SLICE-M3-02 折算與 CTA`（2026-08-12，CLOSED／PASS）亦已正式關閉**。
-現有 35 份 migration；完整實跑結果為 **1,050**（單元 66、DB 整合 557、端到端 427），
-最新一輪全綠（HEAD `f9fe2e5`，已 push）。
+`SLICE-M3-02 折算與 CTA`與 `SLICE-M3-03 折算調節核對與期間級 G-07`
+（皆 2026-08-12，CLOSED／PASS）亦已正式關閉**。
+現有 38 份 migration；完整實跑結果為 **1,108**（單元 66、DB 整合 615、端到端 427），
+最新一輪全綠（已 push）。
 
 ## 🏁 里程碑 2 已完成（2026-08-10 離開複核通過）
 
@@ -106,13 +107,13 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,050 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,108 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis／**fx** 各自單跑（自行重建 DB 並補齊前置） | 9～30 秒 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 48 秒 |
-| `pnpm test`（＝`test:full`） | 完整 1,050 條 | **約 6～7 分鐘** |
+| `pnpm test`（＝`test:full`） | 完整 1,108 條 | **約 6～7 分鐘** |
 | `pnpm test:acceptance:<suite>` | 十支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
@@ -152,8 +153,10 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   PASS／ACCEPTED_DEVIATION／DEFERRED 逐條判定）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-11_SLICE-M3-01.md`（B-02 期間工作台、
   0028 遷移規格函式、0029 角色作用域修補）
-- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-02.md`（**最新接續入口**：
-  折算與 CTA、0030～0035、Manifest 重演與完整性、MVP 3 剩餘項目）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-02.md`（折算與 CTA、
+  0030～0035、Manifest 重演與完整性）
+- `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-03.md`（**最新接續入口**：
+  折算調節核對、兩支 readiness、0036～0038、MVP 3 剩餘項目）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
@@ -265,8 +268,34 @@ FAILED replay 的診斷產出保存政策留待證據包切片（BACKLOG 已記�
 **3 與 4 完成後才解鎖 `ADJ_APPROVED → CALCULATING`**（0028 的規格函式維持
 `NOT_IMPLEMENTED`）。
 
-下一刀：**折算調節核對＋期間級 G-07**——解鎖期間主線的前置；畫面緊接其後，
-現金流必須在 MVP 3 關閉前完成。
+## `SLICE-M3-03 折算調節核對與期間級 G-07`已完成並關閉（2026-08-12，CLOSED／PASS）
+
+切片文件含 **20/20 驗收對照表**。交付 migration **0036～0038**。
+
+**一個在契約走查中發現的循環**：基線的 G-07 掛在 `ADJ_APPROVED → CALCULATING`，
+只能回答「**開始計算**所需的輸入是否齊備」。若把「run COMPLETED → 調節 FINALIZED
+→ R4 選定」也塞進 G-07，就變成「還沒進 CALCULATING，卻要先完成計算與調節」。
+因此拆成兩支唯讀函式：
+- `fn_period_fx_input_readiness`＝現行 G-07（六項輸入條件，`G07_*`）
+- `fn_period_fx_result_readiness`＝折算結果與調節（七項，`POSTFX_*`，
+  整體回 `POST_FX_RECONCILIATION_READY`）。**暫不自行命名 G-13**，
+  新增正式 Guard ID 須走 CR（BACKLOG 已記）。
+
+**其他關鍵決定**：
+- **內部核對不產生尾差**——引擎與 C2 同法同率，C1～C4 只會是零差異或硬差異；
+  `ROUNDING_DIFFERENCE` 保留給日後的對外輸出／`OutputProfile` 核對。
+  Case-001 調節「所有類別零筆」是**正確結果**，INV-24 的樣本明標為 schema-level。
+- **硬差異只要存在就失敗，狀態無關**——G-07 是 `output_capability = NONE` 的硬守衛；
+  只擋 `OPEN` 的話，把 `MISSING_RATE` 標成 `ACCEPTED_EXCEPTION` 就能讓期間變 ready。
+- **權威輸入與結論都要顯式選定**：`PeriodFxInputSelection`（R2）與
+  `PeriodFxRunSelection`（R4），現行版本由**取代鏈**判斷而非 `created_at`。
+- tolerance 是**幣別對**、凍結在 reconciliation 上（FX Manifest 已封存）。
+
+**本刀不解鎖任何遷移**：`ADJ_APPROVED → CALCULATING` 還缺 G-03；
+`CALCULATING → RECONCILING` 還缺其餘守衛。0028 的規格函式未改動。
+
+下一刀：**B-06 折算／核對畫面與 replay 入口**（DB 能力已具備），
+或先做 **REQ-CFS-001 現金流**——後者未完成前 MVP 3 不得關閉。
 
 **不要再做結構重構**——拆層已於 2e19c9b 結束，server.ts 54 行已達目標，
 不得為了行數繼續拆。

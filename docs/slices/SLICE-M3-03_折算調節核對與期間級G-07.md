@@ -1,6 +1,16 @@
 # SLICE-M3-03　折算調節核對與期間級 G-07
 
-> 狀態：**事前契約 第四版（走查三輪修訂後）**，待確認。**尚未批准進 migration。**
+> 狀態：**CLOSED ／ PASS**（2026-08-12）。契約經四輪走查定稿後實作，
+> 交付 migration **0036～0038**：
+>
+> | migration | 內容 |
+> |---|---|
+> | 0036 | 模型與守衛：`RoundingToleranceVersion`（幣別對）、`TranslationReconciliation`、`TranslationDifference`、`PeriodFxInputSelection`／`PeriodFxRunSelection` |
+> | 0037 | 計算：C2 的獨立重算、`fn_translation_reconcile`（唯一入口、單一交易）、INV-24 判定、兩個選定函式（先鎖 `period_revision`） |
+> | 0038 | 判定：`fn_period_fx_input_readiness`（現行 G-07）與 `fn_period_fx_result_readiness`；引擎的 InputSelection 前置檢查 |
+>
+> 測試基線：**單元 66 ＋ DB 整合 615 ＋ 端到端 427 ＝ 1,108**，零失敗
+> （其中 fx 領域 250 條）。
 > 風險：**第一級**（尾差自動結案、期間級守衛、不可逆語意）。
 >
 > 對應基線：設計書 v1.1 §25.8（`RECONCILING`）、§25.13 守衛表（G-07）、
@@ -471,3 +481,57 @@ migration（`RoundingToleranceVersion`（幣別對 scope）＋ R4 批准函式�
 → DB 負面測試（2～15）→ Case-001 的無差異正控制（**所有類別零筆**）
 → schema-level 尾差樣本驗 INV-24 → 期間套件回歸（斷言不改）→ 完整一輪。
 **畫面不在本刀。**
+
+## 十一、驗收對照（20/20）
+
+| # | 驗收條目 | 對應測試 |
+|---|---|---|
+| 1 | 四項比較；無差異仍留下 `FINALIZED` 調節 | `0037：調節建立成功（單一交易、直接 FINALIZED）`／`Case-001 調節：所有類別零筆差異` |
+| 2 | C2 是獨立重算 | `C2：獨立重算抓出被竄改的產出（UNEXPLAINED 100.00）`（反證：C2 改讀 `translation_result` → 1 紅） |
+| 3～5 | INV-24 三條門檻（schema-level fixture） | `0038：POSTFX_TOLERANCE_VIOLATION（單筆超限）`／`前置：超限的尾差維持 OPEN` |
+| 6 | 尾差的舉證與適用範圍 | `0036：尾差缺算術推導 → 拒絕`／`0036：尾差的方向必須與捨入殘差一致`／`0036：內部重算的差異不得標為 ROUNDING_DIFFERENCE` |
+| 7 | 硬錯誤不得被人工放行 | `0038：標成 ACCEPTED_EXCEPTION **仍**不通過（G-07 是硬守衛）` |
+| 8 | `UNEXPLAINED` 同樣阻擋 | `0038：硬差異存在 → 結果就緒失敗`（`UNEXPLAINED` 亦屬非尾差類） |
+| 8A | 兩支函式各司其職 | `0038：輸入就緒不因「尚無結果」而失敗（不形成循環）` |
+| 8B | 輸入選定 | `0038 輸入就緒：未選定輸入 → G07_INPUT_NOT_SELECTED`／`選定：來源 run 非 COMPLETED`／`引擎前置：傳入的輸入與現行選定不一致` |
+| 9 | 結果選定 | `0038 選定結果：非 R4／replay run／調節不屬該 run`／`0036：同一舊版不得被兩個新版指向` |
+| 10 | tolerance 凍結在 reconciliation 上 | `0037：容許值快照凍結在調節上（不在 FX Manifest）` |
+| 10A | tolerance 是幣別對 | `0037：容許值的幣別對與本 run 的報告幣不符 → 拒絕` |
+| 10B | tolerance 版本明確指定 | 建立函式簽章即要求 `tolerance_version_id`；`0037：未批准的容許值版本不得使用` |
+| 11 | 未批准的 tolerance 不得使用 | 同上 |
+| 11A | 建立入口的交易性 | `0036：app_runtime 不得自填容許值的批准欄`／調節與差異僅 SELECT 授權 |
+| 11B | 版本可解釋 | `0037：保存 engine／canonicalization 版本與 SHA-256 輸入雜湊` |
+| 12 | Manifest 被竄改 → 不通過 | `0038：POSTFX_MANIFEST_INTEGRITY_FAILED` |
+| 13 | 不可變性 | `0036：調節不可 UPDATE／DELETE`／`0038：已是終態的差異不得再改`／`0036：差異不得經一般 UPDATE 修改`／`0037：同一 run 至多一份調節` |
+| 14 | 跨租戶與跨案件 | `0038：唯讀判定函式驗 current_tenant()`／各建立函式的 `CROSS_TENANT_DENIED` |
+| 15 | 兩支 readiness 唯讀 | 同上；期間套件（DB 31＋端到端 37）斷言未改 |
+| 16 | 完整測試一輪全綠 | 單元 66＋DB 615＋端到端 427，零失敗 |
+
+**每個穩定代碼的專屬案例**（§19，全部先斷言前置狀態）：
+`G07_INPUT_NOT_SELECTED`／`G07_CURRENCY_ASSIGNMENT_MISSING`／
+`G07_RATE_VERSION_NOT_FROZEN`／`G07_RATE_INCOMPLETE`／`G07_POLICY_NOT_APPROVED`／
+`G07_SOURCE_RUN_NOT_READY`／`POSTFX_RUN_NOT_SELECTED`／
+`POSTFX_MANIFEST_INTEGRITY_FAILED`／`POSTFX_INPUT_NOT_FROZEN`／
+`POSTFX_RUN_NOT_COMPLETED`／`POSTFX_RECONCILIATION_NOT_FINALIZED`／
+`POSTFX_HARD_DIFFERENCE_PRESENT`／`POSTFX_TOLERANCE_VIOLATION`
+＋ `POST_FX_RECONCILIATION_READY` 與輸入就緒的 `READY` 正控制。
+
+隔離手法：部分狀態會被 Selection 建立函式提前擋住（那是好事），因此 readiness
+自己的防禦分支以 **owner-level 直接寫入 selection** 驗證。過程中需要
+兩個額外的報告單位——一個沒有幣別指派、一個沒有權益 lot set——否則
+`G07_CURRENCY_ASSIGNMENT_MISSING` 與 `G07_POLICY_NOT_APPROVED`／
+`G07_SOURCE_RUN_NOT_READY` 會被更前面的條件遮住而測不到。
+
+## 十二、仍未完成（MVP 3）
+
+| # | 項目 |
+|---|---|
+| 1 | **REQ-CFS-001 現金流支持資料**——未完成前 **MVP 3 不得關閉** |
+| 2 | **B-06 折算／核對畫面與 replay 入口**（DB 能力已具備） |
+| 3 | **G-03：B 基礎（遞延稅）判定**；`AMENDED` 取代鏈亦未完成 |
+| 4 | **對外輸出／`OutputProfile` 核對**——`ROUNDING_DIFFERENCE` 的真正使用場景 |
+| 5 | 折算結果就緒的**正式 Guard ID**（須走 CR，BACKLOG 已記） |
+
+**本刀不解鎖任何遷移**：`ADJ_APPROVED → CALCULATING` 需 G-07（本刀交付）**與 G-03**；
+`CALCULATING → RECONCILING` 需結果就緒（本刀交付判定能力）與其餘守衛。
+0028 的規格函式未改動。
