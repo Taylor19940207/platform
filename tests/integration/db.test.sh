@@ -678,6 +678,7 @@ n=$(APP_C <<<"$T2 SELECT count(*) FROM background_job")
 . "$DOMAIN/period.test.sh"
 . "$DOMAIN/basis.test.sh"
 . "$DOMAIN/fx.test.sh"
+. "$DOMAIN/cashflow.test.sh"
 
 echo ""
 echo "通過 $pass ／ 失敗 $fail"
