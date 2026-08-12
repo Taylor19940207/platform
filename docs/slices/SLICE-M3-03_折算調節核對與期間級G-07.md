@@ -1,6 +1,6 @@
 # SLICE-M3-03　折算調節核對與期間級 G-07
 
-> 狀態：**事前契約 第三版（走查兩輪修訂後）**，待確認。**尚未批准進 migration。**
+> 狀態：**事前契約 第四版（走查三輪修訂後）**，待確認。**尚未批准進 migration。**
 > 風險：**第一級**（尾差自動結案、期間級守衛、不可逆語意）。
 >
 > 對應基線：設計書 v1.1 §25.8（`RECONCILING`）、§25.13 守衛表（G-07）、
@@ -68,6 +68,9 @@
 > 這條是本刀最容易被繞過的地方：把缺率當尾差吃掉，報表看起來乾淨，
 > 而真正的問題是「有一段金額根本沒有匯率可折算」。
 
+**且內部核對（C1～C4）根本不會產生 `ROUNDING_DIFFERENCE`**——引擎與 C2 同法同率，
+差異只會是零或硬差異。該分類保留給日後的對外輸出核對，見 §四之一。
+
 `resolution_status` 沿用 0023 已凍結的詞彙（共用詞彙，不共用實體）：
 `OPEN／EXPLAINED／RESOLVED／RESOLVED_BY_POLICY／ACCEPTED_EXCEPTION`。
 狀態在欄位裡，不在實體名稱裡（§26.5 L1165）。
@@ -114,42 +117,49 @@ D-26-05 的完整 scope 鏈是
   既有 run 凍結的是當時的 scope 形狀，追溯改寫會讓舊 run 的結論失去意義。
   屆時新版本帶較細的 scope，舊版本原樣保留。
 
-## 四之一、`ROUNDING_DIFFERENCE` 必須有算術推導，不得由「差額很小」推定
+## 四之一、內部核對不產生尾差——`ROUNDING_DIFFERENCE` 的適用範圍
 
-基線的措辭是「原因經**系統證實**為純算術尾差」（D-26-05）。金額門檻只回答
-「小不小」，不回答「是不是尾差」。在本系統內，引擎與 C2 使用**同一份凍結方法與
-同樣的逐行 `ROUND_HALF_UP`**，因此兩者不一致時的正常解釋是：結果被修改、
-引擎或調節器有缺陷、或來源與方法不一致——**都不是尾差**。
+第三版把 `actual_difference = actual_amount − comparison_amount` 與
+`rounded_amount − unrounded_amount` 要求相等，但那兩者互相矛盾：
 
-因此每一筆 `ROUNDING_DIFFERENCE` 必須保存可驗證的推導：
+- 引擎與 C2 使用**同一份凍結方法與同樣的逐行 `ROUND_HALF_UP`**，
+  因此正常情況下 `actual_amount − comparison_amount = 0`；
+- 而捨入殘差 `rounded_amount − unrounded_amount` **通常不是零**。
 
-    rounding_basis               被捨入的那個乘積（軋差後餘額 × 匯率）
-    unrounded_amount             未捨入值
-    rounded_amount               已捨入值
-    currency_minor_unit          凍結的最小單位
-    rounding_mode                'ROUND_HALF_UP'
-    expected_rounding_residual   rounded_amount − unrounded_amount
+兩者不可能同時成立。用直接建構的樣本雖然能讓 DB 測試通過，卻不符合契約對
+`comparison_amount` 的定義——那是把 fixture 當成語意。
 
-**方向與比較基準寫死**（只說「兩者相等」不夠明確）：
+**決定：**
 
-    actual_difference = actual_amount − comparison_amount
-    且必須等於
-    expected_rounding_residual
-      = round(unrounded_amount, minor_unit, HALF_UP) − unrounded_amount
+| 事實 | 歸屬 |
+|---|---|
+| C1～C4 的內部核對結果 | **只會是零差異或硬差異**（`SOURCE_MISMATCH`／`CTA_MISMATCH`／`METHOD_UNRESOLVED`／`MISSING_RATE`／`UNEXPLAINED`），**不產生 `ROUNDING_DIFFERENCE`** |
+| 捨入殘差（`rounded − unrounded`） | **計算證據**，隨差異列或調節保存，供日後對外核對引用；**不是** C2 的差異 |
+| `ROUNDING_DIFFERENCE` | **保留給日後的對外輸出／`OutputProfile` 核對**——屆時 `comparison_amount` 才可能是未捨入值或外部系統的值 |
 
-`actual_amount` 是產出的值（`TranslationResult`），`comparison_amount` 是 C2
-重算的期望值；兩者相減的**正負號**必須與 residual 一致，不只是絕對值相等。
+因此：
 
-**只有上式成立才允許 `reason_class = 'ROUNDING_DIFFERENCE'`**
-（DB CHECK ＋ 建立函式雙重把關）；
-其餘一律 `UNEXPLAINED` 或對應的硬錯誤類別。
+- **本刀只交付 INV-24 的資料庫約束與判定能力，不宣稱目前的生產流程會產生尾差。**
+  Case-001 的正控制是「零筆差異、G-07 與結果就緒皆通過」，這是**正確結果**，
+  不是「還沒測到」。
+- INV-24 的三條門檻測試以**直接建構**的差異列進行，且測試與 fixture 必須
+  **明確標示為 schema-level fixture**（註記「本樣本不由折算流程產生，
+  用於驗證 DB 約束」）。不得讓讀者誤以為內部折算會產出尾差。
+- 尾差的推導欄位仍然保存並強制（見下），因為那是日後對外核對時的舉證基礎：
 
-> **Case-001 產生零筆尾差是完全合法的結果。** 目前的內部折算流程不會產生
-> 這類 residual（引擎與 C2 同法同率）。Tolerance 能力先建好，等 `OutputProfile`
-> 或與外部系統核對真的產生可證明的尾差時再使用。
-> **不得為了測 INV-24 而人工把任意小差額命名成尾差**——那正是本節要防的事。
-> INV-24 的驗收改以**直接建構**的尾差樣本（帶完整推導欄位）進行，
-> 不經折算引擎產生。
+      rounding_basis               被捨入的乘積（軋差後餘額 × 匯率）
+      unrounded_amount             未捨入值
+      rounded_amount               已捨入值
+      currency_minor_unit          凍結的最小單位
+      rounding_mode                'ROUND_HALF_UP'
+      expected_rounding_residual   round(unrounded_amount, minor_unit, HALF_UP) − unrounded_amount
+
+  `reason_class = 'ROUNDING_DIFFERENCE'` 時，
+  **`actual_difference` 必須等於 `expected_rounding_residual`（含正負號）**，
+  且 `actual_difference = actual_amount − comparison_amount` 仍是欄位的定義——
+  只是在對外核對的情境下，`comparison_amount` 是**未捨入值或外部值**，
+  兩式因此不再互斥。內部核對情境下 `comparison_amount` 是 C2 期望值，
+  該情境**不允許**此分類（CHECK 以差異來源標記強制）。
 
 ## 四之二、INV-24：兩層同時滿足，且不得淨額互抵
 
@@ -215,21 +225,52 @@ D-26-05 的完整 scope 鏈是
 **`POST_FX_RECONCILIATION_READY`**（及其下列的個別失敗代碼），並記入
 `docs/BACKLOG.md` 待日後回寫基線守衛表。
 
-### 六之一、`fn_period_fx_input_readiness`：現行 G-07
+### 六之一、`PeriodFxInputSelection`：G-07 的權威輸入來源
+
+`fn_period_fx_input_readiness(period_revision_id)` 只拿得到期間 ID，卻要判斷
+**哪一個** source run、**哪一版**匯率、**哪一版**政策。現行模型裡沒有期間級的
+事前選定物件——那三個 ID 是 `fn_fx_translation_run(...)` 的呼叫參數。
+若判定函式自行找「最新 APPROVED」，就重犯了**用查詢結果代替人的決策**的錯誤。
+
+**新增最小的事前選定物件：**
+
+    PeriodFxInputSelection
+    ├─ period_revision_id / reporting_unit_id
+    ├─ source_run_id                    要折算的 NO_FX run
+    ├─ exchange_rate_version_id
+    ├─ translation_policy_version_id
+    ├─ selection_series_id / version_no / supersedes_selection_id
+    └─ selected_by / selected_at        **案件層 R2**（system-only 函式）
+
+- 由 **R2** 選定（B-06 的計算執行屬 R2，與 `fn_fx_translation_run` 的發起角色一致）；
+  結果選定（`PeriodFxRunSelection`）才是 **R4**——選輸入是作業，選結論是批准。
+- 版本鏈與不可改寫的規則與 `PeriodFxRunSelection` 相同（現行版本由取代鏈判斷、
+  不得分叉）。
+- **G-07 讀現行 InputSelection**；`fn_fx_translation_run` 建立 FX run 時
+  **必須使用同一組 ID**，否則「G-07 通過的輸入」與「實際拿去算的輸入」可能不是
+  同一組。以 `CREATE OR REPLACE` 在既有函式前段加一項前置檢查
+  （三個 ID 必須等於現行 InputSelection，否則 `FX_INPUT_NOT_SELECTED`）——
+  **簽章與計算行為不變**，M3-02 的既有斷言一字不改；受影響的只是測試 fixture
+  需先建立 InputSelection（本刀明列為預期的 fixture 變更，不是行為變更）。
+- 最後由 Manifest 凍結實際使用的三者（M3-02 已有），形成
+  **選定 → 判定 → 計算 → 凍結**的同一條鏈。
+
+### 六之二、`fn_period_fx_input_readiness`：現行 G-07
 
 | # | 條件 | 代碼 |
 |---|---|---|
+| 0 | 存在現行 `PeriodFxInputSelection` | `G07_INPUT_NOT_SELECTED` |
 | 1 | 該報告單位有已批准且涵蓋期末的 `FUNCTIONAL` 與 `REPORTING` 指派 | `G07_CURRENCY_ASSIGNMENT_MISSING` |
-| 2 | 指定的匯率版本存在、屬本案件且為 `APPROVED` | `G07_RATE_VERSION_NOT_FROZEN` |
+| 2 | 選定的匯率版本存在、屬本案件且為 `APPROVED` | `G07_RATE_VERSION_NOT_FROZEN` |
 | 3 | 所需 rate／date／coverage 完整（CLOSING 對期末、AVERAGE 涵蓋全期、每筆權益事件都有 HISTORICAL） | `G07_RATE_INCOMPLETE` |
-| 4 | 折算政策版本已批准，且其 CTA 科目屬本案件集團科目表 | `G07_POLICY_NOT_APPROVED` |
-| 5 | 來源 run 存在且為 `COMPLETED`（要折算的 TB 已產生） | `G07_SOURCE_RUN_NOT_READY` |
+| 4 | 選定的折算政策版本已批准，且其 CTA 科目屬本案件集團科目表 | `G07_POLICY_NOT_APPROVED` |
+| 5 | 選定的來源 run 存在且為 `COMPLETED`（要折算的 TB 已產生） | `G07_SOURCE_RUN_NOT_READY` |
 
-**這五項全部是「開始之前」就能判定的事**，不需要任何 FX run 已存在。
+**這六項全部是「開始之前」就能判定的事**，不需要任何 FX run 已存在。
 
-### 六之二、`fn_period_fx_result_readiness`：折算結果與調節
+### 六之三、`fn_period_fx_result_readiness`：折算結果與調節
 
-判定對象由**顯式選定**決定，不用 `created_at` 猜（見六之三）。
+判定對象由**顯式選定**決定，不用 `created_at` 猜（見六之四）。
 
 | # | 條件 | 代碼 |
 |---|---|---|
@@ -251,7 +292,7 @@ D-26-05 的完整 scope 鏈是
 - `ACCEPTED_EXCEPTION` 在本刀**只作為調查紀錄**，不改變判定。
 - **修復路徑是重新建立正確的 FX run、重新調節並重新選定**，不是把差異標掉。
 
-### 六之三、`PeriodFxRunSelection`：顯式選定，版本由取代鏈判斷
+### 六之四、`PeriodFxRunSelection`：顯式選定，版本由取代鏈判斷
 
 「最新的 `COMPLETED` run 自動取代舊 run」**不安全**：測試或誤操作產生的 run 會
 自動成為權威結論、同時完成的 run 沒有穩定排序、而且答不出「誰決定母公司該採哪一版」。
@@ -271,7 +312,7 @@ D-26-05 的完整 scope 鏈是
 - **建立時 DB 重新驗證完整父鏈**：run、reconciliation、期間修訂、報告單位、
   租戶、案件六者必須一致（比照 0032 的父鏈守衛，SECURITY DEFINER 不依賴 RLS）。
 
-### 六之四、範圍：一個 PeriodRevision 對一個報告單位
+### 六之五、範圍：一個 PeriodRevision 對一個報告單位
 
 現行模型中 `ReportingPeriod` 只屬**一個** `ReportingUnit`，因此「該 revision 的
 所有報告單位」目前不成立。本刀的判定範圍寫死為：
@@ -280,7 +321,7 @@ D-26-05 的完整 scope 鏈是
 
 未來 group period composition 落地後再擴成多單位聚合；**現在不預留假的多單位邏輯**。
 
-兩支函式皆**唯讀**，不改任何狀態；`app_runtime` 只獲 EXECUTE。
+兩支 readiness 函式皆**唯讀**，不改任何狀態；`app_runtime` 只獲 EXECUTE。
 
 ## 七、期間狀態機邊界（不要誤讀）
 
@@ -307,6 +348,7 @@ D-26-05 的完整 scope 鏈是
 - REQ-CFS-001 現金流支持資料。
 - 解鎖 `ADJ_APPROVED → CALCULATING`、`CALCULATING → RECONCILING` 或任何其後遷移。
 - 為折算結果就緒新增正式 Guard ID（須走 CR，見 BACKLOG）。
+- **對外輸出／`OutputProfile` 核對**——`ROUNDING_DIFFERENCE` 的真正使用場景在那一刀。
 - `OutputProfile` 與完整的 D-26-05 scope 鏈。
 - 基礎間調節（`basis_reconciliation`，0023 已有）——本刀是**折算**調節，
   另立實體：前者的軸是 `from_basis → to_basis`，後者的軸是功能幣 → 報告幣，
@@ -318,21 +360,27 @@ D-26-05 的完整 scope 鏈是
 ## 九、驗收
 
 1. **四項比較**各自能產生差異，且無差異時仍留下 `FINALIZED` 的調節物件。
-   Case-001 的正控制：`ROUNDING_DIFFERENCE` **零筆**、其餘類別零筆、G-07 通過。
+   Case-001 的正控制：**所有類別零筆**、輸入就緒與結果就緒皆通過。
+   （零筆是**正確結果**，不是「還沒測到」——內部核對不產生尾差，見 §四之一。）
 2. **C2 是獨立重算**：竄改 `TranslationResult` 的某一列金額（owner 級）→
    產生 `UNEXPLAINED` → G-07 不通過。
    **反證：把 C2 改成讀 `TranslationResult` 當期望值 → 本條轉紅。**
-3. **單筆過門檻** → 該筆維持 `OPEN`，G-07 不通過。
-4. **單筆皆小但累積過門檻** → **全部**尾差維持 `OPEN`，G-07 不通過。
+3～5 為 **INV-24 的 schema-level 驗收**：樣本以**直接建構**方式產生（帶完整推導
+   欄位），**不由折算流程產出**；測試與 fixture 必須明標
+   「本樣本不由折算流程產生，用於驗證 DB 約束」。本刀**不宣稱**目前的生產流程
+   會產生尾差。
+3. **單筆過門檻** → 該筆維持 `OPEN`，結果就緒不通過。
+4. **單筆皆小但累積過門檻** → **全部**尾差維持 `OPEN`。
 5. **正負尾差淨額為零但絕對值累積超標** → 仍維持 `OPEN`。
    **反證：把累積判定改成淨額 → 本條轉紅。**
-   （3～5 的尾差樣本以**直接建構**方式產生，帶完整推導欄位，不經折算引擎——
-   見 §四之一。）
-6. **尾差必須有算術推導與方向**：`actual_difference` 必須等於
-   `actual_amount − comparison_amount`，且等於
-   `round(unrounded_amount, minor_unit, HALF_UP) − unrounded_amount`（含正負號）；
-   只有絕對值相等而方向相反者**不得**標為 `ROUNDING_DIFFERENCE`；
-   缺推導欄位者一律拒絕。
+6. **尾差的舉證與適用範圍**：
+   (a) `reason_class = 'ROUNDING_DIFFERENCE'` 時，`actual_difference` 必須等於
+       `expected_rounding_residual`（含正負號）；只有絕對值相等而方向相反者拒絕；
+       缺推導欄位者一律拒絕。
+   (b) **內部核對來源的差異列不得標為 `ROUNDING_DIFFERENCE`**
+       （以差異來源標記強制）。
+   **反證：允許內部核對產生 `ROUNDING_DIFFERENCE` → (b) 轉紅**；
+   **拿掉推導比對、只留金額門檻 → (a) 轉紅。**
    **反證：拿掉推導比對、只留金額門檻 → 本條轉紅。**
 7. **硬錯誤不得被人工放行**：`MISSING_RATE`／`METHOD_UNRESOLVED`／
    `SOURCE_MISMATCH`／`CTA_MISMATCH` 標成 `EXPLAINED` 或 `ACCEPTED_EXCEPTION`
@@ -346,7 +394,18 @@ D-26-05 的完整 scope 鏈是
    (b) 匯率版本未批准時，**輸入就緒**回 `G07_RATE_VERSION_NOT_FROZEN`。
    **反證：把「run COMPLETED／調節 FINALIZED」併回輸入就緒 → (a) 轉紅**
    （那正是「還沒開始計算就要求計算已完成」的循環）。
-9. **顯式選定**：
+8B. **輸入選定（`PeriodFxInputSelection`）**：
+   (a) 沒有 InputSelection → 輸入就緒回 `G07_INPUT_NOT_SELECTED`；
+   (b) 非 R2 不得建立；
+   (c) `fn_fx_translation_run` 以**不等於**現行 InputSelection 的三個 ID 呼叫
+       → `FX_INPUT_NOT_SELECTED`，不建立任何 run；
+   (d) 同一舊版被兩個新版指向 → 拒絕；
+   (e) 建立時 DB 重驗 source run／匯率版本／政策版本的父鏈與歸屬。
+   **反證：讓判定函式自行取「最新 APPROVED」→ (a) 轉紅**
+   （那正是用查詢結果代替人的決策）。
+   **註**：(c) 使既有 fx 測試需先建立 InputSelection——這是**預期的 fixture
+   變更**，M3-02 的斷言一字不改。
+9. **結果選定（`PeriodFxRunSelection`）**：
    (a) 沒有 selection → `POSTFX_RUN_NOT_SELECTED`；
    (b) 非 R4 不得建立 selection；
    (c) selection 指向 `FAILED` 或 replay run → 拒絕；
@@ -379,7 +438,7 @@ D-26-05 的完整 scope 鏈是
     由 `OPEN` 走向終態，終態不得再改；同一 run 至多一份調節。
 14. **跨租戶與跨案件**：調節、tolerance、selection 的 run／報告單位／期間
     必須同租戶同案件（比照 0032 的父鏈守衛）；跨租戶與同租戶跨案件各一條負面測試。
-15. **兩支判定函式皆唯讀**：`app_runtime` 不得以它改變任何狀態；
+15. **兩支 readiness 函式皆唯讀**：`app_runtime` 不得以它改變任何狀態；
     0028 的規格函式與既有期間測試（DB 31＋端到端 37）**斷言一字不改**全綠。
 16. 完整測試一輪全綠。
 
@@ -404,8 +463,11 @@ migration（`RoundingToleranceVersion`（幣別對 scope）＋ R4 批准函式�
 `TranslationReconciliation`（含 tolerance 快照與 `reconciliation_input_hash`）／
 `TranslationDifference`（含算術推導欄位）＋不可變與父鏈守衛 →
 獨立重算函式（不呼叫引擎、不讀 `TranslationResult`）＋ INV-24 判定 →
+`PeriodFxInputSelection` ＋ R2 選定函式 ＋ `fn_fx_translation_run` 的前置檢查
+（`CREATE OR REPLACE`，簽章與計算行為不變）→
 `PeriodFxRunSelection`（series／version／supersedes）＋ R4 選定函式 →
 `fn_period_fx_input_readiness` ＋ `fn_period_fx_result_readiness`）
-→ DB 負面測試（2～15）→ Case-001 的無差異正控制（尾差零筆）
-→ 直接建構的尾差樣本驗 INV-24 → 期間套件回歸（斷言不改）→ 完整一輪。
+→ 既有 fx 測試補建 InputSelection（fixture 變更，斷言不改）
+→ DB 負面測試（2～15）→ Case-001 的無差異正控制（**所有類別零筆**）
+→ schema-level 尾差樣本驗 INV-24 → 期間套件回歸（斷言不改）→ 完整一輪。
 **畫面不在本刀。**
