@@ -33,6 +33,27 @@ const check = (name: string, ok: boolean, detail = "") => {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  " + detail : ""}`);
 };
 const sql = (q: string): string => raw(q, { db: "cbfc_dev" });
+
+// seed 為 B-06 畫面在 2026-03 留了一個 ACCEPTED 批次（case-001-tb.csv）與一個 RUNNING run。
+// 因此「依期間查唯一批次」抓到的可能不是本測試上傳的那一批，而所有正常上傳的
+// file_name 都是 tb.csv——唯一分得開的是**本測試自己算得出來的內容雜湊**。
+const shaOf = (csvPath: string): string =>
+  createHash("sha256").update(readFileSync(csvPath)).digest("hex");
+const dbNow = (): string => sql("SELECT clock_timestamp()::text");
+/** 取得本測試剛上傳的那一批。since 是上傳前記下的時間點——同一檔案重複上傳時，
+ *  只靠雜湊會抓到較早那一批。取得後立刻回驗父鏈與雜湊，避免以錯誤對象通過。 */
+const uploadedBatch = (pr: string, user: string, csvPath: string, since: string): string => {
+  const sha = shaOf(csvPath);
+  const id = sql(`SELECT import_batch_id FROM import_batch
+                   WHERE declared_period_revision_id = '${pr}' AND uploaded_by = '${user}'
+                     AND file_sha256 = '${sha}' AND created_at > '${since}'::timestamptz
+                   ORDER BY created_at DESC LIMIT 1`);
+  check(`前置：取得本測試上傳的批次（期間／上傳者／檔案雜湊皆相符）`,
+    id !== "" && sql(`SELECT count(*) FROM import_batch WHERE import_batch_id = '${id}'
+                       AND declared_period_revision_id = '${pr}' AND uploaded_by = '${user}'
+                       AND file_sha256 = '${sha}'`) === "1", id.slice(0, 8));
+  return id;
+};
 async function login(userId: string): Promise<string> {
   const r = await fetch(`${API}/login?u=${userId}&t=${T1}`, { redirect: "manual" });
   return (r.headers.get("set-cookie") ?? "").split(";")[0];
@@ -68,10 +89,11 @@ try {
   const bing = await login(U_BING); const ops = await login(U_OPS);
 
   // ── 前置：Case-001 完整鏈 ──
+  const t0 = dbNow();
   await post(jia, "/upload", { engagement: ENG_A, legal_entity: LE_A, period_revision: PR1, provided_by: PROVIDER_R1,
     csv: readFileSync(`${FIX}/jp_tb_2026-03.csv`, "utf8") });
   await waitFor(() => sql("SELECT count(*) FROM import_batch WHERE status='VALIDATED'") === "1");
-  const B1 = sql(`SELECT import_batch_id FROM import_batch LIMIT 1`);
+  const B1 = uploadedBatch(PR1, U_JIA, `${FIX}/jp_tb_2026-03.csv`, t0);
   await post(jia, "/b04/accept", { batch: B1 });
   const manual = readFileSync(`${FIX}/manual_mapping.csv`, "utf8").trim().split("\n").slice(1)
     .map((l) => l.split(","));
@@ -91,7 +113,12 @@ try {
   // run 建立時先停 worker → RUNNING 狀態下測 RUN_NOT_COMPLETED
   worker.kill(); worker = null; await sleep(600);
   await post(jia, "/b06/run", { batch: B1, request_key: K(1) });
-  const RUN = sql(`SELECT calculation_run_id FROM calculation_run LIMIT 1`);
+  // 以本測試自己的 request_key 反查——seed 為 B-06 畫面留了一個別的批次的 RUNNING run，
+  // LIMIT 1 會抓到它，後面整段「產包」就在驗錯的對象。
+  const RUN = sql(`SELECT calculation_run_id FROM calculation_run WHERE request_key='${K(1)}'`);
+  check("前置：取得本測試建立的 run（request_key 與來源批次皆相符）",
+    RUN !== "" && sql(`SELECT count(*) FROM calculation_run WHERE calculation_run_id='${RUN}'
+                        AND request_key='${K(1)}' AND import_batch_id='${B1}'`) === "1", RUN.slice(0, 8));
   check("run 尚未 COMPLETED → 產包 409＋RUN_NOT_COMPLETED 留痕",
     (await post(jia, "/b07/package", { run: RUN, request_key: K(2) })).status === 409
     && Number(sql(`SELECT count(*) FROM audit_event WHERE kind='CONTROL_VIOLATION_ATTEMPT'

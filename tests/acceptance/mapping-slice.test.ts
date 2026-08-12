@@ -3,6 +3,7 @@
 // 核心價值驗證：第一次建立映射後，下一期（2026-04）自動複用，使用者只處理例外（新科目 631）。
 import { spawn, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { raw } from "../../packages/database/src/psql.ts";
 
@@ -27,6 +28,27 @@ const check = (name: string, ok: boolean, detail = "") => {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  " + detail : ""}`);
 };
 const sql = (q: string): string => raw(q, { db: "cbfc_dev" });
+
+// seed 為 B-06 畫面在 2026-03 留了一個 ACCEPTED 批次（case-001-tb.csv）與一個 RUNNING run。
+// 因此「依期間查唯一批次」抓到的可能不是本測試上傳的那一批，而所有正常上傳的
+// file_name 都是 tb.csv——唯一分得開的是**本測試自己算得出來的內容雜湊**。
+const shaOf = (csvPath: string): string =>
+  createHash("sha256").update(readFileSync(csvPath)).digest("hex");
+const dbNow = (): string => sql("SELECT clock_timestamp()::text");
+/** 取得本測試剛上傳的那一批。since 是上傳前記下的時間點——同一檔案重複上傳時，
+ *  只靠雜湊會抓到較早那一批。取得後立刻回驗父鏈與雜湊，避免以錯誤對象通過。 */
+const uploadedBatch = (pr: string, user: string, csvPath: string, since: string): string => {
+  const sha = shaOf(csvPath);
+  const id = sql(`SELECT import_batch_id FROM import_batch
+                   WHERE declared_period_revision_id = '${pr}' AND uploaded_by = '${user}'
+                     AND file_sha256 = '${sha}' AND created_at > '${since}'::timestamptz
+                   ORDER BY created_at DESC LIMIT 1`);
+  check(`前置：取得本測試上傳的批次（期間／上傳者／檔案雜湊皆相符）`,
+    id !== "" && sql(`SELECT count(*) FROM import_batch WHERE import_batch_id = '${id}'
+                       AND declared_period_revision_id = '${pr}' AND uploaded_by = '${user}'
+                       AND file_sha256 = '${sha}'`) === "1", id.slice(0, 8));
+  return id;
+};
 
 async function login(userId: string): Promise<string> {
   const r = await fetch(`${API}/login?u=${userId}&t=${T1}`, { redirect: "manual" });
@@ -79,9 +101,10 @@ try {
   const senior = await login(U_SENIOR);
 
   // ── 第一期：2026-03 ──
+  const t1 = dbNow();
   check("上傳 Case-001 2026-03 TB 回 302", await upload(staff, PR1, `${FIX}/jp_tb_2026-03.csv`) === 302);
   await waitWorker();
-  const B1 = sql(`SELECT import_batch_id FROM import_batch WHERE declared_period_revision_id='${PR1}'`);
+  const B1 = uploadedBatch(PR1, U_STAFF, `${FIX}/jp_tb_2026-03.csv`, t1);
   check("批次通過驗證（VALIDATED／MATCHED）",
     sql(`SELECT status||'/'||identity_status FROM import_batch WHERE import_batch_id='${B1}'`) === "VALIDATED/MATCHED");
   check("接受批次 → ACCEPTED（G-01 接受判定式）", await post(staff, "/b04/accept", { batch: B1 }) === 302
@@ -152,10 +175,13 @@ try {
   // 0021：來源批次必須已接受——未經接受的批次不得成為正式映射的來源脈絡。
   // 應用層先判定並回穩定機器代碼，不讓使用者撞上 DB 例外的 500。
   const B_NEW = await (async () => {
+    const t = dbNow();
     await upload(staff, PR1, `${FIX}/jp_tb_2026-03.csv`);
     await waitWorker();
-    return sql(`SELECT import_batch_id FROM import_batch ORDER BY created_at DESC LIMIT 1`);
+    // 同一份檔案的第二次上傳：雜湊與 B1 相同，只有時間點分得開
+    return uploadedBatch(PR1, U_STAFF, `${FIX}/jp_tb_2026-03.csv`, t);
   })();
+  check("0021 前置：第二次上傳是不同批次（不是 B1）", B_NEW !== "" && B_NEW !== B1);
   const newStatus = sql(`SELECT status FROM import_batch WHERE import_batch_id='${B_NEW}'`);
   const r0021 = await fetch(`${API}/b04/map`, { method: "POST", redirect: "manual",
     headers: { cookie: staff, "content-type": "application/x-www-form-urlencoded" },
@@ -197,9 +223,10 @@ try {
   check("全數映射後 G-02 通過", await post(staff, "/b04/submit", { batch: B1 }) === 200);
 
   // ── 第二期：2026-04（核心價值：自動複用＋只處理例外） ──
+  const t2 = dbNow();
   check("上傳 2026-04 TB 回 302", await upload(staff, PR2, `${FIX}/jp_tb_2026-04.csv`) === 302);
   await waitWorker();
-  const B2 = sql(`SELECT import_batch_id FROM import_batch WHERE declared_period_revision_id='${PR2}'`);
+  const B2 = uploadedBatch(PR2, U_STAFF, `${FIX}/jp_tb_2026-04.csv`, t2);
   await post(staff, "/b04/accept", { batch: B2 });
   b04 = await (await fetch(`${API}/b04?batch=${B2}`, { headers: { cookie: staff } })).text();
   check("下一期自動複用：僅新科目 631 未映射，其餘既有映射直接套用",
