@@ -1,6 +1,6 @@
 # SLICE-M3-04　現金流支持資料（REQ-CFS-001）
 
-> 狀態：**事前契約 第二版（走查修訂後）**，待確認。**尚未批准進 migration。**
+> 狀態：**事前契約 第三版（走查兩輪修訂後）**，待確認。**尚未批准進 migration。**
 > 風險：**第一級**（母公司批准的方法版本、完整度判定、控制總額勾稽、凍結與重演）。
 >
 > 對應基線：手冊 v1.2 **REQ-CFS-001（P0）**、§20 MVP 3、§299–301（資料粒度）；
@@ -81,6 +81,10 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
   同一個理由）。
 - `activity` 三值是準則層的結構事實，不是可配置政策；`code` 由母公司決定。
 - **不預先塞入任何預設分類集合**：分類是母公司口徑的一部分。
+- **批准時的兩項最低要求**（否則等於批准了一個空集合）：
+  1. 恰好**一個** `kind = 'FX_EFFECT_ON_CASH'` 的控制項目（多於一個或沒有皆拒絕）；
+  2. 至少**一筆** `CashFlowCashAccountMembership`——沒有現金科目範圍，
+     K1／K2 就沒有計算對象。
 
 ## 四、映射：科目／分錄／必要明細 → `CashFlowClass`
 
@@ -125,8 +129,13 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
     ├─ status    DATA_PRESENT              有已映射的支持資料
     │            | ZERO_ACTIVITY_CONFIRMED 本期確認無活動（需確認人與理由）
     │            | COVERAGE_EXCEPTION      粒度不足，走已批准例外（§五之二）
-    ├─ confirmed_by / confirmed_at         ZERO_ACTIVITY_CONFIRMED 時必填（R2 確認、R3 覆核）
+    ├─ confirmed_by / confirmed_at         R2 確認；ZERO_ACTIVITY_CONFIRMED 時必填
+    ├─ reviewed_by / reviewed_at           R3 覆核；ZERO_ACTIVITY_CONFIRMED 時必填
     └─ evidence_ref                        ZERO_ACTIVITY_CONFIRMED 時必填
+
+`ZERO_ACTIVITY_CONFIRMED` 只有在 **R2 確認 ＋ R3 覆核 ＋ 理由與證據齊備**
+三者同時成立時才算完整。**本刀不另造自然人互斥規則**——是否允許同一人兼
+R2／R3，沿用既有的實例級控制政策，不在此新增 SoD。
 
     完整度判定（per period_revision × reporting_unit × policy_version）
     ├─ 每個 is_required 的 CashFlowClass 都有一筆 CashFlowClassPeriodCoverage，
@@ -179,14 +188,53 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
        ├─ coverage_exception_id（可空）
        └─ period_revision_id / reporting_unit_id
 
-### 控制總額勾稽（G-09 的資料層對應物）
+### 六之一、權威來源的顯式選定
+
+「前期已選定 run」目前只有 FX 有物件（`PeriodFxRunSelection`）；**NO_FX 沒有
+對應的正式選定**，首期的「經批准的期初證據」也還沒有資料形狀。兩者都不能
+留給實作臨場決定，否則又會退回「按時間找最新版」。
+
+    PeriodCashFlowSourceSelection
+    ├─ period_revision_id / reporting_unit_id
+    ├─ current_run_id                  本期的來源 run（FX 或 NO_FX）
+    ├─ opening_source_kind             PRIOR_SELECTED_RUN | FIRST_PERIOD_EVIDENCE
+    ├─ prior_run_id                    PRIOR_SELECTED_RUN 時必填
+    ├─ opening_balance_set_version_id  FIRST_PERIOD_EVIDENCE 時必填
+    ├─ series_id / version_no / supersedes_selection_id
+    └─ selected_by / selected_at       **案件層 R4**（system-only 函式）
+
+規則（DB 強制）：
+- **FX 情境**：`current_run_id` 必須**等於**現行 `PeriodFxRunSelection`
+  所選定的 run——兩個選定不得各說各話。
+- **NO_FX 情境**：由本物件明確選定，**不按時間找最新**。
+- `PRIOR_SELECTED_RUN`：`prior_run_id` 必須是**顯式前期**
+  （`reporting_period.previous_reporting_period_id`）的**已選定結果**。
+- **首期只能用 `FIRST_PERIOD_EVIDENCE`**；非首期不得使用它。
+- XOR：兩個來源欄位恰有一個非空。
+
+首期的期初證據也用集合版本，理由與分類集合相同——單列的版本鏈證明不了
+「沒有漏掉一個現金科目」：
+
+    CashFlowOpeningBalanceSetVersion
+    ├─ engagement_id / reporting_unit_id / period_revision_id
+    ├─ series_id / version_no / supersedes_set_version_id
+    ├─ evidence_ref                    必填
+    └─ approved_by / approved_at       **案件層 R4**
+    └─ CashFlowOpeningBalanceLine［］
+       ├─ account_id
+       ├─ functional_amount / currency
+       └─ reporting_amount / reporting_currency（可空；有 FX 時必填）
+
+整套一起批准、凍結與重演。否則「經批准的期初證據」仍只是一句話。
+
+### 六之二、控制總額勾稽（G-09 的資料層對應物）
 
 **現金的期初與期末來源必須凍結，不得臨時查詢：**
 
 | 項目 | 來源 |
 |---|---|
-| 期初現金 | **前期已選定的 run**（`PeriodFxRunSelection`／NO_FX 的對應選定）；**首期**則使用**經批准的期初現金證據**（比照 `EquityOpeningTranslatedBalance` 的 `FIRST_CONVERSION`） |
-| 期末現金 | **本期選定的 run** |
+| 期初現金 | 依 `PeriodCashFlowSourceSelection.opening_source_kind`：前期已選定 run，或首期的已批准 `CashFlowOpeningBalanceSetVersion` |
+| 期末現金 | `PeriodCashFlowSourceSelection.current_run_id` |
 | 現金科目範圍 | 凍結的 `CashFlowCashAccountMembership`（隨分類集合） |
 
 | # | 勾稽 | 判準 |
@@ -234,7 +282,7 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 **本刀不解鎖任何遷移。** `ADJ_APPROVED → CALCULATING` 仍缺 G-03；
 `CALCULATING → RECONCILING` 的守衛與 `RECONCILING` 之後各段亦未實作。
 現金流支持資料是 `RECONCILING` 階段「關係人與現金流核對」的資料前提，
-但**本刀只交付資料與判定能力**，0028 的規格函式不動。
+但本刀只交付資料與判定能力，0028 的規格函式不動。
 
 ## 九、驗收
 
@@ -243,7 +291,9 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 2. **`evidence_version` 必填**：缺母公司確認文件 → 拒絕建立政策版本。
 3. **分類以集合為批准單位**：集合不可變、版本向後指、不得分叉；
    單獨新增一個分類到已批准集合 → 拒絕。
-4. **映射粒度不得高於政策**：政策為 `ACCOUNT` 而規則為 `JOURNAL_LINE` → 拒絕。
+4. **映射粒度不得超出實際取得**：`required_granularity = 'BALANCE'`
+   而規則為 `JOURNAL_LINE`、且實際 `DataCoverage` 只有 `BALANCE` → 拒絕
+   （`ACCOUNT` 只屬 `source_kind`，對應 `BALANCE`）。
    **反證：拿掉該檢查 → 轉紅。**
 5. **映射唯一**：同一來源同一生效期間兩條規則 → `CFS_MAPPING_AMBIGUOUS`。
 6. **未映射即未映射**：有來源事實未命中規則 → `CFS_UNMAPPED_SOURCE`，
@@ -271,6 +321,19 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 11. **凍結與重演**：改動現行政策／分類集合／映射後，舊 run 重演結果與雜湊不變；
     新 run 才採新版本。**反證：重演時回查現行主檔 → 轉紅。**
 12. **結果雜湊涵蓋來源證據**：只改映射規則而金額不變時，雜湊必須改變。
+12A. **權威來源選定**：
+    (a) FX 情境下 `current_run_id` ≠ 現行 `PeriodFxRunSelection` → 拒絕；
+    (b) 非首期使用 `FIRST_PERIOD_EVIDENCE` → 拒絕；首期使用
+        `PRIOR_SELECTED_RUN` → 拒絕；
+    (c) `prior_run_id` 不屬顯式前期的已選定結果 → 拒絕；
+    (d) 非 R4 不得選定。
+    **反證：把期初改成「查前期最新的 COMPLETED run」→ (c) 轉紅。**
+12B. **首期期初證據**：未批准的 `CashFlowOpeningBalanceSetVersion` 不得使用；
+    集合不可變、版本向後指、不得分叉；缺 `evidence_ref` → 拒絕。
+12C. **零活動需雙人流程**：缺 `reviewed_by`／`reviewed_at` →
+    `CFS_ZERO_ACTIVITY_UNCONFIRMED`。
+12D. **分類集合的最低要求**：沒有或超過一個 `FX_EFFECT_ON_CASH` → 批准被拒；
+    沒有任何現金科目 membership → 批准被拒。
 13. **跨租戶與跨案件**：政策、分類集合、映射、例外、來源 run 的父鏈全驗
     （比照 0032）；跨租戶與同租戶跨案件各一條負面測試。
 14. **不越界**：本刀不產生任何「現金流量表」實體；輸出型別只有支持資料列。
@@ -290,8 +353,11 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
    緩解：§六與§七的重用決定（待走查拍板）。
 
 實作順序（契約確認後）：
-migration（`CashFlowPolicyVersion` → `CashFlowClassSetVersion` ＋ 分類 →
+migration（`CashFlowPolicyVersion` → `CashFlowClassSetVersion` ＋ 分類
+＋ 現金科目 membership →
 `CashFlowMappingVersion` ＋ 規則 → `CashFlowCoverageException` →
+`CashFlowOpeningBalanceSetVersion` ＋ 明細 → `PeriodCashFlowSourceSelection` →
+`CashFlowClassPeriodCoverage` →
 `calculation_scope` 擴充與 manifest 新條目 → 支持資料列 →
 完整度與控制總額判定函式 → 期間級就緒判定）
 → DB 負面測試（1～9、13）→ Case-001 的正控制與控制總額勾稽（10）
