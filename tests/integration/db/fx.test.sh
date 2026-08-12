@@ -928,10 +928,10 @@ UPDATE currency SET minor_unit = 0 WHERE currency_code = 'CNY';
 SQL
 h3=$(PSQL_C <<<"$T1 SELECT result_content_hash FROM calculation_run WHERE calculation_run_id='$FXRUN'")
 [ "$h3" = "$h1" ] && ok "凍結：改動現行 Currency 後，舊 run 的結果與雜湊不變" || ng "凍結：舊 run 被影響"
-m1=$(PSQL_C <<<"$T1 SELECT e.domain_version_value FROM calculation_run r
+m1=$(PSQL_C <<<"$T1 SELECT e.payload->>'minor_unit' FROM calculation_run r
   JOIN calculation_manifest_entry e ON e.manifest_id=r.manifest_id
  WHERE r.calculation_run_id='$FXRUN' AND e.object_type='CURRENCY_DEFINITION'
-   AND e.content_canonical LIKE 'currency=CNY%'")
+   AND e.payload->>'code'='CNY'")
 [ "$m1" = "2" ] && ok "凍結：舊 run 的 manifest 仍記著 CNY minor_unit = 2" || ng "凍結：manifest 值為 ${m1}"
 FXRUN3=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','fx-1.0.0')")
 n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
@@ -1028,5 +1028,96 @@ expect_err "非 R2 不得發起折算" \
 post=$(PSQL_C <<<"$T1 SELECT count(*) FROM calculation_run")
 [ "$pre" = "$post" ] && ok "被拒的折算不留下任何 run（連預覽都不產生）" \
   || ng "被拒後 run 數由 ${pre} 變為 ${post}"
+
+
+# ══ 15　真正的 replay：只憑舊 Manifest 重算（AC-FX-001）══════════════
+# 「同一批現行資料跑兩次結果相同」不等於「可重演」。這一節把現行主檔改到
+# 足以改變結果，再用**同一份 Manifest** 重算——結果必須與原 run 一致。
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+-- 改分類（資產→費用）、改 Currency 精度。兩者若被回查，結果一定不同。
+UPDATE account SET translation_category='EXPENSE' WHERE code='C1001';
+UPDATE currency SET minor_unit=0 WHERE currency_code='CNY';
+SQL
+chg=$(PSQL_C <<<"$T1 SELECT translation_category||'/'||(SELECT minor_unit FROM currency WHERE currency_code='CNY')
+  FROM account WHERE code='C1001'")
+[ "$chg" = "EXPENSE/0" ] && ok "replay 前置：現行主檔已改（C1001 → EXPENSE，CNY → 0 位）" \
+  || ng "replay 前置：主檔為 ${chg}"
+RP=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_replay('$FXRUN','$JIA','fx-1.0.0')")
+st=$(PSQL_C <<<"$T1 SELECT status||'/'||COALESCE(failure_reason_code,'-') FROM calculation_run WHERE calculation_run_id='$RP'")
+[ "$st" = "COMPLETED/-" ] && ok "replay：只憑舊 Manifest 重算成功（現行主檔已變仍一致）" \
+  || ng "replay：狀態為 ${st}"
+h=$(PSQL_C <<<"$T1 SELECT result_content_hash FROM calculation_run WHERE calculation_run_id='$RP'")
+[ "$h" = "$h1" ] && ok "replay：result_content_hash 與原 run 完全相同" || ng "replay：雜湊不同"
+n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$RP' AND b.account_code='C1001'")
+[ "$n" = "16842.00" ] && ok "replay：C1001 仍以凍結的 ASSET／2 位得 16,842.00（未回查現行分類與精度）" \
+  || ng "replay：C1001 為 ${n}"
+# 精度的重演證明必須用**乘積不整除**的案例：整除時 0 位與 2 位得到同一個數，
+# 回查現行精度也看不出差別。
+RP2=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_replay('$FXRUN4','$JIA','fx-1.0.0')")
+n=$(PSQL_C <<<"$T1 SELECT tr.result_debit FROM translation_result tr
+  JOIN balance_snapshot_line b ON b.snapshot_line_id=tr.source_snapshot_line_id
+ WHERE tr.calculation_run_id='$RP2' AND b.account_code='C1001'")
+[ "$n" = "16843.16" ] && ok "replay：CNY 已改 0 位，重演仍以凍結的 2 位得 16,843.16" \
+  || ng "replay：不整除案例得 ${n}（回查現行精度會得 16843.00）"
+st=$(PSQL_C <<<"$T1 SELECT status FROM calculation_run WHERE calculation_run_id='$RP2'")
+[ "$st" = "COMPLETED" ] && ok "replay：不整除案例的重演亦與原 run 一致" || ng "replay：狀態 ${st}"
+
+n=$(PSQL_C <<<"$T1 SELECT manifest_id::text=(SELECT manifest_id::text FROM calculation_run
+  WHERE calculation_run_id='$FXRUN') FROM calculation_run WHERE calculation_run_id='$RP'")
+[ "$n" = "t" ] && ok "replay：引用同一份 Manifest（不建立新的凍結集合）" || ng "replay：Manifest 不同"
+n=$(PSQL_C <<<"$T1 SELECT replay_of_run_id FROM calculation_run WHERE calculation_run_id='$RP'")
+[ "$n" = "$FXRUN" ] && ok "replay：replay_of_run_id 指向原 run" || ng "replay：replay_of_run_id 為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT status||'/'||result_content_hash FROM calculation_run WHERE calculation_run_id='$FXRUN'")
+[ "$n" = "COMPLETED/$h1" ] && ok "replay：原 run 完全未被修改" || ng "replay：原 run 變成 ${n}"
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+UPDATE account SET translation_category='ASSET' WHERE code='C1001';
+UPDATE currency SET minor_unit=2 WHERE currency_code='CNY';
+SQL
+
+# 重演不一致必須以 REPLAY_FAILED 結束，不得宣稱成功
+# 竄改原 run 的結果雜湊（run 為終態，owner 也得停用守衛才改得動——
+# 這正是「結果不可變」該有的阻力）
+PSQL_C >/dev/null 2>&1 <<SQL
+$T1
+ALTER TABLE calculation_run DISABLE TRIGGER USER;
+UPDATE calculation_run SET result_content_hash='刻意不符' WHERE calculation_run_id='$FXRUN2';
+ALTER TABLE calculation_run ENABLE TRIGGER USER;
+SQL
+h4=$(PSQL_C <<<"$T1 SELECT result_content_hash FROM calculation_run WHERE calculation_run_id='$FXRUN2'")
+[ "$h4" = "刻意不符" ] && ok "replay 前置：原 run 的結果雜湊已被竄改" || ng "replay 前置：雜湊為 ${h4}"
+RPF=$(PSQL_C <<<"$T1 SELECT fn_fx_translation_replay('$FXRUN2','$JIA','fx-1.0.0')")
+st=$(PSQL_C <<<"$T1 SELECT status||'/'||COALESCE(failure_reason_code,'-') FROM calculation_run WHERE calculation_run_id='$RPF'")
+[ "$st" = "FAILED/REPLAY_FAILED" ] && ok "replay：結果不一致 → REPLAY_FAILED，不宣稱成功" \
+  || ng "replay：狀態為 ${st}"
+
+# Hash 演算法必須與宣告一致
+n=$(PSQL_C <<<"$T1 SELECT length(frozen_set_content_hash)||'/'||hash_algorithm
+  FROM calculation_input_manifest m JOIN calculation_run r ON r.manifest_id=m.manifest_id
+ WHERE r.calculation_run_id='$FXRUN'")
+[ "$n" = "64/sha256" ] && ok "凍結雜湊為 SHA-256（64 hex），與 hash_algorithm 宣告一致" \
+  || ng "凍結雜湊為 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT length(result_content_hash) FROM calculation_run WHERE calculation_run_id='$FXRUN'")
+[ "$n" = "64" ] && ok "結果雜湊亦為 SHA-256" || ng "結果雜湊長度 ${n}"
+n=$(PSQL_C <<<"$T1 SELECT count(*) FROM calculation_manifest_entry e
+  JOIN calculation_run r ON r.manifest_id=e.manifest_id
+ WHERE r.calculation_run_id='$FXRUN' AND e.payload='{}'::jsonb")
+[ "$n" = "0" ] && ok "凍結條目沒有空 payload（每一類都保存了實際使用的值）" \
+  || ng "仍有 ${n} 筆空 payload"
+n=$(PSQL_C <<<"$T1 SELECT payload->>'source_result_hash' FROM calculation_manifest_entry e
+  JOIN calculation_run r ON r.manifest_id=e.manifest_id
+ WHERE r.calculation_run_id='$FXRUN' AND e.object_type='SOURCE_CALCULATION_RUN'")
+[ "$n" = "case001-r" ] && ok "凍結：來源 run 與其結果雜湊也在凍結清單內" || ng "來源雜湊為 ${n}"
+
+# source run 的完整驗證
+expect_err "來源 run 非 COMPLETED → 拒絕" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$PR','$UNIT','$RUN_RUNNING','$FXCASE','$POLCASE','$JIA','x')" \
+  "FX_SOURCE_RUN_NOT_COMPLETED\|§24.1A"
+expect_err "來源 run 屬別的期間 → 拒絕（釘住期間檢查本身的訊息）" \
+  "$T1 SELECT fn_fx_translation_run('$TEN','$ENG','$RPC','$UNIT','$SRCRUN','$FXCASE','$POLCASE','$JIA','x')" \
+  "來源 run 的案件或期間與本次折算不一致"
 
 [ "${STANDALONE:-0}" = "1" ] && summary
