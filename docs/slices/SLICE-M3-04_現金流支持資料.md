@@ -1,6 +1,6 @@
 # SLICE-M3-04　現金流支持資料（REQ-CFS-001）
 
-> 狀態：**事前契約 第三版（走查兩輪修訂後）**，待確認。**尚未批准進 migration。**
+> 狀態：**事前契約 第四版（走查三輪修訂後）**，待確認。**尚未批准進 migration。**
 > 風險：**第一級**（母公司批准的方法版本、完整度判定、控制總額勾稽、凍結與重演）。
 >
 > 對應基線：手冊 v1.2 **REQ-CFS-001（P0）**、§20 MVP 3、§299–301（資料粒度）；
@@ -86,7 +86,51 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
   2. 至少**一筆** `CashFlowCashAccountMembership`——沒有現金科目範圍，
      K1／K2 就沒有計算對象。
 
-## 四、映射：科目／分錄／必要明細 → `CashFlowClass`
+## 三之二、金額事實：`CashFlowSourceFact`
+
+**目前的模型沒有「本期現金流金額」這個事實。** 現有的候選來源都不是：
+
+| 來源 | 為什麼不是 |
+|---|---|
+| `Account` | 只是科目主檔，沒有本期金額 |
+| `journal_line` | 平台的**調整分錄**，不等於匯入的現金流支持資料 |
+| `source_document` | 有附件，沒有可勾稽的金額 |
+| `source_ledger_line` | 多半是**期末 TB 餘額**——把餘額當成本期現金流，就是自行重建 |
+
+若直接從這些產生 `CashFlowSupportLine.amount`，實作者只能現場決定怎麼算，
+產品就從「收集支持資料」滑向「自行重建現金流」——正是 GB-04 禁止的那件事。
+
+因此補上最小的金額事實：
+
+    CashFlowSourceFact
+    ├─ period_revision_id / reporting_unit_id
+    ├─ source_dataset_id / import_batch_id
+    ├─ actual_granularity        BALANCE | JOURNAL | SUBLEDGER | DOCUMENT
+    ├─ source_kind               ACCOUNT | JOURNAL_LINE | SUBLEDGER_ITEM | DOCUMENT
+    ├─ account_id
+    ├─ source_ledger_line_id / source_document_id     依 source_kind **XOR**
+    ├─ source_row_id             來源列識別（可追回原檔）
+    ├─ signed_amount_functional / functional_currency
+    ├─ signed_amount_reporting  / reporting_currency（可空；有 FX 時必填）
+    ├─ evidence_ref
+    └─ content_hash
+
+**語意寫死（DB 強制）：**
+
+1. **金額由提供者提交，或自明確的現金流支持資料集匯入；平台不從 TB 餘額
+   自行推算。** 沒有 `CashFlowSourceFact` 就沒有現金流金額——不得由
+   `source_ledger_line` 的餘額推導。
+2. `CashFlowMappingRule` 決定 **`CashFlowSourceFact` 如何分類**（不是分類科目本身）。
+3. `CashFlowSupportLine` 引用 **`source_fact_id` ＋ `mapping_rule_id`**，
+   只做保存、分類與輸出，**不做任何金額運算**。
+4. **K1／K2 使用這些已提交的 signed amount 勾稽，不反推缺失金額。**
+5. `actual_granularity` 必須來自該 fact **所屬資料集**的 `DataCoverage`，
+   不得逐列自填。
+
+**帶正負號**（`signed_*`）而非借貸兩欄：現金流的方向是流入／流出，
+用借貸表示會在「同一分類同時有流入與流出」時失去可加性。
+
+## 四、映射：`CashFlowSourceFact` → `CashFlowClass`
 
     CashFlowMappingVersion
     ├─ engagement_id / policy_version_id      綁定方法與粒度版本
@@ -95,6 +139,7 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
     └─ CashFlowMappingRule［］
        ├─ source_kind      ACCOUNT | JOURNAL_LINE | SUBLEDGER_ITEM | DOCUMENT
        ├─ source_ref       依 source_kind 的具體外鍵（不是可空 text，比照 0031）
+       │                   規則比對的對象是 CashFlowSourceFact 的同名欄位
        ├─ cash_flow_class_id
        ├─ effective_from / effective_to       生效日（比照 MappingRule）
        └─ evidence_ref
@@ -126,12 +171,20 @@ GB-04 寫得很清楚：**P0 僅保存母公司確認的方法與粒度，並收
     CashFlowClassPeriodCoverage
     ├─ period_revision_id / reporting_unit_id / policy_version_id
     ├─ cash_flow_class_id
-    ├─ status    DATA_PRESENT              有已映射的支持資料
+    ├─ status    DATA_PRESENT              有已映射的 CashFlowSourceFact
     │            | ZERO_ACTIVITY_CONFIRMED 本期確認無活動（需確認人與理由）
     │            | COVERAGE_EXCEPTION      粒度不足，走已批准例外（§五之二）
     ├─ confirmed_by / confirmed_at         R2 確認；ZERO_ACTIVITY_CONFIRMED 時必填
     ├─ reviewed_by / reviewed_at           R3 覆核；ZERO_ACTIVITY_CONFIRMED 時必填
     └─ evidence_ref                        ZERO_ACTIVITY_CONFIRMED 時必填
+
+**寫入權限逐狀態釘死：**
+
+| status | 誰寫入 |
+|---|---|
+| `DATA_PRESENT` | **只能由系統依 `CashFlowSourceFact` 衍生**，不得人工宣告 |
+| `ZERO_ACTIVITY_CONFIRMED` | 走 R2 確認 ＋ R3 覆核的 system-only 函式 |
+| `COVERAGE_EXCEPTION` | 必須帶 `coverage_exception_id`，且引用**已批准的逐分類例外** |
 
 `ZERO_ACTIVITY_CONFIRMED` 只有在 **R2 確認 ＋ R3 覆核 ＋ 理由與證據齊備**
 三者同時成立時才算完整。**本刀不另造自然人互斥規則**——是否允許同一人兼
@@ -182,11 +235,16 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
 
     CalculationRun（calculation_scope = 'CASH_FLOW_SUPPORT'）
     └─ CashFlowSupportLine［］
-       ├─ cash_flow_class_id / activity
-       ├─ amount（功能幣）/ amount_reporting（報告幣，可空）
-       ├─ source_kind / source_ref / mapping_rule_id
+       ├─ cash_flow_class_id / kind / activity
+       ├─ source_fact_id          **金額的唯一來源**（不在此重算）
+       ├─ mapping_rule_id         命中的分類規則
+       ├─ signed_amount_functional / signed_amount_reporting（自 fact 原樣帶出）
        ├─ coverage_exception_id（可空）
        └─ period_revision_id / reporting_unit_id
+
+**支持資料列不做金額運算**：`signed_amount_*` 一律自 `CashFlowSourceFact`
+原樣帶出。這一條讓「收集」與「重建」在資料層就分得開——重建會需要一個
+可以放推算結果的欄位，而這裡沒有。
 
 ### 六之一、權威來源的顯式選定
 
@@ -334,6 +392,17 @@ INV-23 的原則是「粒度不足時不得自動執行」。但現金流常常�
     `CFS_ZERO_ACTIVITY_UNCONFIRMED`。
 12D. **分類集合的最低要求**：沒有或超過一個 `FX_EFFECT_ON_CASH` → 批准被拒；
     沒有任何現金科目 membership → 批准被拒。
+12E. **金額事實**：
+    (a) 沒有 `CashFlowSourceFact` 時不得產生任何 `CashFlowSupportLine`；
+    (b) `source_ledger_line` 有餘額但沒有 fact → 完整度判定為未確認，
+        **不得**由餘額推導金額。**反證：加入「以 TB 餘額補金額」→ 轉紅**；
+    (c) `CashFlowSupportLine.signed_amount_*` 必須逐欄等於其 fact 的值
+        （支持資料列不做金額運算）；
+    (d) `actual_granularity` 與該 fact 所屬資料集的 `DataCoverage` 不符 → 拒絕；
+    (e) `source_kind` 與 `source_ledger_line_id`／`source_document_id` 的 XOR。
+12F. **逐期覆蓋的寫入權限**：
+    (a) 人工寫入 `DATA_PRESENT` → 拒絕（只能由系統依 fact 衍生）；
+    (b) `COVERAGE_EXCEPTION` 缺 `coverage_exception_id` 或引用未批准的例外 → 拒絕。
 13. **跨租戶與跨案件**：政策、分類集合、映射、例外、來源 run 的父鏈全驗
     （比照 0032）；跨租戶與同租戶跨案件各一條負面測試。
 14. **不越界**：本刀不產生任何「現金流量表」實體；輸出型別只有支持資料列。
@@ -357,7 +426,7 @@ migration（`CashFlowPolicyVersion` → `CashFlowClassSetVersion` ＋ 分類
 ＋ 現金科目 membership →
 `CashFlowMappingVersion` ＋ 規則 → `CashFlowCoverageException` →
 `CashFlowOpeningBalanceSetVersion` ＋ 明細 → `PeriodCashFlowSourceSelection` →
-`CashFlowClassPeriodCoverage` →
+`CashFlowSourceFact` → `CashFlowClassPeriodCoverage` →
 `calculation_scope` 擴充與 manifest 新條目 → 支持資料列 →
 完整度與控制總額判定函式 → 期間級就緒判定）
 → DB 負面測試（1～9、13）→ Case-001 的正控制與控制總額勾稽（10）
