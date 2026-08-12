@@ -11,6 +11,7 @@ fx_reset; fx_core; fx_accounts
 
 CFSET=c0400000-0000-0000-0000-000000000001
 CFCLS=c0410000-0000-0000-0000-000000000001
+CFCLS_FXE=c0410000-0000-0000-0000-000000000002
 CFPOL=c0420000-0000-0000-0000-000000000001
 CFDS=c0430000-0000-0000-0000-000000000001
 CFMF=c0440000-0000-0000-0000-000000000001
@@ -23,7 +24,7 @@ VALUES ('${CFSET}','${TEN}','${ENG}','CF 分類 v1','c0400000-0000-0000-0000-000
 INSERT INTO cash_flow_class (cash_flow_class_id, tenant_id, class_set_version_id, code, name,
         kind, activity, direction, is_required) VALUES
   ('${CFCLS}','${TEN}','${CFSET}','OP-01','銷售收現','ACTIVITY','OPERATING','INFLOW',true),
-  (gen_random_uuid(),'${TEN}','${CFSET}','FXE','匯率變動對現金的影響','FX_EFFECT_ON_CASH',
+  ('${CFCLS_FXE}','${TEN}','${CFSET}','FXE','匯率變動對現金的影響','FX_EFFECT_ON_CASH',
    NULL,'EITHER',true);
 INSERT INTO cash_flow_cash_account_membership (tenant_id, class_set_version_id, account_id, cash_role)
 VALUES ('${TEN}','${CFSET}','${ACC1}','CASH');
@@ -168,10 +169,13 @@ expect_ok  "0040：零活動四組資料齊備 → 接受" \
         confirmed_at, reviewed_by, reviewed_at, reason, evidence_ref)
    VALUES ('${TEN}','${PR}','${UNIT}','${CFPOL}','${CFCLS}','ZERO_ACTIVITY_CONFIRMED',
            '${JIA}',now(),'${YI}',now(),'本期無此類活動','底稿 #1')"
+# 父鏈正確的一列（PR＋UNIT＋CFPOL＋CFCLS_FXE）——原本的 GRP_PR＋GRP_UNIT
+# 搭配 UNIT 政策本身就是無效父鏈，0042 的 DB 防線會先以別的理由擋下，
+# 那條測試就會「以錯誤理由通過」。
 expect_err "0040：COVERAGE_EXCEPTION 必須帶 exception_id" \
   "${T1} INSERT INTO cash_flow_class_period_coverage (tenant_id, period_revision_id,
         reporting_unit_id, policy_version_id, cash_flow_class_id, status)
-   VALUES ('${TEN}','${GRP_PR}','${GRP_UNIT}','${CFPOL}','${CFCLS}','COVERAGE_EXCEPTION')" \
+   VALUES ('${TEN}','${PR}','${UNIT}','${CFPOL}','${CFCLS_FXE}','COVERAGE_EXCEPTION')" \
   "violates check constraint"
 
 # ── 0040：多批次橋接 ──
@@ -269,5 +273,454 @@ expect_err "0041：封套建立後不可 UPDATE" \
 n=$(PSQL_C <<<"${T1} SELECT actual_granularity FROM cash_flow_source_fact WHERE content_hash='f1'")
 [ "${n}" = "BALANCE" ] && ok "0041：fact 的粒度取自封套所指的覆蓋度（不是整批最細的）" \
   || ng "0041：fact 粒度為 ${n}"
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# 0042：角色工作流函式與父鏈（SLICE-M3-04 第二段 2a）
+#
+# 紀律：每條負面測試**先斷言前置狀態成立**（角色確實持有、物件確實存在、
+# 父鏈確實正確），否則會被更前面的守衛以別的理由擋下而假綠。
+# ══════════════════════════════════════════════════════════════════
+fx_tb_lines
+
+# ── 角色前置：作用域正確與作用域錯誤各一組 ──
+CFR4=af420000-0000-0000-0000-000000000001      # 案件層 R4
+CFR3=af420000-0000-0000-0000-000000000002      # 案件層 R3
+CFT4=af420000-0000-0000-0000-000000000004      # **租戶層** R4（作用域錯誤的反例）
+CFDUAL=af420000-0000-0000-0000-000000000005    # 案件層 R2＋R3＋R4（SoD 反例）
+_has app_user "user_id = '${CFR4}'" || PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+INSERT INTO app_user (user_id, tenant_id, email, display_name) VALUES
+  ('${CFR4}','${TEN}','cf-partner@t1.jp','現金流合夥人'),
+  ('${CFR3}','${TEN}','cf-senior@t1.jp','現金流覆核者'),
+  ('${CFT4}','${TEN}','cf-tenant-r4@t1.jp','租戶層 R4'),
+  ('${CFDUAL}','${TEN}','cf-dual@t1.jp','兼任者');
+INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id) VALUES
+  ('${TEN}','${CFR4}','R4','${ENG}'),
+  ('${TEN}','${CFR3}','R3','${ENG}'),
+  ('${TEN}','${CFT4}','R4',NULL),
+  ('${TEN}','${CFDUAL}','R2','${ENG}'),('${TEN}','${CFDUAL}','R3','${ENG}'),
+  ('${TEN}','${CFDUAL}','R4','${ENG}');
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${CFR4}' AND role='R4' AND engagement_id='${ENG}' AND revoked_at IS NULL")
+[ "${n}" = "1" ] && ok "0042 前置：CFR4 持有**案件層** R4" || ng "0042 前置：CFR4 角色數 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${CFT4}' AND role='R4' AND engagement_id IS NULL AND revoked_at IS NULL")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${CFT4}' AND engagement_id='${ENG}'")
+[ "${n}" = "1" ] && [ "${m}" = "0" ] \
+  && ok "0042 前置：CFT4 持有租戶層 R4、且本案件無任何指派（角色種類正確、作用域錯誤）" \
+  || ng "0042 前置：CFT4 租戶層 ${n}／案件層 ${m}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${JIA}' AND role='R2' AND engagement_id='${ENG}' AND revoked_at IS NULL")
+[ "${n}" = "1" ] && ok "0042 前置：甲持有案件層 R2（非 R4 的反例是角色種類不符，不是沒有指派）" \
+  || ng "0042 前置：甲 R2 數 ${n}"
+
+# ══ 1　分類集合：R4、集合為批准單位、批准時的兩項最低要求 ══════════
+SERA=c0420000-0000-0000-0000-000000000301
+SETA=$(PSQL_C <<<"${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','CF 分類集合 A','${SERA}',1,NULL,'${CFR4}')" 2>/dev/null)
+[ -n "${SETA}" ] && ok "0042：R4 可經函式建立分類集合" || ng "0042：分類集合建立失敗"
+expect_err "0042：非 R4（甲，案件層 R2）不得建立分類集合" \
+  "${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','x','c0420000-0000-0000-0000-000000000399',1,NULL,'${JIA}')" \
+  "ACTOR_ROLE_NOT_HELD"
+expect_err "0042：租戶層 R4 不得建立分類集合（§26.3 作用域嚴格相等）" \
+  "${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','x','c0420000-0000-0000-0000-000000000398',1,NULL,'${CFT4}')" \
+  "ACTOR_ROLE_NOT_HELD"
+expect_err "0042：跨租戶脈絡不得建立分類集合" \
+  "${T2} SELECT fn_cf_class_set_create('${TEN}','${ENG}','x','c0420000-0000-0000-0000-000000000397',1,NULL,'${CFR4}')" \
+  "CROSS_TENANT_DENIED"
+
+expect_err "0042：空集合不得批准（沒有 FX_EFFECT_ON_CASH 控制項）" \
+  "${T1} SELECT fn_cf_class_set_approve('${SETA}','${CFR4}')" "CFS_CLASS_SET_FX_EFFECT_REQUIRED"
+CLSA=$(PSQL_C <<<"${T1} SELECT fn_cf_class_add('${SETA}','OP-01','銷售收現','ACTIVITY','OPERATING','INFLOW',true,'${CFR4}')" 2>/dev/null)
+[ -n "${CLSA}" ] && ok "0042：R4 可加入 ACTIVITY 分類" || ng "0042：分類建立失敗"
+expect_err "0042：只有活動分類仍不得批准（K2 沒有檢查項）" \
+  "${T1} SELECT fn_cf_class_set_approve('${SETA}','${CFR4}')" "CFS_CLASS_SET_FX_EFFECT_REQUIRED"
+CLSF=$(PSQL_C <<<"${T1} SELECT fn_cf_class_add('${SETA}','FXE','匯率變動對現金的影響','FX_EFFECT_ON_CASH',NULL,'EITHER',true,'${CFR4}')" 2>/dev/null)
+[ -n "${CLSF}" ] && ok "0042：R4 可加入 FX_EFFECT_ON_CASH 控制項" || ng "0042：控制項建立失敗"
+expect_err "0042：沒有現金科目範圍的分類集合不得批准（K1／K2 沒有計算對象）" \
+  "${T1} SELECT fn_cf_class_set_approve('${SETA}','${CFR4}')" "CFS_CLASS_SET_NO_CASH_ACCOUNT"
+expect_err "0042：現金科目必須屬本案件的科目表" \
+  "${T1} SELECT fn_cf_cash_account_add('${SETA}','${ACC99}','CASH','${CFR4}')" "§24.1A"
+expect_ok  "0042：R4 加入本案件科目為現金範圍" \
+  "${T1} SELECT fn_cf_cash_account_add('${SETA}','${ACC1}','CASH','${CFR4}')"
+CLSF2=$(PSQL_C <<<"${T1} SELECT fn_cf_class_add('${SETA}','FXE2','第二個控制項','FX_EFFECT_ON_CASH',NULL,'EITHER',false,'${CFR4}')" 2>/dev/null)
+[ -n "${CLSF2}" ] && ok "0042 前置：集合內已有兩個 FX_EFFECT_ON_CASH" || ng "0042 前置：第二個控制項建立失敗"
+expect_err "0042：超過一個 FX_EFFECT_ON_CASH → 批准被拒" \
+  "${T1} SELECT fn_cf_class_set_approve('${SETA}','${CFR4}')" "CFS_CLASS_SET_FX_EFFECT_REQUIRED"
+expect_ok  "0042：未批准的集合可移除多餘控制項" \
+  "${T1} DELETE FROM cash_flow_class WHERE cash_flow_class_id='${CLSF2}'"
+expect_ok  "0042：恰一個控制項＋至少一筆現金科目 → R4 批准通過" \
+  "${T1} SELECT fn_cf_class_set_approve('${SETA}','${CFR4}')"
+expect_err "0042：已批准集合不得重複批准" \
+  "${T1} SELECT fn_cf_class_set_approve('${SETA}','${CFR4}')" "CFS_ALREADY_APPROVED"
+expect_err "0042：已批准集合不得單獨新增分類（集合是批准單位）" \
+  "${T1} SELECT fn_cf_class_add('${SETA}','OP-02','事後追加','ACTIVITY','OPERATING','INFLOW',true,'${CFR4}')" \
+  "CFS_CLASS_SET_IMMUTABLE"
+expect_err "0042：已批准集合不得單獨新增現金科目" \
+  "${T1} SELECT fn_cf_cash_account_add('${SETA}','${ACC2}','CASH_EQUIVALENT','${CFR4}')" \
+  "CFS_CLASS_SET_IMMUTABLE"
+expect_err "0042：已批准集合不可變更（改口徑須發新集合版本）" \
+  "${T1} UPDATE cash_flow_class_set_version SET label='改名' WHERE class_set_version_id='${SETA}'" \
+  "CFS_CLASS_SET_IMMUTABLE"
+
+# ── 版本鏈：同 series、緊接前一版、不得分叉 ──
+expect_err "0042：新版本不得跳號（v1 → v3）" \
+  "${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','A v3','${SERA}',3,'${SETA}','${CFR4}')" \
+  "CFS_CHAIN_VERSION_GAP"
+expect_err "0042：取代的對象必須屬同一版本序列" \
+  "${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','別的序列','c0420000-0000-0000-0000-000000000302',2,'${SETA}','${CFR4}')" \
+  "CFS_CHAIN_SERIES_MISMATCH"
+SETA2=$(PSQL_C <<<"${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','A v2','${SERA}',2,'${SETA}','${CFR4}')" 2>/dev/null)
+[ -n "${SETA2}" ] && ok "0042：v2 緊接 v1 且同 series → 接受" || ng "0042：v2 建立失敗"
+expect_err "0042：同一舊版不得分叉出兩個現行版本" \
+  "${T1} SELECT fn_cf_class_set_create('${TEN}','${ENG}','A v2 分叉','${SERA}',2,'${SETA}','${CFR4}')" \
+  "duplicate key"
+
+# ══ 2　政策版本：R4、引用已批准集合、批准後不可變 ══════════════════
+SERP=c0420000-0000-0000-0000-000000000311
+expect_err "0042：非 R4 不得建立政策版本（方法與粒度是母公司的決定）" \
+  "${T1} SELECT fn_cf_policy_create('${TEN}','${ENG}','${UNIT}','DIRECT','BALANCE','${SETA}','確認函 v1','${SERP}',1,NULL,'${JIA}')" \
+  "ACTOR_ROLE_NOT_HELD"
+POLA=$(PSQL_C <<<"${T1} SELECT fn_cf_policy_create('${TEN}','${ENG}','${UNIT}','DIRECT','BALANCE','${SETA}','母公司確認函 v1','${SERP}',1,NULL,'${CFR4}')" 2>/dev/null)
+[ -n "${POLA}" ] && ok "0042：R4 可經函式建立政策版本" || ng "0042：政策建立失敗"
+expect_err "0042：政策的分類集合必須屬本案件（父鏈最後防線）" \
+  "${T1} INSERT INTO cash_flow_policy_version (tenant_id, engagement_id, reporting_unit_id,
+        method, required_granularity, class_set_version_id, evidence_version, series_id,
+        version_no, created_by)
+   VALUES ('${TEN}','${ENG99}','${UNIT}','DIRECT','BALANCE','${SETA}','x',
+           'c0420000-0000-0000-0000-000000000391',1,'${CFR4}')" "§24.1A"
+# 未批准集合的政策：批准時必須被擋（SETA2 是尚未批准的 v2）
+POLB=$(PSQL_C <<<"${T1} SELECT fn_cf_policy_create('${TEN}','${ENG}','${UNIT}','INDIRECT','BALANCE','${SETA2}','確認函 v2','c0420000-0000-0000-0000-000000000312',1,NULL,'${CFR4}')" 2>/dev/null)
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_class_set_version
+     WHERE class_set_version_id='${SETA2}' AND approved_at IS NULL")
+[ -n "${POLB}" ] && [ "${n}" = "1" ] \
+  && ok "0042 前置：政策 B 已建立且其分類集合尚未批准" || ng "0042 前置：政策 B／集合狀態不符"
+expect_err "0042：政策引用的分類集合未批准 → 不得批准政策" \
+  "${T1} SELECT fn_cf_policy_approve('${POLB}','${CFR4}')" "CFS_CLASS_SET_NOT_APPROVED"
+expect_err "0042：非 R4 不得批准政策版本" \
+  "${T1} SELECT fn_cf_policy_approve('${POLA}','${CFR3}')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0042：R4 批准政策版本" "${T1} SELECT fn_cf_policy_approve('${POLA}','${CFR4}')"
+expect_err "0042：已批准政策不得重複批准" \
+  "${T1} SELECT fn_cf_policy_approve('${POLA}','${CFR4}')" "CFS_ALREADY_APPROVED"
+expect_err "0042：已批准政策不可變更（改方法或粒度須發新版本）" \
+  "${T1} UPDATE cash_flow_policy_version SET method='INDIRECT' WHERE policy_version_id='${POLA}'" \
+  "CFS_POLICY_IMMUTABLE"
+
+# ══ 3　映射：R2 建立 → R3 覆核 → R4 批准 ═══════════════════════════
+SERM=c0420000-0000-0000-0000-000000000321
+expect_err "0042：非 R2 不得建立映射版本" \
+  "${T1} SELECT fn_cf_mapping_create('${TEN}','${ENG}','${POLA}','${SERM}',1,NULL,'${CFR4}')" \
+  "ACTOR_ROLE_NOT_HELD"
+MAPA=$(PSQL_C <<<"${T1} SELECT fn_cf_mapping_create('${TEN}','${ENG}','${POLA}','${SERM}',1,NULL,'${JIA}')" 2>/dev/null)
+[ -n "${MAPA}" ] && ok "0042：R2 可經函式建立映射版本" || ng "0042：映射版本建立失敗"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_class
+     WHERE cash_flow_class_id='${CFCLS}' AND class_set_version_id='${CFSET}'")
+[ "${n}" = "1" ] && ok "0042 前置：CFCLS 屬另一個分類集合（不是政策 A 綁定的那一份）" \
+  || ng "0042 前置：CFCLS 歸屬不符"
+expect_err "0042：映射規則的分類必須屬政策所綁定的集合" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','ACCOUNT','${ACC1}',NULL,NULL,'${CFCLS}',NULL,NULL,'e','${JIA}')" \
+  "CFS_MAPPING_CLASS_NOT_IN_SET"
+expect_ok  "0042：R2 加入 ACCOUNT 規則（2026-01-01～2026-06-30）" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','ACCOUNT','${ACC1}',NULL,NULL,'${CLSA}','2026-01-01','2026-06-30','e1','${JIA}')"
+expect_err "0042：同一來源同一生效期間重疊 → CFS_MAPPING_AMBIGUOUS" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','ACCOUNT','${ACC1}',NULL,NULL,'${CLSA}','2026-06-01','2026-12-31','e2','${JIA}')" \
+  "CFS_MAPPING_AMBIGUOUS"
+expect_ok  "0042：相鄰不重疊的生效期間 → 接受" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','ACCOUNT','${ACC1}',NULL,NULL,'${CLSA}','2026-07-01','2026-12-31','e3','${JIA}')"
+expect_err "0042：無界規則與既有規則重疊 → CFS_MAPPING_AMBIGUOUS" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','ACCOUNT','${ACC1}',NULL,NULL,'${CLSA}',NULL,NULL,'e4','${JIA}')" \
+  "CFS_MAPPING_AMBIGUOUS"
+SLL2=$(PSQL_C <<<"${T1} SELECT source_ledger_line_id FROM source_ledger_line ORDER BY source_ledger_line_id LIMIT 1")
+[ -n "${SLL2}" ] && ok "0042 前置：本租戶存在來源列（JOURNAL_LINE 規則的引用對象）" \
+  || ng "0042 前置：找不到來源列"
+expect_ok  "0042 靜態粒度：政策只要 BALANCE 而規則到 JOURNAL_LINE → 接受（更細不是錯）" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','JOURNAL_LINE',NULL,${SLL2},NULL,'${CLSA}',NULL,NULL,'e5','${JIA}')"
+
+# 政策要求 JOURNAL 時，只有 ACCOUNT 層映射不算完整（靜態判定，唯一實作）
+SERPJ=c0420000-0000-0000-0000-000000000313
+POLJ=$(PSQL_C <<<"${T1} SELECT fn_cf_policy_create('${TEN}','${ENG}','${UNIT}','DIRECT','JOURNAL','${SETA}','確認函 J','${SERPJ}',1,NULL,'${CFR4}')" 2>/dev/null)
+MAPJ=$(PSQL_C <<<"${T1} SELECT fn_cf_mapping_create('${TEN}','${ENG}','${POLJ}','c0420000-0000-0000-0000-000000000322',1,NULL,'${JIA}')" 2>/dev/null)
+n=$(PSQL_C <<<"${T1} SELECT required_granularity FROM cash_flow_policy_version WHERE policy_version_id='${POLJ}'")
+[ "${n}" = "JOURNAL" ] && ok "0042 前置：政策 J 要求 JOURNAL 粒度" || ng "0042 前置：政策 J 粒度為 ${n}"
+expect_err "0042 靜態粒度：政策要 JOURNAL 而規則只到 ACCOUNT → 拒絕" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPJ}','ACCOUNT','${ACC1}',NULL,NULL,'${CLSA}',NULL,NULL,'ej','${JIA}')" \
+  "CFS_MAPPING_GRANULARITY_INSUFFICIENT"
+
+expect_err "0042：非 R3 不得覆核映射版本" \
+  "${T1} SELECT fn_cf_mapping_review('${MAPA}','${JIA}')" "ACTOR_ROLE_NOT_HELD"
+expect_err "0042：未經 R3 覆核不得批准映射版本" \
+  "${T1} SELECT fn_cf_mapping_approve('${MAPA}','${CFR4}')" "CFS_MAPPING_NOT_REVIEWED"
+expect_err "0042：沒有任何規則的映射版本不得覆核" \
+  "${T1} SELECT fn_cf_mapping_review('${MAPJ}','${CFR3}')" "CFS_MAPPING_EMPTY"
+expect_ok  "0042：R3 覆核映射版本" "${T1} SELECT fn_cf_mapping_review('${MAPA}','${CFR3}')"
+expect_err "0042：已覆核不得重複覆核" \
+  "${T1} SELECT fn_cf_mapping_review('${MAPA}','${CFR3}')" "CFS_MAPPING_ALREADY_REVIEWED"
+expect_err "0042：覆核後不得再增修規則（否則覆核的不是被批准的那一份）" \
+  "${T1} SELECT fn_cf_mapping_rule_add('${MAPA}','ACCOUNT','${ACC2}',NULL,NULL,'${CLSA}',NULL,NULL,'e6','${JIA}')" \
+  "CFS_MAPPING_LOCKED"
+
+# SoD：建立者不得批准自己建立的版本（自然人判定）
+MAPD=$(PSQL_C <<<"${T1} SELECT fn_cf_mapping_create('${TEN}','${ENG}','${POLA}','c0420000-0000-0000-0000-000000000323',1,NULL,'${CFDUAL}')" 2>/dev/null)
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+SELECT fn_cf_mapping_rule_add('${MAPD}','ACCOUNT','${ACC2}',NULL,NULL,'${CLSA}',NULL,NULL,'d1','${CFDUAL}');
+SELECT fn_cf_mapping_review('${MAPD}','${CFR3}');
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment WHERE user_id='${CFDUAL}'
+     AND role='R4' AND engagement_id='${ENG}' AND revoked_at IS NULL")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_mapping_version
+     WHERE mapping_version_id='${MAPD}' AND reviewed_at IS NOT NULL AND created_by='${CFDUAL}'")
+[ "${n}" = "1" ] && [ "${m}" = "1" ] \
+  && ok "0042 前置：兼任者持有案件層 R4，且該版本由他建立、已完成 R3 覆核" \
+  || ng "0042 前置：兼任者 R4=${n}／版本狀態=${m}"
+expect_err "0042 SoD：映射建立者不得批准自己建立的版本（角色齊備，只差不是同一人）" \
+  "${T1} SELECT fn_cf_mapping_approve('${MAPD}','${CFDUAL}')" "SOD"
+expect_ok  "0042：R4（非建立者）批准映射版本" \
+  "${T1} SELECT fn_cf_mapping_approve('${MAPA}','${CFR4}')"
+expect_err "0042：已批准的映射版本不得重複批准" \
+  "${T1} SELECT fn_cf_mapping_approve('${MAPA}','${CFR4}')" "CFS_ALREADY_APPROVED"
+expect_err "0042：已批准的映射版本不可變更" \
+  "${T1} UPDATE cash_flow_mapping_version SET content_hash='x' WHERE mapping_version_id='${MAPA}'" \
+  "CFS_MAPPING_IMMUTABLE"
+
+# ══ 4　粒度例外：R2 申請、R4 批准、逐分類 ══════════════════════════
+EXCA=$(PSQL_C <<<"${T1} SELECT fn_cf_coverage_exception_create('${PR}','${UNIT}','${POLA}','${CLSA}','BALANCE','拿不到分錄層資料','底稿 E1','${JIA}')" 2>/dev/null)
+[ -n "${EXCA}" ] && ok "0042：R2 可申請逐分類的粒度例外" || ng "0042：例外申請失敗"
+expect_err "0042：例外的分類必須屬政策所綁定的集合" \
+  "${T1} SELECT fn_cf_coverage_exception_create('${PR}','${UNIT}','${POLA}','${CFCLS}','BALANCE','r','e','${JIA}')" \
+  "CFS_EXCEPTION_CLASS_NOT_IN_SET"
+expect_err "0042：未批准的粒度例外不得成為覆蓋結論" \
+  "${T1} SELECT fn_cf_coverage_exception_record('${EXCA}','${JIA}')" "CFS_EXCEPTION_NOT_APPROVED"
+expect_err "0042：非 R4 不得批准粒度例外" \
+  "${T1} SELECT fn_cf_coverage_exception_approve('${EXCA}','${JIA}')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0042：R4 批准粒度例外" "${T1} SELECT fn_cf_coverage_exception_approve('${EXCA}','${CFR4}')"
+expect_err "0042：已批准的粒度例外不可變更" \
+  "${T1} UPDATE cash_flow_coverage_exception SET reason='改' WHERE exception_id='${EXCA}'" \
+  "CFS_EXCEPTION_IMMUTABLE"
+expect_ok  "0042：已批准的例外可落成該期該分類的覆蓋結論" \
+  "${T1} SELECT fn_cf_coverage_exception_record('${EXCA}','${JIA}')"
+
+# ══ 5　覆蓋結論的父鏈 ══════════════════════════════════════════════
+expect_err "0042：DATA_PRESENT 不得人工宣告（只能由系統依已映射的來源事實衍生）" \
+  "${T1} INSERT INTO cash_flow_class_period_coverage (tenant_id, period_revision_id,
+        reporting_unit_id, policy_version_id, cash_flow_class_id, status)
+   VALUES ('${TEN}','${PR}','${UNIT}','${POLA}','${CLSF}','DATA_PRESENT')" \
+  "CFS_DATA_PRESENT_NOT_IMPLEMENTED"
+expect_err "0042：覆蓋結論的分類必須屬政策所綁定的集合" \
+  "${T1} INSERT INTO cash_flow_class_period_coverage (tenant_id, period_revision_id,
+        reporting_unit_id, policy_version_id, cash_flow_class_id, status, coverage_exception_id)
+   VALUES ('${TEN}','${PR}','${UNIT}','${POLA}','${CFCLS}','COVERAGE_EXCEPTION','${EXCA}')" \
+  "CFS_CLASS_NOT_IN_SET"
+expect_err "0042：覆蓋結論的報告單位必須與政策一致" \
+  "${T1} INSERT INTO cash_flow_class_period_coverage (tenant_id, period_revision_id,
+        reporting_unit_id, policy_version_id, cash_flow_class_id, status, coverage_exception_id)
+   VALUES ('${TEN}','${GRP_PR}','${GRP_UNIT}','${POLA}','${CLSF}','COVERAGE_EXCEPTION','${EXCA}')" \
+  "§24.1A"
+expect_err "0042：覆蓋結論引用的例外必須是同期同分類" \
+  "${T1} INSERT INTO cash_flow_class_period_coverage (tenant_id, period_revision_id,
+        reporting_unit_id, policy_version_id, cash_flow_class_id, status, coverage_exception_id)
+   VALUES ('${TEN}','${PR}','${UNIT}','${POLA}','${CLSF}','COVERAGE_EXCEPTION','${EXCA}')" \
+  "CFS_EXCEPTION_SCOPE_MISMATCH"
+
+# ══ 6　零活動：R2 確認 → R3 覆核（Coverage 仍只有三種完成語意）══════
+expect_err "0042：非 R2 不得確認零活動" \
+  "${T1} SELECT fn_cf_zero_activity_confirm('${PR}','${UNIT}','${POLA}','${CLSF}','同幣別本期為零','底稿 Z1','${CFR4}')" \
+  "ACTOR_ROLE_NOT_HELD"
+expect_err "0042：未批准的政策版本不得作為零活動確認的依據" \
+  "${T1} SELECT fn_cf_zero_activity_confirm('${PR}','${UNIT}','${POLB}','${CLSA}','x','e','${JIA}')" \
+  "CFS_POLICY_NOT_APPROVED"
+ATT=$(PSQL_C <<<"${T1} SELECT fn_cf_zero_activity_confirm('${PR}','${UNIT}','${POLA}','${CLSF}','同幣別本期為零','底稿 Z1','${JIA}')" 2>/dev/null)
+n=$(PSQL_C <<<"${T1} SELECT status FROM cash_flow_zero_activity_attestation WHERE attestation_id='${ATT}'")
+[ "${n}" = "PENDING_REVIEW" ] && ok "0042：R2 確認產生 PENDING_REVIEW 的零活動見證" \
+  || ng "0042：見證狀態為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_class_period_coverage
+     WHERE period_revision_id='${PR}' AND cash_flow_class_id='${CLSF}' AND policy_version_id='${POLA}'")
+[ "${n}" = "0" ] && ok "0042：只有 R2 確認時**尚未**產生覆蓋結論（雙人流程未完成）" \
+  || ng "0042：覆蓋結論提前出現 ${n} 筆"
+expect_err "0042：非 R3 不得覆核零活動見證" \
+  "${T1} SELECT fn_cf_zero_activity_review('${ATT}','${JIA}')" "ACTOR_ROLE_NOT_HELD"
+expect_ok  "0042：R3 覆核零活動見證" "${T1} SELECT fn_cf_zero_activity_review('${ATT}','${CFR3}')"
+n=$(PSQL_C <<<"${T1} SELECT status FROM cash_flow_class_period_coverage
+     WHERE period_revision_id='${PR}' AND cash_flow_class_id='${CLSF}' AND policy_version_id='${POLA}'")
+[ "${n}" = "ZERO_ACTIVITY_CONFIRMED" ] \
+  && ok "0042：R3 覆核於同一交易產生 ZERO_ACTIVITY_CONFIRMED 的覆蓋結論" \
+  || ng "0042：覆蓋結論狀態為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT confirmed_by='${JIA}' AND reviewed_by='${CFR3}'
+     FROM cash_flow_class_period_coverage WHERE period_revision_id='${PR}'
+       AND cash_flow_class_id='${CLSF}' AND policy_version_id='${POLA}'")
+[ "${n}" = "t" ] && ok "0042：確認人（R2）與覆核人（R3）分開保存於覆蓋結論" \
+  || ng "0042：確認人／覆核人不符（${n}）"
+expect_err "0042：已覆核的零活動見證不得重複覆核" \
+  "${T1} SELECT fn_cf_zero_activity_review('${ATT}','${CFR3}')" "CFS_ZERO_ACTIVITY_ALREADY_REVIEWED"
+expect_err "0042：已覆核的零活動見證不可變更" \
+  "${T1} UPDATE cash_flow_zero_activity_attestation SET reason='改' WHERE attestation_id='${ATT}'" \
+  "CFS_ZERO_ACTIVITY_IMMUTABLE"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM pg_constraint
+     WHERE conrelid='cash_flow_class_period_coverage'::regclass AND contype='c'
+       AND pg_get_constraintdef(oid) LIKE '%ZERO_ACTIVITY_PENDING%'")
+[ "${n}" = "0" ] && ok "0042：Coverage 仍只有三種完成語意（未新增中間狀態）" \
+  || ng "0042：Coverage 出現中間狀態 ${n} 條"
+
+# ══ 7　首期期初證據集合 ════════════════════════════════════════════
+SERO=c0420000-0000-0000-0000-000000000331
+expect_err "0042：非 R4 不得建立期初證據集合" \
+  "${T1} SELECT fn_cf_opening_set_create('${TEN}','${ENG}','${UNIT}','${PR}','${SERO}',1,NULL,'期初證據','${JIA}')" \
+  "ACTOR_ROLE_NOT_HELD"
+OPS=$(PSQL_C <<<"${T1} SELECT fn_cf_opening_set_create('${TEN}','${ENG}','${UNIT}','${PR}','${SERO}',1,NULL,'母公司期初證據 v1','${CFR4}')" 2>/dev/null)
+[ -n "${OPS}" ] && ok "0042：R4 可建立期初證據集合" || ng "0042：期初集合建立失敗"
+expect_err "0042：空的期初證據集合不得批准（證明不了沒有漏掉現金科目）" \
+  "${T1} SELECT fn_cf_opening_set_approve('${OPS}','${CFR4}')" "CFS_OPENING_SET_EMPTY"
+expect_err "0042：期初明細的科目必須屬本案件" \
+  "${T1} SELECT fn_cf_opening_line_add('${OPS}','${ACC99}',100,'JPY',NULL,NULL,'${CFR4}')" "§24.1A"
+expect_ok  "0042：R4 加入期初明細" \
+  "${T1} SELECT fn_cf_opening_line_add('${OPS}','${ACC1}',5000000,'JPY',NULL,NULL,'${CFR4}')"
+expect_ok  "0042：R4 批准期初證據集合" "${T1} SELECT fn_cf_opening_set_approve('${OPS}','${CFR4}')"
+expect_err "0042：已批准的期初證據集合不得再加明細" \
+  "${T1} SELECT fn_cf_opening_line_add('${OPS}','${ACC2}',1,'JPY',NULL,NULL,'${CFR4}')" \
+  "CFS_OPENING_SET_IMMUTABLE"
+
+# ══ 8　來源選定：FX 對齊、顯式前期、首期證據 ═══════════════════════
+# 本期的 NO_FX 來源 run（已完成）、一個仍在執行的 run、一個未經選定的折算 run
+RUN_OK=c0450000-0000-0000-0000-000000000101
+RUN_RUNNING=c0450000-0000-0000-0000-000000000102
+RUN_FX=c0450000-0000-0000-0000-000000000103
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by) VALUES
+  ('c0440000-0000-0000-0000-000000000101','${TEN}','${ENG}','${PR}','NO_FX','sqlcanon-2','k1','${JIA}'),
+  ('c0440000-0000-0000-0000-000000000102','${TEN}','${ENG}','${PR}','NO_FX','sqlcanon-2','k2','${JIA}'),
+  ('c0440000-0000-0000-0000-000000000103','${TEN}','${ENG}','${PR}','FX_TRANSLATION','sqlcanon-2','k3','${JIA}');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by) VALUES
+  ('${RUN_OK}','${TEN}','${ENG}','${PR}','${B1}','c0440000-0000-0000-0000-000000000101','PREVIEW',
+   'RUNNING',gen_random_uuid(),'h1','1.0.0','${JIA}'),
+  ('${RUN_RUNNING}','${TEN}','${ENG}','${PR}','${B1}','c0440000-0000-0000-0000-000000000102','PREVIEW',
+   'RUNNING',gen_random_uuid(),'h2','1.0.0','${JIA}'),
+  ('${RUN_FX}','${TEN}','${ENG}','${PR}','${B1}','c0440000-0000-0000-0000-000000000103','PREVIEW',
+   'RUNNING',gen_random_uuid(),'h3','1.0.0','${JIA}');
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='r1'
+ WHERE calculation_run_id IN ('${RUN_OK}','${RUN_FX}');
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run
+     WHERE calculation_run_id IN ('${RUN_OK}','${RUN_FX}') AND status='COMPLETED'")
+[ "${n}" = "2" ] && ok "0042 前置：本期已有兩個 COMPLETED run（NO_FX 與 FX_TRANSLATION）" \
+  || ng "0042 前置：COMPLETED run 數為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM reporting_period rp JOIN period_revision pr
+       ON pr.reporting_period_id = rp.reporting_period_id
+     WHERE pr.period_revision_id='${PR}' AND rp.previous_reporting_period_id IS NULL")
+[ "${n}" = "1" ] && ok "0042 前置：本期是首期（沒有顯式前期）" || ng "0042 前置：首期判定為 ${n}"
+
+expect_err "0042：非 R4 不得選定本期的權威來源" \
+  "${T1} SELECT fn_cf_select_source('${PR}','${RUN_OK}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS}','${JIA}')" \
+  "ACTOR_ROLE_NOT_HELD"
+expect_err "0042：首期不得使用 PRIOR_SELECTED_RUN" \
+  "${T1} SELECT fn_cf_select_source('${PR}','${RUN_OK}','PRIOR_SELECTED_RUN','${RUN_OK}',NULL,'${CFR4}')" \
+  "CFS_OPENING_SOURCE_INVALID"
+expect_err "0042：尚未完成的 run 不得作為本期來源" \
+  "${T1} SELECT fn_cf_select_source('${PR}','${RUN_RUNNING}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS}','${CFR4}')" \
+  "CFS_SOURCE_RUN_NOT_COMPLETED"
+# 本期的折算結果選定狀態依執行模式而異（聚合時 fx 套件已選定，單跑時為空）。
+# 兩種狀態都必須擋下同一件事——先斷言實際狀態，再驗對應的拒絕理由，
+# 否則就是「以錯誤理由通過」。
+FXSEL=$(PSQL_C <<<"${T1} SELECT COALESCE(fn_current_fx_run_selection('${PR}')::text,'')")
+if [ -z "${FXSEL}" ]; then
+  ok "0042 前置：本期尚未選定折算結果（驗未選定分支）"; FXEXP="CFS_FX_RUN_NOT_SELECTED"
+else
+  n=$(PSQL_C <<<"${T1} SELECT selected_run_id<>'${RUN_FX}' FROM period_fx_run_selection
+       WHERE run_selection_id='${FXSEL}'")
+  [ "${n}" = "t" ] && ok "0042 前置：本期已選定的折算結果不是本測試的 run（驗不一致分支）" \
+    || ng "0042 前置：折算結果選定狀態不符（${n}）"
+  FXEXP="CFS_FX_SELECTION_MISMATCH"
+fi
+expect_err "0042：折算 run 必須與現行 PeriodFxRunSelection 一致（兩個選定不得各說各話）" \
+  "${T1} SELECT fn_cf_select_source('${PR}','${RUN_FX}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS}','${CFR4}')" \
+  "${FXEXP}"
+OPS2=$(PSQL_C <<<"${T1} SELECT fn_cf_opening_set_create('${TEN}','${ENG}','${UNIT}','${PR}','c0420000-0000-0000-0000-000000000332',1,NULL,'未批准的期初證據','${CFR4}')" 2>/dev/null)
+expect_err "0042：未批准的期初證據集合不得使用" \
+  "${T1} SELECT fn_cf_select_source('${PR}','${RUN_OK}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS2}','${CFR4}')" \
+  "CFS_OPENING_EVIDENCE_NOT_APPROVED"
+SEL1=$(PSQL_C <<<"${T1} SELECT fn_cf_select_source('${PR}','${RUN_OK}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS}','${CFR4}')" 2>/dev/null)
+[ -n "${SEL1}" ] && ok "0042：R4 以首期期初證據選定本期權威來源" || ng "0042：來源選定失敗"
+expect_err "0042：選定建立後不可 UPDATE（換選擇請發新版本）" \
+  "${T1} UPDATE period_cash_flow_source_selection SET current_run_id='${RUN_FX}' WHERE cf_selection_id='${SEL1}'" \
+  "CFS_SELECTION_IMMUTABLE"
+SEL2=$(PSQL_C <<<"${T1} SELECT fn_cf_select_source('${PR}','${RUN_OK}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS}','${CFR4}')" 2>/dev/null)
+n=$(PSQL_C <<<"${T1} SELECT version_no FROM period_cash_flow_source_selection WHERE cf_selection_id='${SEL2}'")
+m=$(PSQL_C <<<"${T1} SELECT supersedes_selection_id='${SEL1}' FROM period_cash_flow_source_selection WHERE cf_selection_id='${SEL2}'")
+[ "${n}" = "2" ] && [ "${m}" = "t" ] && ok "0042：改選發 v2 並向後指向 v1（取代鏈，不按時間）" \
+  || ng "0042：v2 版本號 ${n}／取代指向 ${m}"
+n=$(PSQL_C <<<"${T1} SELECT fn_current_cf_source_selection('${PR}')='${SEL2}'")
+[ "${n}" = "t" ] && ok "0042：現行選定由取代鏈判斷（未被任何後版指向者）" || ng "0042：現行選定不是 v2"
+
+# ── 非首期：顯式前期的已選定結果 ──
+RP2=dddddddd-0000-0000-0000-000000000011
+PR2=99999999-0000-0000-0000-000000000011
+B_P2=00000000-0000-0000-0000-0000000000c2
+RUN_P2=c0450000-0000-0000-0000-000000000111
+RUN_P2FX=c0450000-0000-0000-0000-000000000112
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id,
+        fiscal_calendar_id, label, start_date, end_date, previous_reporting_period_id)
+VALUES ('${RP2}','${TEN}','${ENG}','${UNIT}','${CAL}','2026-04','2026-04-01','2026-04-30',
+        'dddddddd-0000-0000-0000-000000000001');
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id)
+VALUES ('${PR2}','${TEN}','${RP2}');
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by)
+VALUES ('${B_P2}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR2}','${JIA}','${JIA}');
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by) VALUES
+  ('c0440000-0000-0000-0000-000000000111','${TEN}','${ENG}','${PR2}','NO_FX','sqlcanon-2','k4','${JIA}'),
+  ('c0440000-0000-0000-0000-000000000112','${TEN}','${ENG}','${PR2}','FX_TRANSLATION','sqlcanon-2','k5','${JIA}');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by) VALUES
+  ('${RUN_P2}','${TEN}','${ENG}','${PR2}','${B_P2}','c0440000-0000-0000-0000-000000000111',
+   'PREVIEW','RUNNING',gen_random_uuid(),'h4','1.0.0','${JIA}'),
+  ('${RUN_P2FX}','${TEN}','${ENG}','${PR2}','${B_P2}','c0440000-0000-0000-0000-000000000112',
+   'PREVIEW','RUNNING',gen_random_uuid(),'h5','1.0.0','${JIA}');
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='r2'
+ WHERE calculation_run_id IN ('${RUN_P2}','${RUN_P2FX}');
+SQL
+n=$(PSQL_C <<<"${T1} SELECT previous_reporting_period_id='dddddddd-0000-0000-0000-000000000001'
+     FROM reporting_period WHERE reporting_period_id='${RP2}'")
+[ "${n}" = "t" ] && ok "0042 前置：第二期有顯式前期連結" || ng "0042 前置：前期連結為 ${n}"
+expect_err "0042：非首期不得使用首期期初證據" \
+  "${T1} SELECT fn_cf_select_source('${PR2}','${RUN_P2}','FIRST_PERIOD_EVIDENCE',NULL,'${OPS}','${CFR4}')" \
+  "CFS_OPENING_SOURCE_INVALID"
+expect_err "0042：期初 run 必須是顯式前期的**已選定**結果（不是前期最新的 COMPLETED run）" \
+  "${T1} SELECT fn_cf_select_source('${PR2}','${RUN_P2}','PRIOR_SELECTED_RUN','${RUN_FX}',NULL,'${CFR4}')" \
+  "CFS_PRIOR_RUN_NOT_SELECTED"
+# 第二期由本檔自建，兩種模式下都不會有折算結果選定——未選定分支因此是確定的
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM period_fx_run_selection WHERE period_revision_id='${PR2}'")
+[ "${n}" = "0" ] && ok "0042 前置：第二期尚未選定折算結果" || ng "0042 前置：第二期已有 ${n} 筆折算選定"
+expect_err "0042：折算 run 未經 PeriodFxRunSelection 選定 → 不得逕行作為現金流來源" \
+  "${T1} SELECT fn_cf_select_source('${PR2}','${RUN_P2FX}','PRIOR_SELECTED_RUN','${RUN_OK}',NULL,'${CFR4}')" \
+  "CFS_FX_RUN_NOT_SELECTED"
+expect_ok  "0042：期初 run 等於前期已選定結果 → 接受" \
+  "${T1} SELECT fn_cf_select_source('${PR2}','${RUN_P2}','PRIOR_SELECTED_RUN','${RUN_OK}',NULL,'${CFR4}')"
+
+# ══ 9　權限模板：函式是唯一寫入入口 ════════════════════════════════
+n=$(PSQL_C <<<"SELECT count(*) FROM information_schema.role_table_grants
+     WHERE grantee='app_runtime' AND privilege_type IN ('INSERT','UPDATE','DELETE')
+       AND table_name LIKE 'cash_flow%'")
+[ "${n}" = "0" ] && ok "0042：app_runtime 對現金流各表只有 SELECT（建立與批准只能經函式）" \
+  || ng "0042：app_runtime 仍有 ${n} 項寫入授權"
+n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+     WHERE ns.nspname='public' AND p.proname LIKE 'fn_cf%' AND p.prosecdef
+       AND NOT ('search_path=pg_catalog, public' = ANY(COALESCE(p.proconfig,ARRAY['']::text[])))")
+[ "${n}" = "0" ] && ok "0042：所有 SECURITY DEFINER 函式都固定 search_path" \
+  || ng "0042：${n} 支函式未固定 search_path"
+n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+     WHERE ns.nspname='public' AND p.proname LIKE 'fn_cf%' AND p.prosecdef
+       AND has_function_privilege('public', p.oid, 'EXECUTE')")
+[ "${n}" = "0" ] && ok "0042：SECURITY DEFINER 函式一律撤回 PUBLIC" \
+  || ng "0042：${n} 支函式仍對 PUBLIC 開放"
 
 [ "${STANDALONE:-0}" = "1" ] && summary
