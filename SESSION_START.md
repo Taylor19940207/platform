@@ -48,15 +48,17 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 `SLICE-M3-02 折算與 CTA`與 `SLICE-M3-03 折算調節核對與期間級 G-07`
 （皆 2026-08-12，CLOSED／PASS）亦已正式關閉**。
 現有 43 份 migration；完整實跑結果為 **1,321**（單元 66、DB 整合 819、端到端 436），
-最新一輪全綠（HEAD `6f2bf0a`）。
+最新一輪全綠（HEAD `a564ea5`，已 push）。
 
 **進行中：`SLICE-M3-04 現金流支持資料`的第一段、第二段 2a 與 2b 第一項已完成**。
 0039～0041 建立模型、結構守衛與用途封套；0042 完成十一張表的父鏈／版本鏈守衛、
 十九支 system-only 工作流函式、零活動的 R2 確認＋R3 覆核，以及映射的
 R2→R3→R4／SoD／重疊／靜態粒度控制；**0043 把現金流支持 run 的建立收斂成單一
 system-only 入口**（案件層 R2、多批次來源在同一交易內凍結、`FOR UPDATE` 使批次
-狀態變更不得穿過建立交易）。**下一步是 2b 第二項：Manifest 凍結、`fn_manifest_verify`
-與 replay**；不得回頭重做 2a／0043，也不得把後續畫面混進同一刀。
+狀態變更不得穿過建立交易；已複核通過並 push）。**下一步是 2b 第二刀 A：CFS Manifest
+的 system-only 凍結入口與 `fn_manifest_verify` 驗證**——結果雜湊與 replay 已改排到
+支持資料列那一刀（沒有真實輸出前重演等於拿 Manifest 雜湊冒充結果雜湊）。
+不得回頭重做 2a／0043，也不得把後續畫面混進同一刀。
 細節見 `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-04-PHASE1.md`。
 
 ## 🏁 里程碑 2 已完成（2026-08-10 離開複核通過）
@@ -167,8 +169,8 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
 - `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-03.md`（折算調節核對、
   兩支 readiness、0036～0038）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-04-PHASE1.md`（**最新接續入口**：
-  檔名保留以避免交接連結分岔；內容已更新至 0043／2b 第一項關閉，
-  下一步為 2b 第二項 Manifest 凍結與 replay）
+  檔名保留以避免交接連結分岔；內容已更新至 0043／2b 第一刀關閉，
+  下一步為 2b 第二刀 A：CFS Manifest system-only 凍結入口）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
