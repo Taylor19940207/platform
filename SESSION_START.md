@@ -125,7 +125,7 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis／fx／**cashflow** 各自單跑（自行重建 DB 並補齊前置） | 依領域實測 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 依本機實測 |
-| `pnpm test`（＝`test:full`） | 完整 1,377 條 | **依本機實測為準** |
+| `pnpm test`（＝`test:full`） | 完整 1,399 條 | **依本機實測為準** |
 | `pnpm test:acceptance:<suite>` | 十支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
