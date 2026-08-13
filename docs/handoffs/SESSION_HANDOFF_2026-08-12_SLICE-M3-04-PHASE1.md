@@ -1,21 +1,21 @@
 # SESSION HANDOFF　SLICE-M3-04 現金流支持資料（持續更新的唯一交接入口）
 
-> 檔名保留 `PHASE1` 是為了不讓既有連結失效；本檔內容已推進至 **Phase 2a 完成**。
+> 檔名保留 `PHASE1` 是為了不讓既有連結失效；本檔內容已推進至 **2b 第一刀完成**。
 > 後續 M3-04 換機交接持續更新本檔，不再為每一小段新增 handoff。
 
-基準：**HEAD `6ad2e82`**，已 push，工作區乾淨。
-完整測試 **1,261** 零失敗：單元 66 ／ DB 整合 759 ／ 端到端 436。
-**42 份 migration**（可從零重建）。
+基準：**HEAD `62700c6`**，工作區乾淨。
+完整測試 **1,317** 零失敗：單元 66 ／ DB 整合 815 ／ 端到端 436。
+**43 份 migration**（可從零重建）。
 
 **權威契約：`docs/slices/SLICE-M3-04_現金流支持資料.md` 第五版**（經五輪走查凍結）。
-新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0042，
-就能直接開始 **2b**。
+新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0043，
+就能直接開始 **2b 第二項（Manifest 凍結與 replay）**。
 
 ## 現在切在哪裡
 
-契約、模型、結構守衛與角色工作流已完成且全綠。下一步從**工作流**轉入
-**計算與判定**：支持資料 run、Manifest、輸出、完整度與 K1～K4。
-2a 已獨立提交並關閉，不得與 2b 重做或混改。
+契約、模型、結構守衛、角色工作流與**支持 run 的建立入口**已完成且全綠。
+2b 的七項中**第一項已關閉**；下一步是第二項 Manifest 凍結、`fn_manifest_verify`
+與 replay。各段已獨立提交，不得回頭重做或混改。
 
 ## 第一段交付（0039／0040／0041）
 
@@ -77,12 +77,13 @@ R2→R3→R4／SoD／生效區間重疊／靜態粒度相容、Coverage 有效�
 cashflow DB 測試由 36 增至 **144**；既有 36 條的斷言與預期錯誤未弱化。
 九項控制分五批反證，皆在反轉後轉紅、還原後全綠。2a 的提交為 `6ad2e82`。
 
-### 2b　計算與判定（下一步）
+### 2b　計算與判定（分刀進行）
 
 只做以下範圍：
 
-1. 支持資料 run（`calculation_scope = 'CASH_FLOW_SUPPORT'`）與多批次來源橋接；
-2. Manifest 凍結、`fn_manifest_verify`、結果雜湊與 replay；
+1. ~~支持資料 run（`calculation_scope = 'CASH_FLOW_SUPPORT'`）與多批次來源橋接~~
+   **已完成（0043，提交 `62700c6`）**；
+2. Manifest 凍結、`fn_manifest_verify`、結果雜湊與 replay；**← 下一刀**
 3. `CashFlowSupportLine` 只原樣承接已接受 fact 的 signed amount 與命中映射；
 4. `DATA_PRESENT` 只能由系統依已接受 fact 衍生；
 5. 以實際 `DataCoverage` 判定 run-level 粒度是否滿足政策；
@@ -97,6 +98,42 @@ cashflow DB 測試由 36 增至 **144**；既有 36 條的斷言與預期錯誤�
   必須由 2b 以封套綁定的那一筆 `data_coverage_id` 判定。
 
 2b 明確不做畫面，也不解鎖期間遷移；先讓計算、凍結、重演與控制總額在 DB 層閉合。
+
+### 2b 第一項　支持 run 的建立入口（0043，CLOSED／PASS）
+
+0040 讓 run 的來源改由橋接凍結，卻沒有入口——app_runtime 對 `calculation_run`
+有 INSERT（NO_FX 要用）、對橋接只有 SELECT，因此建得出「scope 是現金流、
+卻零筆來源」的 run。0043 把建立收斂成單一 system-only 入口
+`fn_cash_flow_support_run_create(manifest, batches[], actor, engine_version)`：
+案件層 **R2**（比照 `fn_fx_translation_run`）、至少一筆／不重複／不含空值、
+依 `import_batch_id` 遞增順序 `FOR UPDATE` 後才寫入、run 與橋接同一交易。
+每筆批次的 ACCEPTED／期間／案件仍由 **0040 的 trigger** 判定，本刀不重寫一份。
+
+cashflow DB 測試由 144 增至 **200**；既有 0039～0042 斷言零刪改（diff 為純新增）。
+七項控制分三批反證，皆在反轉後轉紅、還原後全綠。
+
+**三件下一刀必須知道的事**：
+
+1. **system-only 用執行身分當邊界，不是 GUC。** app_runtime 的 `calculation_run`
+   INSERT 收不回（NO_FX 要用），所以 trigger 比對 `current_user` 與表 owner。
+   `fn_calculation_run_insert_guard` 因此**必須維持 SECURITY INVOKER**——改成
+   DEFINER 的話 `current_user` 會變成 owner，檢查對誰都通過，等於沒寫。
+2. **「至少一筆橋接」只在函式層強制**（已與使用者確認）。0040 有一條既有斷言
+   單獨建立無橋接的 run，加 `DEFERRABLE` 約束會讓它在 commit 轉紅。真正的防線
+   是權限邊界；owner 直插屬既有的邊界外。「無橋接的 run 不得寫出結果」留給
+   **本刀之後的結果寫入路徑**——做第 3 項時要記得補。
+3. **CASH_FLOW_SUPPORT manifest 目前仍可由 app_runtime 直接 INSERT**（0012 的
+   既有授權）。凍結與驗證就是第二項的內容，那一刀要一併把它收斂成函式入口。
+
+**測試設計上的兩個實測結論**：
+
+- **每條負面測試各用一份新的 Manifest**（`mfn()` 助手），並逐條回驗
+  「沒有留下半套 run」。共用一份時，控制一被拿掉，第一條就佔用它、後面全部以
+  `CFS_RUN_MANIFEST_ALREADY_USED` 連鎖失敗——反證時分不出是哪一項控制在守。
+- **跨案件 fixture 不得沿用 `adjustment.test.sh` 的 …099 期間鏈**：聚合模式下
+  它已存在（撞主鍵會讓整段 fixture 中止），而且它的 `reporting_unit` 沒有
+  `legal_entity_id`，掛批次會先撞 0024 的歸屬守衛。現金流用 …098 系列自建。
+  fixture 的 heredoc 也不再吞 stderr，建立失敗即 fail closed。
 
 ## 2026-08-13 端到端 fixture 退化與修復（94c0b29）
 
