@@ -603,6 +603,12 @@ INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, perio
    'RUNNING',gen_random_uuid(),'h2','1.0.0','${JIA}'),
   ('${RUN_FX}','${TEN}','${ENG}','${PR}','${B1}','c0440000-0000-0000-0000-000000000103','PREVIEW',
    'RUNNING',gen_random_uuid(),'h3','1.0.0','${JIA}');
+-- 本期來源 run 的實際輸出。0044 凍結的是**行資料**，run 是裸的話那條斷言只是空證；
+-- 必須在轉 COMPLETED 之前寫入（0013 的 trg_bsl_run_state 禁止對終態 run 追加結果）。
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit) VALUES
+  ('${TEN}','${RUN_OK}','SOURCE_TB','${ACC1}','1002','银行存款',1000.00,0),
+  ('${TEN}','${RUN_OK}','SOURCE_TB','${ACC2}','6602','管理费用',0,1000.00);
 UPDATE calculation_run SET status='COMPLETED', result_content_hash='r1'
  WHERE calculation_run_id IN ('${RUN_OK}','${RUN_FX}');
 SQL
@@ -994,12 +1000,15 @@ expect_err "0043：在別的租戶脈絡下不得建立本租戶的 run" \
   "CROSS_TENANT_DENIED"
 no_run "${MF}" "跨租戶脈絡發起"
 
-# ── 正控制：兩筆合法批次，經 app_runtime 走函式 ──
-# 用 APP_C 才同時證明兩件事：GRANT EXECUTE 生效、且 system-only 守衛不擋函式路徑。
-RUN43=$(APP_C <<<"${T1} SELECT fn_cash_flow_support_run_create('${MF43P}',
-        ARRAY['${B43A}','${B43B}']::uuid[],'${JIA}','1.0.0')" 2>/dev/null)
-[ -n "${RUN43}" ] && ok "0043：R2 經函式以兩筆已接受批次建立現金流支持 run" \
-  || ng "0043：正控制建立失敗"
+# ── 正控制：多筆合法批次，經 app_runtime 走**凍結入口** ──
+# 0044 起 0043 的入口降為內部 helper（app_runtime 已無 EXECUTE），因此正控制改走
+# 唯一對外入口 fn_cash_flow_support_freeze_and_run——它凍結完整 Manifest 之後才
+# 呼叫本 helper。0043 檔頭明文留下的「零條目 Manifest」過渡邊界於此關閉。
+# 用 APP_C 才同時證明：GRANT EXECUTE 生效、且 system-only 守衛不擋函式路徑。
+RUN43=$(APP_C <<<"${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+        '${POLA}','${MAPA}',ARRAY['${B43A}','${B43B}','${CFB}']::uuid[],'${JIA}','1.0.0')" 2>/dev/null)
+[ -n "${RUN43}" ] && ok "0043／0044：R2 經凍結入口以多筆已接受批次建立現金流支持 run" \
+  || ng "0043／0044：正控制建立失敗"
 st=$(PSQL_C <<<"${T1} SELECT status||'/'||(import_batch_id IS NULL)::text||'/'||
      (result_content_hash IS NULL)::text||'/'||(completed_at IS NULL)::text||'/'||
      (failed_at IS NULL)::text||'/'||(replay_of_run_id IS NULL)::text
@@ -1009,7 +1018,8 @@ st=$(PSQL_C <<<"${T1} SELECT status||'/'||(import_batch_id IS NULL)::text||'/'||
   || ng "0043：run 狀態為 ${st}"
 st=$(PSQL_C <<<"${T1} SELECT string_agg(import_batch_id::text,',' ORDER BY import_batch_id)
      FROM calculation_run_source_batch WHERE calculation_run_id='${RUN43}'")
-[ "${st}" = "${B43A},${B43B}" ] && ok "0043：來源橋接恰好是那兩筆批次（同一交易內凍結）" \
+[ "${st}" = "${CFB},${B43A},${B43B}" ] \
+  && ok "0043：來源橋接恰好是那三筆批次（同一交易內凍結）" \
   || ng "0043：橋接為 ${st}"
 st=$(PSQL_C <<<"${T1} SELECT (r.created_by='${JIA}')::text||'/'||
      (r.request_content_hash = m.frozen_set_content_hash)::text||'/'||r.engine_version
@@ -1018,13 +1028,14 @@ st=$(PSQL_C <<<"${T1} SELECT (r.created_by='${JIA}')::text||'/'||
 [ "${st}" = "true/true/1.0.0" ] \
   && ok "0043：建立者、請求雜湊（＝Manifest 凍結雜湊）與引擎版本都如實記錄" \
   || ng "0043：run 欄位為 ${st}"
+MANI43=$(PSQL_C <<<"${T1} SELECT manifest_id FROM calculation_run WHERE calculation_run_id='${RUN43}'")
 n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_support_line WHERE calculation_run_id='${RUN43}'")
-m=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry WHERE manifest_id='${MF43P}'")
-[ "${n}" = "0" ] && [ "${m}" = "0" ] \
-  && ok "0043：本刀只建立 run——不產生支持資料列、不凍結 Manifest 條目（屬 2b 後續）" \
-  || ng "0043：支持資料列 ${n} 筆／Manifest 條目 ${m} 筆"
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry WHERE manifest_id='${MANI43}'")
+[ "${n}" = "0" ] && [ "${m}" -ge 5 ] \
+  && ok "0043／0044：Manifest 已完整凍結（${m} 筆條目），但仍不產生支持資料列（屬後續刀）" \
+  || ng "0043／0044：支持資料列 ${n} 筆／Manifest 條目 ${m} 筆"
 expect_err "0043：同一份 Manifest 不得再建第二個原始 run" \
-  "${T1} SELECT fn_cash_flow_support_run_create('${MF43P}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MANI43}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
   "CFS_RUN_MANIFEST_ALREADY_USED"
 
 # ── 既有的單批次契約不得因本刀改變 ──
@@ -1047,12 +1058,14 @@ n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.p
        AND has_function_privilege('public', p.oid, 'EXECUTE')")
 [ "${n}" = "0" ] && ok "0043：現金流全部 SECURITY DEFINER 函式一律撤回 PUBLIC（含 fn_cash_flow_*）" \
   || ng "0043：${n} 支函式仍對 PUBLIC 開放"
+# 0044 起本函式是**內部 helper**：app_runtime 的 EXECUTE 已撤回，
+# 唯一對外入口是 fn_cash_flow_support_freeze_and_run（見第 11 節）。
 n=$(PSQL_C <<<"SELECT prosecdef::text||'/'||has_function_privilege('public',oid,'EXECUTE')::text||'/'||
      has_function_privilege('app_runtime',oid,'EXECUTE')::text
      FROM pg_proc WHERE proname='fn_cash_flow_support_run_create'")
-[ "${n}" = "true/false/true" ] \
-  && ok "0043：建立入口為 SECURITY DEFINER、PUBLIC 無 EXECUTE、只授權 app_runtime" \
-  || ng "0043：建立入口的權限為 ${n}"
+[ "${n}" = "true/false/false" ] \
+  && ok "0044：0043 的建立入口降為內部 helper（SECURITY DEFINER、PUBLIC 與 app_runtime 皆無 EXECUTE）" \
+  || ng "0044：helper 的權限為 ${n}"
 n=$(PSQL_C <<<"SELECT prosecdef::text FROM pg_proc WHERE proname='fn_calculation_run_insert_guard'")
 [ "${n}" = "false" ] \
   && ok "0043：run 的 INSERT trigger 維持 SECURITY INVOKER（改成 DEFINER 會讓 system-only 檢查對誰都通過）" \
@@ -1086,5 +1099,427 @@ echo "${out}" | grep -q "CFS_BATCH_NOT_ACCEPTED" \
   || ng "0043 競態：A 未以 CFS_BATCH_NOT_ACCEPTED 失敗 → ${out}"
 n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run WHERE manifest_id='${MF43C}'")
 [ "${n}" = "0" ] && ok "0043 競態：失敗的建立沒有留下 run" || ng "0043 競態：留下 ${n} 筆 run"
+
+# ══ 11　0044：CFS Manifest 的 system-only 凍結入口 ═════════════════
+# 0043 收斂了 run 的建立，輸入卻還沒被凍結：manifest 與 entry 對 app_runtime 一直
+# 可寫（NO_FX 需要），因此現金流的 run 可以掛在一份任人捏造、甚至空白的 Manifest 上。
+# 本節驗證：直插被擋、結構契約成立、竄改露餡、半套不留、以及兩種來源輸出形狀都被凍結。
+
+# 三者的增量：凍結失敗時不得留下任何一半
+freeze_snapshot() {
+  PSQL_C <<<"${T1} SELECT
+    (SELECT count(*) FROM calculation_input_manifest WHERE calculation_scope='CASH_FLOW_SUPPORT')||'/'||
+    (SELECT count(*) FROM calculation_manifest_entry e
+       JOIN calculation_input_manifest m ON m.manifest_id=e.manifest_id
+      WHERE m.calculation_scope='CASH_FLOW_SUPPORT')||'/'||
+    (SELECT count(*) FROM calculation_run r
+       JOIN calculation_input_manifest m ON m.manifest_id=r.manifest_id
+      WHERE m.calculation_scope='CASH_FLOW_SUPPORT')"
+}
+no_freeze() {  # $1=先前快照 $2=情境
+  local now; now=$(freeze_snapshot)
+  [ "${now}" = "$1" ] && ok "0044：$2 之後 Manifest／條目／run 三者增量皆為 0" \
+    || ng "0044：$2 之後三者由 $1 變為 ${now}"
+}
+
+# ── 前置：先證明 app_runtime **確實有**兩張表的 INSERT 授權 ──
+# 否則下面兩條擋下來的可能只是缺授權，而不是本刀的守衛。
+n=$(PSQL_C <<<"SELECT count(*) FROM information_schema.role_table_grants
+     WHERE grantee='app_runtime' AND privilege_type='INSERT'
+       AND table_name IN ('calculation_input_manifest','calculation_manifest_entry')")
+[ "${n}" = "2" ] && ok "0044 前置：app_runtime 對 Manifest 與條目確有 INSERT 授權（NO_FX 需要，不能收回）" \
+  || ng "0044 前置：INSERT 授權數為 ${n}"
+
+n=$(APP_C <<<"${T1} INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id,
+      period_revision_id, calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+    VALUES (gen_random_uuid(),'${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2','x','${JIA}')" 2>&1 \
+    | grep -c "CFS_MANIFEST_SYSTEM_ONLY")
+[ "${n}" -ge 1 ] && ok "0044：app_runtime 直插現金流 Manifest 被拒（system-only）" \
+  || ng "0044：app_runtime 直插 Manifest 未被擋下"
+n=$(APP_C <<<"${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type,
+      object_id, domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+    VALUES ('${TEN}','${MANI43}','CASH_FLOW_SOURCE_FACT',gen_random_uuid(),'k','v','c','h','{}'::jsonb)" 2>&1 \
+    | grep -c "CFS_MANIFEST_SYSTEM_ONLY")
+[ "${n}" -ge 1 ] && ok "0044：app_runtime 直插現金流凍結條目被拒（system-only）" \
+  || ng "0044：app_runtime 直插條目未被擋下"
+
+# NO_FX 路徑必須完全不受影響——守衛是 scope-specific，不是整表封鎖
+NOFXMF2=c0440000-0000-0000-0000-000000000301
+expect_ok "0044：NO_FX 的 Manifest 仍可由 app_runtime 直接建立（既有路徑不動）" \
+  "${T1} INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id,
+        period_revision_id, calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+   VALUES ('${NOFXMF2}','${TEN}','${ENG}','${PR}','NO_FX','sqlcanon-2','nofx2','${JIA}')"
+n=$(APP_C <<<"${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type,
+      object_id, domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+    VALUES ('${TEN}','${NOFXMF2}','SOURCE_TB',NULL,'k','v','c','h','{}'::jsonb)" 2>&1 | grep -c "ERROR")
+[ "${n}" = "0" ] && ok "0044：NO_FX 的凍結條目仍可由 app_runtime 直接建立（既有路徑不動）" \
+  || ng "0044：NO_FX 條目寫入被誤擋"
+
+# fail closed：條目所屬集合查不到（跨租戶被 RLS 擋掉）時不得當成「不是現金流」放行
+MFT2=c0440000-0000-0000-0000-000000000303
+_has calculation_input_manifest "manifest_id = '${MFT2}'" || PSQL_C >/dev/null <<SQL
+${T2}
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('${MFT2}','${TEN2}','eeeeeeee-0000-0000-0000-000000000022',
+        '99999999-0000-0000-0000-000000000022','NO_FX','sqlcanon-2','t2','a2222222-0000-0000-0000-000000000009');
+SQL
+n=$(PSQL_C <<<"${T2} SELECT count(*) FROM calculation_input_manifest WHERE manifest_id='${MFT2}'")
+[ "${n}" = "1" ] && ok "0044 前置：另一租戶確實有一份 NO_FX 集合（本租戶看不到它）" \
+  || ng "0044 前置：T2 集合建立失敗（${n}）"
+n=$(APP_C <<<"${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type,
+      object_id, domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+    VALUES ('${TEN}','${MFT2}','SOURCE_TB',NULL,'k','v','c','h','{}'::jsonb)" 2>&1 \
+    | grep -c "CFS_MANIFEST_SYSTEM_ONLY")
+[ "${n}" -ge 1 ] && ok "0044：條目所屬集合不可見時 fail closed（不得當成非現金流放行）" \
+  || ng "0044：不可見集合的條目寫入未被擋下"
+
+n=$(APP_C <<<"${T1} SELECT fn_cash_flow_support_run_create('${MANI43}',
+      ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" 2>&1 | grep -c "permission denied")
+[ "${n}" -ge 1 ] && ok "0044：app_runtime 已不能呼叫 0043 的 helper（唯一對外入口是凍結函式）" \
+  || ng "0044：app_runtime 仍可呼叫舊 helper"
+
+n=$(PSQL_C <<<"SELECT string_agg(prosecdef::text,',' ORDER BY proname) FROM pg_proc
+     WHERE proname IN ('fn_cfs_manifest_insert_guard','fn_cfs_manifest_entry_insert_guard')")
+[ "${n}" = "false,false" ] \
+  && ok "0044：兩支 Manifest 守衛都維持 SECURITY INVOKER（DEFINER 會讓身分檢查對誰都通過）" \
+  || ng "0044：守衛的 prosecdef 為 ${n}"
+
+# ── 結構契約：fn_manifest_verify 之上的薄薄一層 ──
+expect_ok "0044：完整凍結的 Manifest 通過結構契約查證" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')"
+expect_err "0044：零條目的 Manifest 無法通過（完整性先於結構）" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MF43N}')" "REPLAY_MANIFEST_INTEGRITY_FAILED"
+SNAP=$(freeze_snapshot)
+expect_err "0044：空 Manifest 的 run 對任何呼叫者都不成立（helper 尾端查證）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF43N}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "REPLAY_MANIFEST_INTEGRITY_FAILED"
+no_freeze "${SNAP}" "空 Manifest 建 run 被拒"
+
+# 缺項：雜湊完全自洽、卻少了必要條目的一份集合
+MFPART=c0440000-0000-0000-0000-000000000302
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+WITH e AS (SELECT fn_fx_freeze_entry2('[]'::jsonb,'SCOPE',NULL,'scope','1',
+             '{"calculation_scope":"CASH_FLOW_SUPPORT"}'::jsonb)->0 AS x)
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+SELECT '${MFPART}','${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2',
+       fn_fx_sha(x->>'hash'),'${JIA}' FROM e;
+WITH e AS (SELECT fn_fx_freeze_entry2('[]'::jsonb,'SCOPE',NULL,'scope','1',
+             '{"calculation_scope":"CASH_FLOW_SUPPORT"}'::jsonb)->0 AS x)
+INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+SELECT '${TEN}','${MFPART}',x->>'object_type',NULL,x->>'kind',x->>'value',
+       x->>'canonical',x->>'hash',x->'payload' FROM e;
+SQL
+expect_ok "0044 前置：缺項樣本的雜湊自洽（完整性驗證會通過，擋它的只能是結構契約）" \
+  "${T1} SELECT fn_manifest_verify('${MFPART}')"
+expect_err "0044：只有 SCOPE 的集合缺必要條目 → 結構契約不成立" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MFPART}')" "CFS_MANIFEST_SINGLETON_VIOLATION"
+
+# ── 唯一性與 object_id ──
+expect_err "0044：同一集合內 singleton 條目不得重複" \
+  "${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+   VALUES ('${TEN}','${MFPART}','SCOPE',NULL,'k','v','c','h','{}'::jsonb)" "duplicate key"
+# 重複測試必須挑**尚未被 run 引用**的集合：已封存的集合會先撞 INV-17，
+# 那條測試就會以「Manifest 已封存」這個別的理由通過。
+FACT1=$(PSQL_C <<<"${T1} SELECT object_id FROM calculation_manifest_entry
+        WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_SOURCE_FACT' LIMIT 1")
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run WHERE manifest_id='${MFPART}'")
+[ "${n}" = "0" ] && ok "0044 前置：缺項樣本尚未被任何 run 引用（不會先撞 INV-17 封存）" \
+  || ng "0044 前置：缺項樣本已被 ${n} 個 run 引用"
+expect_ok "0044 前置：多值條目可寫入未封存的集合" \
+  "${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+   VALUES ('${TEN}','${MFPART}','CASH_FLOW_SOURCE_FACT','${FACT1}','k','v','c','h','{}'::jsonb)"
+expect_err "0044：同一事實不得在同一集合內凍結兩次" \
+  "${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+   VALUES ('${TEN}','${MFPART}','CASH_FLOW_SOURCE_FACT','${FACT1}','k','v','c','h','{}'::jsonb)" \
+  "duplicate key"
+expect_err "0044：多值型別的條目不得沒有 object_id（NULL 唯一性會留下重複通道）" \
+  "${T1} INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+   VALUES ('${TEN}','${MFPART}','CASH_FLOW_SOURCE_FACT',NULL,'k','v','c','h','{}'::jsonb)" \
+  "cme_multi_object_id_ck"
+
+# ── 竄改：不可變 trigger 擋不住資料修復與 owner 操作，驗證要自己抓得到 ──
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry SET payload = payload || '{"tampered":true}'::jsonb
+ WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_POLICY_VERSION';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+expect_err "0044：條目 payload 被竄改 → 結構契約查證失敗" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')" "REPLAY_MANIFEST_INTEGRITY_FAILED"
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry SET payload = payload - 'tampered'
+ WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_POLICY_VERSION';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+expect_ok "0044：還原竄改後恢復通過（證明上一條抓到的就是那次竄改）" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')"
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_input_manifest DISABLE TRIGGER USER;
+UPDATE calculation_input_manifest SET frozen_set_content_hash = 'deadbeef'
+ WHERE manifest_id='${MANI43}';
+ALTER TABLE calculation_input_manifest ENABLE TRIGGER USER;
+SQL
+expect_err "0044：集合雜湊被竄改 → 結構契約查證失敗" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')" "REPLAY_MANIFEST_INTEGRITY_FAILED"
+SETHASH=$(PSQL_C <<<"${T1} SELECT fn_fx_sha(string_agg(content_hash,'|'
+          ORDER BY object_type, COALESCE(object_id::text,''), content_hash))
+          FROM calculation_manifest_entry WHERE manifest_id='${MANI43}'")
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_input_manifest DISABLE TRIGGER USER;
+UPDATE calculation_input_manifest SET frozen_set_content_hash = '${SETHASH}'
+ WHERE manifest_id='${MANI43}';
+ALTER TABLE calculation_input_manifest ENABLE TRIGGER USER;
+SQL
+expect_ok "0044：以生成端同一套排序重算的集合雜湊可還原（生成與驗證未分岔）" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')"
+
+# ── 正控制 A 的內容：凍結的是不是真的那些東西 ──
+n=$(PSQL_C <<<"${T1} SELECT string_agg(object_type,',' ORDER BY object_type)
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}'")
+[ "${n}" = "CASH_FLOW_CLASS_SET_VERSION,CASH_FLOW_COVERAGE_EXCEPTION,CASH_FLOW_MAPPING_VERSION,CASH_FLOW_OPENING_BALANCE_SET_VERSION,CASH_FLOW_POLICY_VERSION,CASH_FLOW_SOURCE_FACT,CASH_FLOW_SOURCE_SELECTION,SCOPE,SOURCE_CALCULATION_RUN" ] \
+  && ok "0044：條目清單齊備（SCOPE／選定／政策／分類集合／映射／期初證據／例外／事實／來源 run）" \
+  || ng "0044：條目清單為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT (payload->>'cf_selection_id' = fn_current_cf_source_selection('${PR}')::text)::text
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_SOURCE_SELECTION'")
+[ "${n}" = "true" ] && ok "0044：凍結的是**現行**選定（取代鏈判定，不是第一版也不是按時間）" \
+  || ng "0044：凍結的選定與現行選定不符（${n}）"
+n=$(PSQL_C <<<"${T1} SELECT (payload->>'opening_source_kind')||'/'||
+     (SELECT count(*) FROM calculation_manifest_entry WHERE manifest_id='${MANI43}'
+        AND object_type='CASH_FLOW_OPENING_BALANCE_SET_VERSION')||'/'||
+     (SELECT count(*) FROM calculation_manifest_entry WHERE manifest_id='${MANI43}'
+        AND object_type='SOURCE_CALCULATION_RUN')
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_SOURCE_SELECTION'")
+[ "${n}" = "FIRST_PERIOD_EVIDENCE/1/1" ] \
+  && ok "0044：首期期初證據情境下——期初證據恰 1 筆、來源 run 恰 1 筆" \
+  || ng "0044：期初／來源 run 筆數為 ${n}"
+# SCOPE 承載來源封套：facts 可以是零筆，封套不能跟著消失
+n=$(PSQL_C <<<"${T1} SELECT (payload->'datasets'->0 ? 'data_coverage_id')::text||'/'||
+     (payload->'datasets'->0 ? 'coverage_granularity')::text||'/'||
+     (payload->'datasets'->0 ? 'completeness_status')::text||'/'||
+     (payload->'datasets'->0 ? 'account_scope')::text||'/'||
+     jsonb_array_length(payload->'source_batches')::text
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='SCOPE'")
+[ "${n}" = "true/true/true/true/3" ] \
+  && ok "0044：SCOPE 凍結了來源封套（三筆批次＋資料集的 data_coverage_id／粒度／完整度／範圍）" \
+  || ng "0044：SCOPE 封套為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_SOURCE_FACT'
+       AND NOT (payload ? 'data_coverage_id')")
+[ "${n}" = "0" ] && ok "0044：每筆事實都帶著綁定的 data_coverage_id（不只 actual_granularity）" \
+  || ng "0044：${n} 筆事實沒有 data_coverage_id"
+# 來源 run 凍結的是**實際行資料**，不是只有身分與雜湊
+n=$(PSQL_C <<<"${T1} SELECT (payload->>'output_kind')||'/'||jsonb_array_length(payload->'lines')::text
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='SOURCE_CALCULATION_RUN'")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='${RUN_OK}'")
+[ "${n}" = "NO_FX/${m}" ] && ok "0044：NO_FX 來源 run 凍結了全部 ${m} 筆 balance_snapshot_line" \
+  || ng "0044：來源 run 的凍結行資料為 ${n}（實際 ${m} 筆）"
+n=$(PSQL_C <<<"${T1} SELECT string_agg(l->>'account_code',',' ORDER BY (l->>'snapshot_line_id')::bigint)
+     FROM calculation_manifest_entry e, jsonb_array_elements(e.payload->'lines') l
+     WHERE e.manifest_id='${MANI43}' AND e.object_type='SOURCE_CALCULATION_RUN'")
+m=$(PSQL_C <<<"${T1} SELECT string_agg(account_code,',' ORDER BY snapshot_line_id)
+     FROM balance_snapshot_line WHERE calculation_run_id='${RUN_OK}'")
+[ -n "${n}" ] && [ "${n}" = "${m}" ] && ok "0044：凍結的行資料逐筆等於來源 run 的實際輸出（${n}）" \
+  || ng "0044：凍結行資料 ${n} ≠ 實際 ${m}"
+
+# ── 凍結入口的參數契約：每一條之後都回驗三者增量為 0 ──
+SNAP=$(freeze_snapshot)
+expect_err "0044：期間不存在 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('99999999-0000-0000-0000-000000000777','${UNIT}',
+     '${POLA}','${MAPA}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" "CFS_FREEZE_PERIOD_NOT_FOUND"
+expect_err "0044：報告單位與期間不符 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${GRP_UNIT}',
+     '${POLA}','${MAPA}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" "CFS_FREEZE_UNIT_MISMATCH"
+expect_err "0044：非 R2 不得凍結" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPA}',ARRAY['${B43A}']::uuid[],'${CFR4}','1.0.0')" "ACTOR_ROLE_NOT_HELD"
+expect_err "0044：在別的租戶脈絡下不得凍結本租戶的輸入" \
+  "${T2} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPA}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" "CROSS_TENANT_DENIED"
+expect_err "0044：未批准的政策版本不得成為凍結輸入" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLB}','${MAPA}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" "CFS_POLICY_NOT_APPROVED"
+expect_err "0044：映射版本綁定的政策不是本次凍結的政策 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPJ}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_FREEZE_MAPPING_POLICY_MISMATCH"
+expect_err "0044：未批准的映射版本不得成為凍結輸入" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPD}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" "CFS_MAPPING_NOT_APPROVED"
+expect_err "0044：缺引擎版本 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPA}',ARRAY['${B43A}']::uuid[],'${JIA}','')" "CFS_RUN_ENGINE_VERSION_REQUIRED"
+expect_err "0044：空來源批次清單 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPA}',ARRAY[]::uuid[],'${JIA}','1.0.0')" "CFS_RUN_SOURCE_BATCH_REQUIRED"
+expect_err "0044：未接受的批次不得成為凍結來源" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR}','${UNIT}',
+     '${POLA}','${MAPA}',ARRAY['${B43QU}']::uuid[],'${JIA}','1.0.0')" "CFS_BATCH_NOT_ACCEPTED"
+no_freeze "${SNAP}" "以上十條參數契約全部被拒"
+
+# ── 正控制 B：前期已選定結果（兩筆來源 run、零事實、無期初證據） ──
+# 本期來源刻意用 NO_FX run：現金流的來源若是折算 run，選定會要求同期的
+# PeriodFxRunSelection，而那需要容許值版本＋折算調節＋折算政策鏈＋匯率版本——
+# 等於在現金流 fixture 裡重建整條 M3-02／M3-03 的鏈。**FX 原始輸出形狀
+# （translation_result）的斷言因此留給下一刀**（見 0044 檔頭的已知邊界）。
+RP3=dddddddd-0000-0000-0000-000000000031
+PR3=99999999-0000-0000-0000-000000000031
+B_P3=c0460000-0000-0000-0000-000000000031
+MF_P3=c0440000-0000-0000-0000-000000000131
+RUN_P3=c0450000-0000-0000-0000-000000000131
+_has period_revision "period_revision_id = '${PR3}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（PR3 鏈）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id,
+        fiscal_calendar_id, label, start_date, end_date, previous_reporting_period_id)
+-- 日期區間避開其他領域檔已用的月份：reporting_period 對
+-- (reporting_unit_id, fiscal_calendar_id, daterange) 有排除約束，聚合模式下會相撞。
+VALUES ('${RP3}','${TEN}','${ENG}','${UNIT}','${CAL}','2030-05','2030-05-01','2030-05-31','${RP2}');
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id)
+VALUES ('${PR3}','${TEN}','${RP3}');
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status, file_name)
+VALUES ('${B_P3}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR3}','${JIA}',
+        '${JIA}','VALIDATING','cf-p3.csv');
+INSERT INTO data_coverage (data_coverage_id, tenant_id, import_batch_id, batch_version,
+        granularity, completeness_status)
+VALUES ('c0480000-0000-0000-0000-000000000031','${TEN}','${B_P3}',1,'BALANCE','COMPLETE');
+INSERT INTO source_dataset (source_dataset_id, tenant_id, import_batch_id, granularity,
+        content_sha256, row_count, batch_version)
+VALUES ('c0470000-0000-0000-0000-000000000031','${TEN}','${B_P3}','BALANCE','sha-p3',1,1);
+INSERT INTO cash_flow_support_dataset (source_dataset_id, tenant_id, engagement_id,
+        period_revision_id, reporting_unit_id, import_batch_id, content_hash, data_coverage_id)
+VALUES ('c0470000-0000-0000-0000-000000000031','${TEN}','${ENG}','${PR3}','${UNIT}','${B_P3}',
+        'ds-p3','c0480000-0000-0000-0000-000000000031');
+ALTER TABLE import_batch DISABLE TRIGGER USER;
+UPDATE import_batch SET status='ACCEPTED' WHERE import_batch_id='${B_P3}';
+ALTER TABLE import_batch ENABLE TRIGGER USER;
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+VALUES ('${MF_P3}','${TEN}','${ENG}','${PR3}','NO_FX','sqlcanon-2','nofx-p3','${JIA}');
+INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
+        import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
+        engine_version, created_by)
+VALUES ('${RUN_P3}','${TEN}','${ENG}','${PR3}','${B_P3}','${MF_P3}','PREVIEW','RUNNING',
+        gen_random_uuid(),'nofx-p3','1.0.0','${JIA}');
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit) VALUES
+  ('${TEN}','${RUN_P3}','SOURCE_TB','${ACC1}','1002','银行存款',3000.00,0),
+  ('${TEN}','${RUN_P3}','SOURCE_TB','${ACC2}','6602','管理费用',0,3000.00);
+UPDATE calculation_run SET status='COMPLETED', result_content_hash='r-p3', completed_at=now()
+ WHERE calculation_run_id='${RUN_P3}';
+SQL
+PRIOR3=$(PSQL_C <<<"${T1} SELECT current_run_id FROM period_cash_flow_source_selection
+         WHERE cf_selection_id = fn_current_cf_source_selection('${PR2}')")
+expect_ok "0044 前置：R4 以前期已選定結果選定第三期的權威來源" \
+  "${T1} SELECT fn_cf_select_source('${PR3}','${RUN_P3}','PRIOR_SELECTED_RUN','${PRIOR3}',NULL,'${CFR4}')"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_source_fact WHERE period_revision_id='${PR3}'")
+[ "${n}" = "0" ] && ok "0044 前置：第三期沒有任何金額事實（零活動是合法的，驗零事實分支）" \
+  || ng "0044 前置：第三期已有 ${n} 筆事實"
+
+RUN44=$(APP_C <<<"${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}',
+        '${POLA}','${MAPA}',ARRAY['${B_P3}']::uuid[],'${JIA}','1.0.0')" 2>/dev/null)
+[ -n "${RUN44}" ] && ok "0044：零事實的期間仍可完成凍結與建立 run（零活動合法）" \
+  || ng "0044：第三期凍結失敗"
+MANI44=$(PSQL_C <<<"${T1} SELECT manifest_id FROM calculation_run WHERE calculation_run_id='${RUN44}'")
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI44}' AND object_type='CASH_FLOW_SOURCE_FACT'")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI44}' AND object_type='SCOPE'
+       AND jsonb_array_length(payload->'datasets') = 1")
+[ "${n}" = "0" ] && [ "${m}" = "1" ] \
+  && ok "0044：零事實時 SCOPE 的來源封套仍在（封套不隨事實消失，粒度判定才有依據）" \
+  || ng "0044：事實 ${n} 筆／封套資料集 ${m}"
+n=$(PSQL_C <<<"${T1} SELECT string_agg(payload->>'role'||':'||(payload->>'output_kind'),',' ORDER BY payload->>'role')
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI44}' AND object_type='SOURCE_CALCULATION_RUN'")
+[ "${n}" = "CURRENT:NO_FX,PRIOR:NO_FX" ] \
+  && ok "0044：前期已選定結果情境下凍結兩筆來源 run，且各自標明原始輸出形狀" \
+  || ng "0044：來源 run 為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI44}' AND object_type='CASH_FLOW_OPENING_BALANCE_SET_VERSION'")
+[ "${n}" = "0" ] && ok "0044：非首期不凍結期初證據集合（條件式條目）" || ng "0044：期初證據 ${n} 筆"
+n=$(PSQL_C <<<"${T1} SELECT jsonb_array_length(payload->'lines')
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI44}'
+       AND object_type='SOURCE_CALCULATION_RUN' AND payload->>'role'='PRIOR'")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='${PRIOR3}'")
+[ "${n}" = "${m}" ] && ok "0044：前期來源 run 的行資料也逐筆凍結（${m} 筆）" \
+  || ng "0044：前期 run 凍結 ${n} 筆／實際 ${m} 筆"
+expect_ok "0044：第三期的凍結集合通過結構契約查證" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MANI44}')"
+
+# ── 併發：凍結途中批次狀態變更不得穿過 ──
+# 用**已有現行選定**的 PR3：沒有選定的期間會在鎖批次之前就失敗，
+# 那樣測到的是「沒有選定」，不是列鎖——以錯誤理由通過。
+B44C=c0460000-0000-0000-0000-000000000032
+B44D=c0460000-0000-0000-0000-000000000033
+_has import_batch "import_batch_id = '${B44C}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（競態批次）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status) VALUES
+  ('${B44C}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR3}','${JIA}','${JIA}','ACCEPTED'),
+  ('${B44D}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR3}','${JIA}','${JIA}','ACCEPTED');
+SQL
+st=$(PSQL_C <<<"${T1} SELECT status FROM import_batch WHERE import_batch_id='${B44C}'")
+[ "${st}" = "ACCEPTED" ] && ok "0044 競態前置：批次在 B 動手前確實是 ACCEPTED" || ng "0044 競態前置：${st}"
+n=$(PSQL_C <<<"${T1} SELECT (fn_current_cf_source_selection('${PR3}') IS NOT NULL)::text")
+[ "${n}" = "true" ] && ok "0044 競態前置：該期間有現行選定（凍結因此走得到鎖批次那一步）" \
+  || ng "0044 競態前置：該期間沒有現行選定，測到的會是別的理由"
+SNAP=$(freeze_snapshot)
+( PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+BEGIN;
+UPDATE import_batch SET status='SUPERSEDED', superseded_by_id='${B43A}'
+ WHERE import_batch_id='${B44C}';
+SELECT pg_sleep(3);
+COMMIT;
+SQL
+) & BPID=$!
+sleep 0.8
+start=$(date +%s)
+out=$(PSQL_C <<<"${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}',
+      '${POLA}','${MAPA}',ARRAY['${B44C}']::uuid[],'${JIA}','1.0.0')" 2>&1)
+waited=$(( $(date +%s) - start ))
+wait ${BPID}
+[ "${waited}" -ge 1 ] && ok "0044 競態：凍結被 B 的列鎖擋住（等待 ${waited}s，未讀到過期狀態）" \
+  || ng "0044 競態：未被阻塞（等待 ${waited}s）"
+echo "${out}" | grep -q "CFS_BATCH_NOT_ACCEPTED" \
+  && ok "0044 競態：B 提交後凍結讀到 SUPERSEDED 並失敗（狀態變更未穿過凍結交易）" \
+  || ng "0044 競態：未以 CFS_BATCH_NOT_ACCEPTED 失敗 → ${out}"
+no_freeze "${SNAP}" "競態下的凍結失敗"
+
+# 同一期間的兩次凍結必須互相序列化，否則兩份凍結會各自看到不同 snapshot。
+# 批次集合刻意**互不相交**：共用批次的話，擋住第二次的會是 helper 的批次列鎖。
+# **本條不宣稱是期間列鎖擋的**——實測反證：把 `FOR UPDATE OF pr` 拿掉仍然全綠，
+# 因為兩次凍結還共用政策／映射／選定那幾列的 FOR UPDATE。期間鎖是刻意保留的
+# 順序保證（先鎖期間再解析現行選定），但目前沒有測試能單獨證明它。
+( PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+BEGIN;
+SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}','${POLA}','${MAPA}',
+       ARRAY['${B_P3}']::uuid[],'${JIA}','1.0.0');
+SELECT pg_sleep(3);
+COMMIT;
+SQL
+) & APID=$!
+sleep 0.8
+start=$(date +%s)
+PSQL_C >/dev/null 2>&1 <<<"${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}',
+  '${POLA}','${MAPA}',ARRAY['${B44D}']::uuid[],'${JIA}','1.0.0')"
+waited=$(( $(date +%s) - start ))
+wait ${APID}
+[ "${waited}" -ge 1 ] \
+  && ok "0044 競態：同一期間的兩次凍結互相序列化（等待 ${waited}s，批次集合不相交仍序列化）" \
+  || ng "0044 競態：第二次凍結未被序列化（等待 ${waited}s）"
 
 [ "${STANDALONE:-0}" = "1" ] && summary
