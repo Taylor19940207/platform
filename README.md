@@ -32,7 +32,7 @@ pnpm dev                          # API + Worker
 ## 測試
 
 ```bash
-pnpm test          # 單元 66 ＋ DB 整合 819 ＋ 端到端驗收 436，共 1,321 條
+pnpm test          # 單元 66 ＋ DB 整合 875 ＋ 端到端驗收 436，共 1,377 條
 pnpm test:quick    # 單元＋DB 整合——切片收口前的快速基線
 pnpm test:db:cashflow # 只跑現金流 DB 套件；其他領域同樣使用 test:db:<domain>
 pnpm test:timing   # 逐 suite 耗時，決定要優化什麼之前先量
@@ -55,7 +55,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 
 ## 現況
 
-- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋43 份 migration（可從零重建）
+- [x] monorepo 骨架（§27 結構）＋ PostgreSQL 16＋44 份 migration（可從零重建）
 - [x] RLS 租戶隔離（§24.9／INV-18）；G-01／INV-28／SOD-07 為 DB 觸發器（最後防線）
 - [x] ImportBatch 七狀態 × identity_status 正交軸（§25.5／CR-002）
 - [x] **里程碑 1**：登入 → 選 客戶/法人/期間 → 上傳 TB → 雜湊＋平衡＋歸屬驗證 → B-00（驗收 20/20）
@@ -73,7 +73,7 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 - [x] **SLICE-M3-01 B-02 期間工作台（0028／0029）**：`fn_period_transition_spec` 為遷移規格的**唯一可查詢來源**，trigger 與畫面讀同一份；完整 B-02 為案件層 R2／R3／R4；0029 修正期間發起人的角色**作用域**（租戶層指派不得發起遷移）並撤回 PUBLIC EXECUTE
 - [x] **SLICE-M3-02 折算與 CTA（0030–0035）**：`Currency`／幣別角色指派（INV-22）／匯率版本四狀態＋觀測／`translation_category`／折算政策與 CTA 落點／權益折算批次集合／期初已折算餘額；**保留盈餘由延續橋接得出，不乘匯率**（CAS 19 §12）；CTA 物化為 `TranslationAdjustmentEntry`（INV-20）；**Manifest 只讀重演＋自身完整性驗證**（SHA-256）。Case-001 12/12、CTA 97,159.00 借方、RE 373,695.00
 - [x] **SLICE-M3-03 折算調節核對與期間級 G-07（0036–0038）**：`RoundingToleranceVersion`（幣別對）／`TranslationReconciliation`＋`TranslationDifference`（六類差異、算術推導）／`PeriodFxInputSelection`（R2）與 `PeriodFxRunSelection`（R4）；C2 為**獨立重算**（不呼叫引擎、不讀結果）；兩支 readiness 拆開輸入與結果，**硬差異只要存在就失敗**
-- [~] **SLICE-M3-04 現金流支持資料（0039–0043）**：第一段模型與結構守衛、第二段 2a 角色工作流、2b 第一項支持 run 建立入口均已完成；0042 含十一張表的父鏈／版本鏈、十九支 system-only 函式、映射 R2→R3→R4＋SoD、零活動 R2 確認＋R3 覆核；0043 是現金流 run 的唯一 system-only 建立入口（R2、多批次來源同交易凍結、FOR UPDATE 防 TOCTOU）。尚待 2b 的 Manifest／replay、支持資料列、完整度與 K1～K4、期間級就緒判定
+- [~] **SLICE-M3-04 現金流支持資料（0039–0044）**：第一段模型與結構守衛、第二段 2a 角色工作流、2b 第一項支持 run 建立入口均已完成；0042 含十一張表的父鏈／版本鏈、十九支 system-only 函式、映射 R2→R3→R4＋SoD、零活動 R2 確認＋R3 覆核；0043 是現金流 run 的唯一 system-only 建立入口（R2、多批次來源同交易凍結、FOR UPDATE 防 TOCTOU）。0044 是 CFS Manifest 的唯一 system-only 凍結入口（顯式版本輸入、單一 snapshot 物化、結構契約查證）。尚待 2b 的支持資料列＋結果雜湊與 replay、完整度與 K1～K4、期間級就緒判定
 - [ ] **MVP 3 剩餘**：現金流 2b（未完成前 MVP 3 不得關閉）／G-03 與 `AMENDED` 取代鏈／對外輸出核對（`OutputProfile`）／結果就緒的正式 Guard ID（CR）
 
 ## 結構
@@ -82,6 +82,6 @@ Docker Compose 不會自行讀取 `.env.local`，所以 Compose 指令須帶 `--
 apps/        api（模組化單體宿主）｜worker（背景驗證）｜web（Next.js 佔位）
 packages/    domain（狀態機）｜database（migration＋轉接層）｜auth｜contracts｜config
 scripts/     dev.mjs｜env.sh（傳輸層）｜sandbox/（非主流程）
-tests/       unit（66）｜integration（DB 守衛 819 條）｜acceptance（端到端 436 條）｜fixtures/case-001
+tests/       unit（66）｜integration（DB 守衛 875 條）｜acceptance（端到端 436 條）｜fixtures/case-001
 docs/        GOVERNANCE｜BACKLOG｜FUTURE_DISCUSSIONS｜adr/｜slices/｜handoffs/
 ```

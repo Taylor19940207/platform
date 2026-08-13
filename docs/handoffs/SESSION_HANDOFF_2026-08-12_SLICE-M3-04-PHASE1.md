@@ -1,22 +1,22 @@
 # SESSION HANDOFF　SLICE-M3-04 現金流支持資料（持續更新的唯一交接入口）
 
-> 檔名保留 `PHASE1` 是為了不讓既有連結失效；本檔內容已推進至 **2b 第一刀完成**。
+> 檔名保留 `PHASE1` 是為了不讓既有連結失效；本檔內容已推進至 **2b 第二刀 A 完成**。
 > 後續 M3-04 換機交接持續更新本檔，不再為每一小段新增 handoff。
 
-最近完整測試基準：**`a564ea5`（1,321／1,321）**；其後只有範圍定案文件變更，
-未修改程式。已 push，工作區乾淨。
-完整測試 **1,321** 零失敗：單元 66 ／ DB 整合 819 ／ 端到端 436。
-**43 份 migration**（可從零重建）。
+最近完整測試基準：**`6a1a3b7`（1,377／1,377）**，工作區乾淨。
+**尚未 push**（`25d84dd` 之後的提交）。
+完整測試 **1,377** 零失敗：單元 66 ／ DB 整合 875 ／ 端到端 436。
+**44 份 migration**（可從零重建）。
 
 **權威契約：`docs/slices/SLICE-M3-04_現金流支持資料.md` 第五版**（經五輪走查凍結）。
-新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0043，
-就能直接開始 **2b 第二刀 A：CFS Manifest 的 system-only 凍結入口**（範圍見下）。
+新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0044，
+就能直接開始 **2b 第三刀：支持資料列 ＋ 結果雜湊與 replay**（範圍見下）。
 
 ## 現在切在哪裡
 
-契約、模型、結構守衛、角色工作流與**支持 run 的建立入口**已完成且全綠
-（0043 已複核通過並 push）。下一步是 **2b 第二刀 A：Manifest 凍結與驗證**。
-各段已獨立提交，不得回頭重做或混改。
+契約、模型、結構守衛、角色工作流、**支持 run 的建立入口**與 **Manifest 的
+system-only 凍結入口**已完成且全綠。下一步是 **2b 第三刀：`CashFlowSupportLine`
+原樣承接 ＋ 結果雜湊與 replay**（同一刀，見下）。各段已獨立提交，不得回頭重做或混改。
 
 ## 第一段交付（0039／0040／0041）
 
@@ -82,9 +82,10 @@ cashflow DB 測試由 36 增至 **144**；既有 36 條的斷言與預期錯誤�
 
 1. ~~支持資料 run（`calculation_scope = 'CASH_FLOW_SUPPORT'`）與多批次來源橋接~~
    **已完成（0043，提交 `62700c6`／`6f2bf0a`，CLOSED／PASS）**；
-2. **A：CFS Manifest 的 system-only 凍結入口 ＋ `fn_manifest_verify` 驗證**；**← 下一刀**
+2. ~~A：CFS Manifest 的 system-only 凍結入口 ＋ `fn_manifest_verify` 驗證~~
+   **已完成（0044，提交 `6a1a3b7`）**；
 3. `CashFlowSupportLine` 原樣承接已接受 fact 的 signed amount 與命中映射，
-   **結果雜湊與 replay 併在同一刀**；
+   **結果雜湊與 replay 併在同一刀**；**← 下一刀**
 4. `DATA_PRESENT` 只能由系統依已接受 fact 衍生；
 5. 以實際 `DataCoverage` 判定 run-level 粒度是否滿足政策；
 6. 完整度的穩定代碼、K1～K4 控制總額與期間級就緒判定；
@@ -104,7 +105,7 @@ replay 比對的必須是**實際輸出**，不是輸入凍結值。第 2 刀只
 
 2b 明確不做畫面，也不解鎖期間遷移；先讓計算、凍結、重演與控制總額在 DB 層閉合。
 
-### 下一刀　SLICE-M3-04 2b 第二刀 A：CFS Manifest system-only 凍結入口
+### 已完成的上一刀範圍　2b 第二刀 A（0044）當初定案的五點
 
 **範圍固定為以下五項**（2026-08-13 定案）：
 
@@ -153,9 +154,8 @@ cashflow DB 測試由 144 增至 **204**；既有 0039～0042 斷言零刪改（
    單獨建立無橋接的 run，加 `DEFERRABLE` 約束會讓它在 commit 轉紅。真正的防線
    是權限邊界；owner 直插屬既有的邊界外。**關閉時限（已確認）：「無橋接不得產出」
    的最後防線補在第 3 項的支持資料列寫入路徑**，不得再往後拖。
-3. **CASH_FLOW_SUPPORT manifest 目前仍可由 app_runtime 直接 INSERT**（0012 的
-   既有授權）。**關閉時限（已確認）：下一刀（2b 第二刀 A）**收斂成 system-only
-   凍結入口。
+3. ~~CASH_FLOW_SUPPORT manifest 仍可由 app_runtime 直接 INSERT~~ **已於 0044 關閉**
+   （scope-specific INSERT trigger ＋ 唯一凍結入口）。
 
 **測試設計上的兩個實測結論**：
 
@@ -166,6 +166,54 @@ cashflow DB 測試由 144 增至 **204**；既有 0039～0042 斷言零刪改（
   它已存在（撞主鍵會讓整段 fixture 中止），而且它的 `reporting_unit` 沒有
   `legal_entity_id`，掛批次會先撞 0024 的歸屬守衛。現金流用 …098 系列自建。
   fixture 的 heredoc 也不再吞 stderr，建立失敗即 fail closed。
+
+
+### 2b 第二刀 A　Manifest 的 system-only 凍結入口（0044，CLOSED／PASS）
+
+唯一對外入口 `fn_cash_flow_support_freeze_and_run(period, unit, policy, mapping,
+batches[], actor, engine)`，案件層 **R2**。**政策與映射版本由參數顯式帶入**——
+不得由「最新已批准」推導（驗收 1 的反證）；權威來源選定取既有
+`fn_current_cf_source_selection`（取代鏈）。
+
+執行順序就是本函式的全部重點：**先鎖 → 單一 statement 物化 → 只驗物化後的集合 →
+寫入 → 結構契約查證**。PL/pgSQL 每個 statement 各有 snapshot，「同一個函式」證明
+不了「同一份輸入」。九種條目、所有內嵌陣列以穩定 ID 排序；canonical 與集合雜湊
+逐字沿用 0034 的 `fn_fx_freeze_entry2`，驗證沿用 `fn_manifest_verify`，另加薄函式
+`fn_cf_manifest_assert_contract`（scope／singleton／條件式期初證據／來源 run 1 或 2 筆／
+object_id 非空）——**沒有第二套 canonical 或 hash**。
+
+cashflow DB 測試 204 → **260**。十項控制分三批反證轉紅；第四批（兩把鎖）**不轉紅**，
+兩個結論見下。
+
+**四件下一刀必須知道的事**：
+
+1. **`SOURCE_CALCULATION_RUN` 的 FX 分支已實作但沒有測試走過**。現金流的來源 run
+   若是折算 run，選定會要求同期的 `PeriodFxRunSelection`，那需要容許值版本＋折算
+   調節＋折算政策鏈＋匯率版本——等於在現金流 fixture 裡重建整條 M3-02／M3-03 鏈。
+   NO_FX 分支已逐筆驗過（凍結行資料等於實際輸出）。**下一刀本來就需要一個 FX 期間
+   （K2 要用），那條 `translation_result` 形狀的斷言必須在那裡補上。**
+2. **凍結函式不再自己檢查來源批次**：0043 的 helper 是那份唯一實作。反證時把凍結
+   函式裡的批次檢查與 `FOR UPDATE` 拿掉不會轉紅——擋住競態的一直是 helper 的鎖。
+   錯誤碼不變，但現在是在 manifest 物化**之後**由 helper 拋出（整份回滾）。
+3. **期間鎖沒有測試能單獨證明它**：任何兩次同期間的凍結都共用政策／映射／選定那
+   幾列的 `FOR UPDATE`。保留它是為了「先鎖期間、再解析現行選定」的順序保證；
+   不要因為看起來多餘就拿掉，也不要宣稱測試證明過它。版本列鎖同樣**擋不住取代鏈
+   被接上**（新版本是 INSERT，不 UPDATE 舊列）。
+4. **`fn_cfs_*` 是第三個命名前綴**，不匹配 0043 加的 `^fn_(cf|cash_flow)_` 權限掃描。
+   目前那兩支是 SECURITY INVOKER 所以無妨；**日後若有人用 `fn_cfs_*` 命名 SECURITY
+   DEFINER 函式，會靜默漏掃**——加函式時記得一併擴充掃描的正規式。
+
+**既有 0043 斷言的變更**（皆為關閉 0043 檔頭明文留下的過渡邊界，已獲授權）：
+正控制改走凍結入口（並多帶一筆批次，橋接三筆）、「零條目 Manifest」改為「已完整
+凍結」、`CFS_RUN_MANIFEST_ALREADY_USED` 改用新 run 的 manifest、helper 權限斷言
+改為 `true/false/false`。0039～0042 的斷言未動。
+
+**測試 fixture 的兩個實測陷阱**：
+- `balance_snapshot_line` 必須在 run 轉 `COMPLETED` **之前**寫入（0013 的
+  `trg_bsl_run_state`）；`translation_result` 另需 component，CTA component 又需
+  `translation_adjustment_line` → `entry` → 折算政策與匯率版本（第 1 點的成本來源）。
+- `reporting_period` 對 `(reporting_unit_id, fiscal_calendar_id, daterange)` 有排除
+  約束，聚合模式下與別的領域檔撞月份會讓整段 fixture 中止；新期間請挑沒人用過的年份。
 
 ## 2026-08-13 端到端 fixture 退化與修復（94c0b29）
 

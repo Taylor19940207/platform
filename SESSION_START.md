@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、四十三份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、四十四份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -47,17 +47,18 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 均已完成並關閉；里程碑 3 的 **`SLICE-M3-01 B-02 期間工作台`（2026-08-11）與
 `SLICE-M3-02 折算與 CTA`與 `SLICE-M3-03 折算調節核對與期間級 G-07`
 （皆 2026-08-12，CLOSED／PASS）亦已正式關閉**。
-現有 43 份 migration；完整實跑結果為 **1,321**（單元 66、DB 整合 819、端到端 436），
-最新一輪全綠（HEAD `a564ea5`，已 push）。
+現有 44 份 migration；完整實跑結果為 **1,377**（單元 66、DB 整合 875、端到端 436），
+最新一輪全綠（HEAD `6a1a3b7`；`25d84dd` 之後尚未 push）。
 
 **進行中：`SLICE-M3-04 現金流支持資料`的第一段、第二段 2a 與 2b 第一項已完成**。
 0039～0041 建立模型、結構守衛與用途封套；0042 完成十一張表的父鏈／版本鏈守衛、
 十九支 system-only 工作流函式、零活動的 R2 確認＋R3 覆核，以及映射的
 R2→R3→R4／SoD／重疊／靜態粒度控制；**0043 把現金流支持 run 的建立收斂成單一
 system-only 入口**（案件層 R2、多批次來源在同一交易內凍結、`FOR UPDATE` 使批次
-狀態變更不得穿過建立交易；已複核通過並 push）。**下一步是 2b 第二刀 A：CFS Manifest
-的 system-only 凍結入口與 `fn_manifest_verify` 驗證**——結果雜湊與 replay 已改排到
-支持資料列那一刀（沒有真實輸出前重演等於拿 Manifest 雜湊冒充結果雜湊）。
+狀態變更不得穿過建立交易；已複核通過並 push）。0044 再把 CFS Manifest 的凍結收斂成唯一 system-only 入口（顯式版本輸入、
+單一 statement 物化、結構契約查證）。**下一步是 2b 第三刀：`CashFlowSupportLine`
+原樣承接 ＋ 結果雜湊與 replay**（同一刀——沒有真實輸出前重演等於拿 Manifest 雜湊
+冒充結果雜湊）。
 不得回頭重做 2a／0043，也不得把後續畫面混進同一刀。
 細節見 `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-04-PHASE1.md`。
 
@@ -118,13 +119,13 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,321 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,377 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
 | `pnpm test:db:<domain>` | mapping／adjustment／period／basis／fx／**cashflow** 各自單跑（自行重建 DB 並補齊前置） | 依領域實測 |
 | `pnpm test:quick` | 單元＋DB 整合全部 | 依本機實測 |
-| `pnpm test`（＝`test:full`） | 完整 1,321 條 | **依本機實測為準** |
+| `pnpm test`（＝`test:full`） | 完整 1,377 條 | **依本機實測為準** |
 | `pnpm test:acceptance:<suite>` | 十支端到端各自單跑 | 8～54 秒 |
 | `pnpm test:timing` | 逐 suite 耗時 | — |
 
@@ -170,7 +171,7 @@ fixture **幂等**：單跑時自行建立前置，聚合時偵測到既有狀�
   兩支 readiness、0036～0038）
 - `docs/handoffs/SESSION_HANDOFF_2026-08-12_SLICE-M3-04-PHASE1.md`（**最新接續入口**：
   檔名保留以避免交接連結分岔；內容已更新至 0043／2b 第一刀關閉，
-  下一步為 2b 第二刀 A：CFS Manifest system-only 凍結入口）
+  下一步為 2b 第三刀：支持資料列＋結果雜湊與 replay）
 
 跨 session、尚未形成決策的產品議題統一記入 `docs/FUTURE_DISCUSSIONS.md`；目前 DISC-001
 追蹤「控制強度與事務所實用性的平衡」。它不改變正式基線或目前計畫；形成可執行決策後，
