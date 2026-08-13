@@ -1013,6 +1013,33 @@ expect_err "0043：在別的租戶脈絡下不得建立本租戶的 run" \
   "CROSS_TENANT_DENIED"
 no_run "${MF}" "跨租戶脈絡發起"
 
+# 0046 起凍結會把功能幣／報告幣一起封存，因此指派必須在**第一次凍結之前**就位
+# 幣別指派：聚合模式下 fx 套件已建好同範圍的指派，這裡只在缺的時候補
+_has reporting_unit_currency_assignment "reporting_unit_id='${UNIT}' AND currency_role='FUNCTIONAL' AND approved_at IS NOT NULL" \
+  || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（功能幣指派）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by)
+VALUES ('${TEN}','${ENG}','${UNIT}','FUNCTIONAL','JPY','[2020-01-01,)','${JIA}');
+SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
+  WHERE reporting_unit_id='${UNIT}' AND currency_role='FUNCTIONAL'),'${CFR4}');
+SQL
+_has reporting_unit_currency_assignment "reporting_unit_id='${UNIT}' AND currency_role='REPORTING' AND approved_at IS NOT NULL" \
+  || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（報告幣指派）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by)
+VALUES ('${TEN}','${ENG}','${UNIT}','REPORTING','CNY','[2020-01-01,)','${JIA}');
+SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
+  WHERE reporting_unit_id='${UNIT}' AND currency_role='REPORTING'),'${CFR4}');
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM reporting_unit_currency_assignment
+     WHERE reporting_unit_id='${UNIT}' AND approved_at IS NOT NULL
+       AND effective_range @> DATE '2026-03-31'
+       AND effective_range @> DATE '2030-05-31'")
+[ "${n}" = "2" ] && ok "0044 前置：本單位有已批准的功能幣與報告幣指派（涵蓋各期期末）" \
+  || ng "0044 前置：涵蓋期末的已批准指派為 ${n} 筆"
+
 # ── 正控制：多筆合法批次，經 app_runtime 走**凍結入口** ──
 # 0044 起 0043 的入口降為內部 helper（app_runtime 已無 EXECUTE），因此正控制改走
 # 唯一對外入口 fn_cash_flow_support_freeze_and_run——它凍結完整 Manifest 之後才
@@ -1214,13 +1241,13 @@ MFPART=c0440000-0000-0000-0000-000000000302
 PSQL_C >/dev/null 2>&1 <<SQL
 ${T1}
 WITH e AS (SELECT fn_fx_freeze_entry2('[]'::jsonb,'SCOPE',NULL,'scope','1',
-             '{"calculation_scope":"CASH_FLOW_SUPPORT"}'::jsonb)->0 AS x)
+             '{"calculation_scope":"CASH_FLOW_SUPPORT","materialization_contract_version":"cfs-mat-1","period_end_date":"2026-03-31","functional_currency":"JPY"}'::jsonb)->0 AS x)
 INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
         calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
 SELECT '${MFPART}','${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2',
        fn_fx_sha(x->>'hash'),'${JIA}' FROM e;
 WITH e AS (SELECT fn_fx_freeze_entry2('[]'::jsonb,'SCOPE',NULL,'scope','1',
-             '{"calculation_scope":"CASH_FLOW_SUPPORT"}'::jsonb)->0 AS x)
+             '{"calculation_scope":"CASH_FLOW_SUPPORT","materialization_contract_version":"cfs-mat-1","period_end_date":"2026-03-31","functional_currency":"JPY"}'::jsonb)->0 AS x)
 INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
         domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
 SELECT '${TEN}','${MFPART}',x->>'object_type',NULL,x->>'kind',x->>'value',
@@ -1451,30 +1478,7 @@ VALUES ('${CTA3}','${TEN}','88888888-0000-0000-0000-000000000001','3999','外幣
 UPDATE account SET translation_category='ASSET'  WHERE account_id='${ACC1}';
 UPDATE account SET translation_category='EXPENSE' WHERE account_id='${ACC2}';
 SQL
-# 幣別指派：聚合模式下 fx 套件已建好同範圍的指派，這裡只在缺的時候補
-_has reporting_unit_currency_assignment "reporting_unit_id='${UNIT}' AND currency_role='FUNCTIONAL' AND approved_at IS NOT NULL" \
-  || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（功能幣指派）建立失敗（fail closed）"; exit 1; }
-${T1}
-INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
-        currency_role, currency_code, effective_range, created_by)
-VALUES ('${TEN}','${ENG}','${UNIT}','FUNCTIONAL','JPY','[2020-01-01,)','${JIA}');
-SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
-  WHERE reporting_unit_id='${UNIT}' AND currency_role='FUNCTIONAL'),'${CFR4}');
-SQL
-_has reporting_unit_currency_assignment "reporting_unit_id='${UNIT}' AND currency_role='REPORTING' AND approved_at IS NOT NULL" \
-  || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（報告幣指派）建立失敗（fail closed）"; exit 1; }
-${T1}
-INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
-        currency_role, currency_code, effective_range, created_by)
-VALUES ('${TEN}','${ENG}','${UNIT}','REPORTING','CNY','[2020-01-01,)','${JIA}');
-SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
-  WHERE reporting_unit_id='${UNIT}' AND currency_role='REPORTING'),'${CFR4}');
-SQL
-n=$(PSQL_C <<<"${T1} SELECT count(*) FROM reporting_unit_currency_assignment
-     WHERE reporting_unit_id='${UNIT}' AND approved_at IS NOT NULL
-       AND effective_range @> DATE '2030-05-31'")
-[ "${n}" = "2" ] && ok "0044 前置：本單位有已批准的功能幣與報告幣指派（涵蓋第三期期末）" \
-  || ng "0044 前置：涵蓋期末的已批准指派為 ${n} 筆"
+
 _has exchange_rate_version "rate_version_id = '${FXV3}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（匯率版本）建立失敗（fail closed）"; exit 1; }
 ${T1}
 INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
@@ -1781,5 +1785,199 @@ wait ${APID}
 n=$(PSQL_C <<<"${T1} SELECT count(*) FROM period_cash_flow_source_selection WHERE period_revision_id='${PR3}'")
 [ "${n}" -ge 2 ] && ok "0045：改選在凍結提交後才生效（第三期已有 ${n} 版選定）" \
   || ng "0045：改選未生效（${n} 版）"
+
+# ══ 13　0046（3A）：物化契約升版 ＋ 私有解析器 ═══════════════════════
+# 本段只驗「凍結契約」與「解析」。判定（DATA_PRESENT／粒度／完整度／K1～K4）、
+# 支持列落地、結果雜湊與 replay 屬 3B～3D，本段不得出現任何支持列。
+
+# ── SCOPE 的新版必要欄位 ──
+n=$(PSQL_C <<<"${T1} SELECT (payload->>'materialization_contract_version')||'/'||
+     (payload->>'period_end_date')||'/'||(payload->>'functional_currency')||'/'||
+     COALESCE(payload->>'reporting_currency','-')
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='SCOPE'")
+[ "${n}" = "cfs-mat-1/2026-03-31/JPY/CNY" ] \
+  && ok "0046：SCOPE 凍結了物化契約版本、期間終了日與幣別（解析不必回查主檔）" \
+  || ng "0046：SCOPE 新版欄位為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT (payload->>'functional_assignment_id' IS NOT NULL)::text
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='SCOPE'")
+[ "${n}" = "true" ] && ok "0046：幣別指派的 ID 也一併凍結（幣別可追溯到哪一份指派）" \
+  || ng "0046：幣別指派 ID 未凍結"
+
+# ── 解析器：私有、驗租戶 ──
+n=$(PSQL_C <<<"SELECT has_function_privilege('app_runtime','fn_cf_parse_support_candidates(uuid)','EXECUTE')::text")
+[ "${n}" = "false" ] && ok "0046：解析器未授權 app_runtime（SECURITY DEFINER 通則）" \
+  || ng "0046：app_runtime 可執行解析器"
+n=$(APP_C <<<"${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')" 2>&1 | grep -c "permission denied")
+[ "${n}" -ge 1 ] && ok "0046：app_runtime 直接呼叫解析器被權限擋下" || ng "0046：app_runtime 仍呼叫得動解析器"
+expect_err "0046：在別的租戶脈絡下不得解析本租戶的 run" \
+  "${T2} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')" "CROSS_TENANT_DENIED"
+expect_err "0046：非現金流 scope 的 run 不得進解析器" \
+  "${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN_OK}')" "CFS_PARSE_SCOPE_MISMATCH"
+
+# ── 解析正控制：金額幣別原樣、命中唯一規則 ──
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')")
+[ "${n}" = "1" ] && ok "0046：首期的凍結集合解析出 1 筆候選列" || ng "0046：候選列數為 ${n}"
+n=$(PSQL_C <<<"${T1} SELECT class_code||'/'||class_kind||'/'||COALESCE(activity,'-')||'/'||
+     signed_amount_functional::text||'/'||functional_currency||'/'||
+     COALESCE(signed_amount_reporting::text,'-')||'/'||COALESCE(reporting_currency,'-')||'/'||
+     actual_granularity FROM fn_cf_parse_support_candidates('${RUN43}')")
+m=$(PSQL_C <<<"${T1} SELECT (payload->>'signed_amount_functional')||'/'||(payload->>'functional_currency')
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_SOURCE_FACT'")
+echo "${n}" | grep -q "^OP-01/ACTIVITY/OPERATING/${m%%/*}/${m##*/}/" \
+  && ok "0046：候選列的分類與金額幣別逐欄原樣承接自凍結事實（${n}）" \
+  || ng "0046：候選列為 ${n}，凍結事實為 ${m}"
+n=$(PSQL_C <<<"${T1} SELECT (c.mapping_rule_id::text = r->>'mapping_rule_id')::text
+     FROM fn_cf_parse_support_candidates('${RUN43}') c,
+          calculation_manifest_entry e, jsonb_array_elements(e.payload->'rules') r
+     WHERE e.manifest_id='${MANI43}' AND e.object_type='CASH_FLOW_MAPPING_VERSION'
+       AND (r->>'effective_from')::date <= DATE '2026-03-31'
+       AND (r->>'effective_to')::date >= DATE '2026-03-31'
+       AND r->>'source_kind'='ACCOUNT'")
+[ "${n}" = "true" ] \
+  && ok "0046：命中的是**生效區間涵蓋凍結期間終了日**的那一條規則（另一條同科目規則未被選中）" \
+  || ng "0046：命中規則不符（${n}）"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_support_line WHERE calculation_run_id='${RUN43}'")
+m=$(PSQL_C <<<"${T1} SELECT status||'/'||COALESCE(result_content_hash,'-') FROM calculation_run
+     WHERE calculation_run_id='${RUN43}'")
+[ "${n}" = "0" ] && [ "${m}" = "RUNNING/-" ] \
+  && ok "0046：3A 只解析——不寫支持列、不設結果雜湊、不宣告 Run 完成" \
+  || ng "0046：支持列 ${n} 筆／run 狀態 ${m}"
+
+# ── 解析只讀凍結內容：改 live 主檔不得影響結果 ──
+BEFORE=$(PSQL_C <<<"${T1} SELECT string_agg(source_fact_id::text||'>'||mapping_rule_id::text,',' ORDER BY source_fact_id)
+         FROM fn_cf_parse_support_candidates('${RUN43}')")
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE cash_flow_mapping_rule DISABLE TRIGGER USER;
+UPDATE cash_flow_mapping_rule SET effective_to = DATE '2026-02-01'
+ WHERE mapping_version_id='${MAPA}' AND source_kind='ACCOUNT';
+ALTER TABLE cash_flow_mapping_rule ENABLE TRIGGER USER;
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_mapping_rule
+     WHERE mapping_version_id='${MAPA}' AND effective_to = DATE '2026-02-01'")
+[ "${n}" -ge 1 ] && ok "0046 前置：現行映射主檔已被改動（生效區間縮到期間之前）" \
+  || ng "0046 前置：主檔改動未生效"
+AFTER=$(PSQL_C <<<"${T1} SELECT string_agg(source_fact_id::text||'>'||mapping_rule_id::text,',' ORDER BY source_fact_id)
+        FROM fn_cf_parse_support_candidates('${RUN43}')")
+[ -n "${BEFORE}" ] && [ "${BEFORE}" = "${AFTER}" ] \
+  && ok "0046：改動現行映射主檔後解析結果完全不變（解析只讀凍結 payload）" \
+  || ng "0046：解析結果被現行主檔影響（前 ${BEFORE}／後 ${AFTER}）"
+
+# ── 未映射與多重映射：先證明前置狀態，再驗拒絕理由 ──
+# 竄改凍結集合本身來造出這兩種情形（凍結內容是解析的唯一輸入）
+tamper_rules() {  # $1=manifest $2=新的 rules 陣列
+  PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{rules}', '$2'::jsonb)
+ WHERE manifest_id='$1' AND object_type='CASH_FLOW_MAPPING_VERSION';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+}
+ORIG_RULES=$(PSQL_C <<<"${T1} SELECT (payload->'rules')::text FROM calculation_manifest_entry
+             WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_MAPPING_VERSION'")
+tamper_rules "${MANI43}" "[]"
+n=$(PSQL_C <<<"${T1} SELECT jsonb_array_length(payload->'rules') FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_MAPPING_VERSION'")
+[ "${n}" = "0" ] && ok "0046 前置：凍結映射已清空（事實仍在，因此擋它的只能是未映射）" \
+  || ng "0046 前置：凍結映射為 ${n} 條"
+expect_err "0046：事實未命中任何凍結規則 → 未映射就是未映射（不得歸入預設分類）" \
+  "${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')" "CFS_UNMAPPED_SOURCE"
+DUP=$(PSQL_C <<<"${T1} SELECT (jsonb_agg(r) || jsonb_agg(jsonb_set(r,'{mapping_rule_id}',
+      to_jsonb(gen_random_uuid()::text))))::text
+      FROM jsonb_array_elements('${ORIG_RULES}'::jsonb) r WHERE r->>'source_kind'='ACCOUNT'
+        AND (r->>'effective_from')::date <= DATE '2026-03-31'
+        AND (r->>'effective_to')::date >= DATE '2026-03-31'")
+tamper_rules "${MANI43}" "${DUP}"
+n=$(PSQL_C <<<"${T1} SELECT jsonb_array_length(payload->'rules') FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_MAPPING_VERSION'")
+[ "${n}" = "2" ] && ok "0046 前置：凍結映射改為兩條同來源同生效期的規則" \
+  || ng "0046 前置：凍結映射為 ${n} 條"
+expect_err "0046：同一事實命中多條凍結規則 → 映射歧義" \
+  "${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')" "CFS_MAPPING_AMBIGUOUS"
+tamper_rules "${MANI43}" "${ORIG_RULES}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')")
+[ "${n}" = "1" ] && ok "0046：還原凍結映射後解析恢復為 1 筆（證明上兩條擋的就是那次改動）" \
+  || ng "0046：還原後候選列為 ${n}"
+
+# ── 命中的分類必須在凍結的分類集合內 ──
+ORIG_CLASSES=$(PSQL_C <<<"${T1} SELECT (payload->'classes')::text FROM calculation_manifest_entry
+               WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_CLASS_SET_VERSION'")
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{classes}','[]'::jsonb)
+ WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_CLASS_SET_VERSION';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+n=$(PSQL_C <<<"${T1} SELECT jsonb_array_length(payload->'classes') FROM calculation_manifest_entry
+     WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_CLASS_SET_VERSION'")
+[ "${n}" = "0" ] && ok "0046 前置：凍結的分類集合已清空（映射仍在，擋它的只能是分類不在集合內）" \
+  || ng "0046 前置：凍結分類為 ${n} 個"
+expect_err "0046：命中的規則指向凍結集合外的分類 → fail closed（支持列不得帶集合裡沒有的分類）" \
+  "${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')" "CFS_PARSE_CLASS_NOT_IN_SET"
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry SET payload = jsonb_set(payload,'{classes}','${ORIG_CLASSES}'::jsonb)
+ WHERE manifest_id='${MANI43}' AND object_type='CASH_FLOW_CLASS_SET_VERSION';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+
+# ── 契約版本：未知版本一律 fail closed ──
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry
+   SET payload = jsonb_set(payload,'{materialization_contract_version}','"cfs-mat-99"')
+ WHERE manifest_id='${MANI43}' AND object_type='SCOPE';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+expect_err "0046：未知的物化契約版本 → 解析 fail closed" \
+  "${T1} SELECT count(*) FROM fn_cf_parse_support_candidates('${RUN43}')" \
+  "CFS_MANIFEST_CONTRACT_VERSION_UNSUPPORTED"
+# 「舊集合」不能用竄改模擬——竄改會先被完整性驗證抓到（那是別的理由）。
+# 真正的舊集合是**雜湊自洽卻缺欄位**，因此手工建一份。
+MFOLD=c0440000-0000-0000-0000-000000000304
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+WITH e AS (SELECT fn_fx_freeze_entry2('[]'::jsonb,'SCOPE',NULL,'scope','1',
+             '{"calculation_scope":"CASH_FLOW_SUPPORT"}'::jsonb)->0 AS x)
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by)
+SELECT '${MFOLD}','${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2',
+       fn_fx_sha(x->>'hash'),'${JIA}' FROM e;
+WITH e AS (SELECT fn_fx_freeze_entry2('[]'::jsonb,'SCOPE',NULL,'scope','1',
+             '{"calculation_scope":"CASH_FLOW_SUPPORT"}'::jsonb)->0 AS x)
+INSERT INTO calculation_manifest_entry (tenant_id, manifest_id, object_type, object_id,
+        domain_version_kind, domain_version_value, content_canonical, content_hash, payload)
+SELECT '${TEN}','${MFOLD}',x->>'object_type',NULL,x->>'kind',x->>'value',
+       x->>'canonical',x->>'hash',x->'payload' FROM e;
+SQL
+expect_ok "0046 前置：舊版樣本的雜湊自洽（完整性驗證會通過，擋它的只能是契約版本）" \
+  "${T1} SELECT fn_manifest_verify('${MFOLD}')"
+expect_err "0046：缺物化契約版本的舊集合 → 結構契約 fail closed（不得回查主檔補值）" \
+  "${T1} SELECT fn_cf_manifest_assert_contract('${MFOLD}')" \
+  "CFS_MANIFEST_CONTRACT_VERSION_UNSUPPORTED"
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE calculation_manifest_entry DISABLE TRIGGER USER;
+UPDATE calculation_manifest_entry
+   SET payload = jsonb_set(payload,'{materialization_contract_version}','"cfs-mat-1"')
+ WHERE manifest_id='${MANI43}' AND object_type='SCOPE';
+ALTER TABLE calculation_manifest_entry ENABLE TRIGGER USER;
+SQL
+
+# ── SECURITY DEFINER 通則：三種前綴一起掃 ──
+n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+     WHERE ns.nspname='public' AND p.proname ~ '^fn_(cf|cfs|cash_flow|calc)_' AND p.prosecdef
+       AND NOT ('search_path=pg_catalog, public' = ANY(COALESCE(p.proconfig,ARRAY['']::text[])))")
+[ "${n}" = "0" ] && ok "0046：fn_cf_／fn_cfs_／fn_cash_flow_／fn_calc_ 的 DEFINER 函式都固定 search_path" \
+  || ng "0046：${n} 支未固定 search_path"
+n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+     WHERE ns.nspname='public' AND p.proname ~ '^fn_(cf|cfs|cash_flow|calc)_' AND p.prosecdef
+       AND has_function_privilege('public', p.oid, 'EXECUTE')")
+[ "${n}" = "0" ] && ok "0046：以上四種前綴的 DEFINER 函式一律撤回 PUBLIC" \
+  || ng "0046：${n} 支仍對 PUBLIC 開放"
 
 [ "${STANDALONE:-0}" = "1" ] && summary

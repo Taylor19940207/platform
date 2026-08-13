@@ -18,7 +18,7 @@
 4. `docs/baseline/基本設計書_v1.1.md` §24～§28：系統邊界與角色、狀態流程、領域資料模型、模組架構、畫面操作。若要新增里程碑 2 功能，這五節必讀；若只驗證本機環境，可先讀 §27 與相關 ADR。
 5. `docs/adr/ADR-LOCAL-001.md` 與 `docs/SANDBOX.md`：只用來理解沙箱原型的來源；沙箱已不是權威環境。
 6. `package.json`、`.env.example`、`docker-compose.yml`、`scripts/dev.mjs`、`scripts/env.sh`。
-7. `packages/domain/src/importBatch.ts`、四十五份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
+7. `packages/domain/src/importBatch.ts`、四十六份 `packages/database/migrations/*.sql`、`packages/database/src/psql.ts`。
 8. **API 已模組化**：`apps/api/src/server.ts` 只剩 54 行（health、開發登入、Session 建構、
    dispatcher、listen）。業務路由在 `apps/api/src/modules/<domain>/`，經
    `apps/api/src/http/dispatch.ts` 分派；`http/{context,respond}.ts` 是 HTTP 邊界。
@@ -47,7 +47,7 @@ macOS 已正式成為權威開發環境；Docker、migration、seed、持久性�
 均已完成並關閉；里程碑 3 的 **`SLICE-M3-01 B-02 期間工作台`（2026-08-11）與
 `SLICE-M3-02 折算與 CTA`與 `SLICE-M3-03 折算調節核對與期間級 G-07`
 （皆 2026-08-12，CLOSED／PASS）亦已正式關閉**。
-現有 45 份 migration；完整實跑結果為 **1,402**（單元 66、DB 整合 899、端到端 437），
+現有 46 份 migration；完整實跑結果為 **1,426**（單元 66、DB 整合 923、端到端 437），
 最新一輪全綠（HEAD `111219d`，已 push）。
 
 **進行中：`SLICE-M3-04 現金流支持資料`的第一段、第二段 2a 與 2b 第一項已完成**。
@@ -119,7 +119,7 @@ Engagement 必須明示授權，租戶層角色不得隱式取得客戶資料。
 只加負面測試不夠——用來反證的使用者必須是**角色種類正確、作用域錯誤**的樣本，
 否則反轉作用域時測試不會紅（種子因此有租戶層庚 R3、辛 R2）。
 
-**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,402 條：
+**測試分級（2026-08-08 實測後建立）**——日常不要每次都跑完整 1,426 條：
 
 | 指令 | 範圍 | 耗時 |
 |---|---|---|
