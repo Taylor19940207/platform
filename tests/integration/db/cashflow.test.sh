@@ -609,8 +609,13 @@ INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer,
         account_code, account_name, debit, credit) VALUES
   ('${TEN}','${RUN_OK}','SOURCE_TB','${ACC1}','1002','银行存款',1000.00,0),
   ('${TEN}','${RUN_OK}','SOURCE_TB','${ACC2}','6602','管理费用',0,1000.00);
+-- 結果雜湊用 fn_calc_result_hash 實算：0045 起凍結會在當下復驗，
+-- 填假雜湊等於讓那道控制永遠測不到。
+UPDATE calculation_run SET status='COMPLETED',
+       result_content_hash = fn_calc_result_hash(calculation_run_id)
+ WHERE calculation_run_id = '${RUN_OK}';
 UPDATE calculation_run SET status='COMPLETED', result_content_hash='r1'
- WHERE calculation_run_id IN ('${RUN_OK}','${RUN_FX}');
+ WHERE calculation_run_id = '${RUN_FX}';
 SQL
 n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run
      WHERE calculation_run_id IN ('${RUN_OK}','${RUN_FX}') AND status='COMPLETED'")
@@ -691,8 +696,16 @@ INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, perio
    'PREVIEW','RUNNING',gen_random_uuid(),'h4','1.0.0','${JIA}'),
   ('${RUN_P2FX}','${TEN}','${ENG}','${PR2}','${B_P2}','c0440000-0000-0000-0000-000000000112',
    'PREVIEW','RUNNING',gen_random_uuid(),'h5','1.0.0','${JIA}');
+-- 前期來源 run 必須有實際輸出：0044 凍結的是行資料，空的 run 會讓「逐筆相等」變成空證
+INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer, account_id,
+        account_code, account_name, debit, credit) VALUES
+  ('${TEN}','${RUN_P2}','SOURCE_TB','${ACC1}','1002','银行存款',2000.00,0),
+  ('${TEN}','${RUN_P2}','SOURCE_TB','${ACC2}','6602','管理费用',0,2000.00);
+UPDATE calculation_run SET status='COMPLETED',
+       result_content_hash = fn_calc_result_hash(calculation_run_id)
+ WHERE calculation_run_id = '${RUN_P2}';
 UPDATE calculation_run SET status='COMPLETED', result_content_hash='r2'
- WHERE calculation_run_id IN ('${RUN_P2}','${RUN_P2FX}');
+ WHERE calculation_run_id = '${RUN_P2FX}';
 SQL
 n=$(PSQL_C <<<"${T1} SELECT previous_reporting_period_id='dddddddd-0000-0000-0000-000000000001'
      FROM reporting_period WHERE reporting_period_id='${RP2}'")
@@ -1420,10 +1433,115 @@ INSERT INTO balance_snapshot_line (tenant_id, calculation_run_id, posting_layer,
 UPDATE calculation_run SET status='COMPLETED', result_content_hash='r-p3', completed_at=now()
  WHERE calculation_run_id='${RUN_P3}';
 SQL
+# ── 第三期的本期來源是**引擎真正產生的折算 run** ──
+# 不手工拼 translation_result：它的 result hash 涵蓋規則、component 與 CTA 證據，
+# 手工拼出來的東西無法用來證明「凍結的 payload 足以重算來源 result hash」。
+CFR6=af420000-0000-0000-0000-000000000007
+FXV3=c0490000-0000-0000-0000-000000000041
+POLV3=c0490000-0000-0000-0000-000000000042
+CTA3=ac000000-0000-0000-0000-000000000041
+_has app_user "user_id = '${CFR6}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（R6／科目）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO app_user (user_id, tenant_id, email, display_name)
+VALUES ('${CFR6}','${TEN}','cf-r6@t1.jp','租戶層 R6');
+INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id)
+VALUES ('${TEN}','${CFR6}','R6',NULL);
+INSERT INTO account (account_id, tenant_id, coa_id, code, name, translation_category)
+VALUES ('${CTA3}','${TEN}','88888888-0000-0000-0000-000000000001','3999','外幣報表折算差額','EQUITY_RETAINED');
+UPDATE account SET translation_category='ASSET'  WHERE account_id='${ACC1}';
+UPDATE account SET translation_category='EXPENSE' WHERE account_id='${ACC2}';
+SQL
+# 幣別指派：聚合模式下 fx 套件已建好同範圍的指派，這裡只在缺的時候補
+_has reporting_unit_currency_assignment "reporting_unit_id='${UNIT}' AND currency_role='FUNCTIONAL' AND approved_at IS NOT NULL" \
+  || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（功能幣指派）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by)
+VALUES ('${TEN}','${ENG}','${UNIT}','FUNCTIONAL','JPY','[2020-01-01,)','${JIA}');
+SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
+  WHERE reporting_unit_id='${UNIT}' AND currency_role='FUNCTIONAL'),'${CFR4}');
+SQL
+_has reporting_unit_currency_assignment "reporting_unit_id='${UNIT}' AND currency_role='REPORTING' AND approved_at IS NOT NULL" \
+  || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（報告幣指派）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO reporting_unit_currency_assignment (tenant_id, engagement_id, reporting_unit_id,
+        currency_role, currency_code, effective_range, created_by)
+VALUES ('${TEN}','${ENG}','${UNIT}','REPORTING','CNY','[2020-01-01,)','${JIA}');
+SELECT fn_currency_assignment_approve((SELECT assignment_id FROM reporting_unit_currency_assignment
+  WHERE reporting_unit_id='${UNIT}' AND currency_role='REPORTING'),'${CFR4}');
+SQL
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM reporting_unit_currency_assignment
+     WHERE reporting_unit_id='${UNIT}' AND approved_at IS NOT NULL
+       AND effective_range @> DATE '2030-05-31'")
+[ "${n}" = "2" ] && ok "0044 前置：本單位有已批准的功能幣與報告幣指派（涵蓋第三期期末）" \
+  || ng "0044 前置：涵蓋期末的已批准指派為 ${n} 筆"
+_has exchange_rate_version "rate_version_id = '${FXV3}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（匯率版本）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO exchange_rate_version (rate_version_id, tenant_id, engagement_id, label,
+        series_id, version_no, created_by)
+VALUES ('${FXV3}','${TEN}','${ENG}','現金流第三期匯率','c0490000-0000-0000-0000-000000000141',1,'${CFR6}');
+SELECT fn_exchange_rate_observation_add('${FXV3}','JPY','CNY','CLOSING',0.05,'央行',
+       DATE '2030-05-31',NULL,NULL,NULL,'${CFR6}');
+SELECT fn_exchange_rate_observation_add('${FXV3}','JPY','CNY','AVERAGE',0.048,'央行',
+       NULL,DATE '2030-05-01',DATE '2030-05-31',NULL,'${CFR6}');
+INSERT INTO translation_policy_version (policy_version_id, tenant_id, engagement_id,
+        reporting_unit_id, label, cta_account_id, cta_coa_id, created_by)
+VALUES ('${POLV3}','${TEN}','${ENG}','${UNIT}','現金流第三期折算政策','${CTA3}',
+        '88888888-0000-0000-0000-000000000001','${JIA}');
+INSERT INTO translation_policy_rule (tenant_id, policy_version_id, translation_category, method) VALUES
+  ('${TEN}','${POLV3}','ASSET','CLOSING'),('${TEN}','${POLV3}','EXPENSE','AVERAGE');
+SQL
+expect_ok "0044 前置：匯率版本走完 R2 → R3 → R4 並批准折算政策" \
+  "${T1} SELECT fn_exchange_rate_transition('${FXV3}','DRAFT','SUBMITTED','${JIA}','R2');
+   SELECT fn_exchange_rate_transition('${FXV3}','SUBMITTED','REVIEWED','${CFR3}','R3');
+   SELECT fn_exchange_rate_transition('${FXV3}','REVIEWED','APPROVED','${CFR4}','R4');
+   SELECT fn_translation_policy_approve('${POLV3}','${CFR4}')"
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+SELECT fn_period_fx_select_inputs('${PR3}','${RUN_P3}','${FXV3}','${POLV3}','${JIA}');
+SQL
+FXRUN3=$(PSQL_C <<<"${T1} SELECT fn_fx_translation_run('${TEN}','${ENG}','${PR3}','${UNIT}',
+         '${RUN_P3}','${FXV3}','${POLV3}','${JIA}','fx-1.0.0')" 2>/dev/null)
+[ -n "${FXRUN3}" ] && ok "0044 前置：引擎產生第三期的折算 run（真實 translation_result 與 component）" \
+  || ng "0044 前置：折算 run 建立失敗"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM translation_result WHERE calculation_run_id='${FXRUN3}'")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM translation_result_component c
+     JOIN translation_result r ON r.translation_result_id=c.translation_result_id
+     WHERE r.calculation_run_id='${FXRUN3}'")
+[ "${n}" -ge 2 ] && [ "${m}" -ge 2 ] \
+  && ok "0044 前置：折算 run 有 ${n} 筆 translation_result 與 ${m} 筆 component（非空證）" \
+  || ng "0044 前置：折算輸出為 ${n}／${m}"
+# 折算結果選定：現金流的來源若是折算 run，兩個選定不得各說各話
+TOLV=c0490000-0000-0000-0000-000000000031
+RECON=c04a0000-0000-0000-0000-000000000031
+_has rounding_tolerance_version "tolerance_version_id = '${TOLV}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（容許值）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO rounding_tolerance_version (tolerance_version_id, tenant_id, engagement_id,
+        reporting_unit_id, source_currency, target_currency, single_limit, cumulative_limit,
+        series_id, version_no, created_by)
+VALUES ('${TOLV}','${TEN}','${ENG}','${UNIT}','JPY','CNY',1.00,10.00,
+        'c0490000-0000-0000-0000-000000000131',1,'${CFR4}');
+SQL
+expect_ok "0044 前置：R4 批准容許值版本" "${T1} SELECT fn_rounding_tolerance_approve('${TOLV}','${CFR4}')"
+_has translation_reconciliation "reconciliation_id = '${RECON}'" || PSQL_C >/dev/null <<SQL || { ng "0044 fixture（折算調節）建立失敗（fail closed）"; exit 1; }
+${T1}
+INSERT INTO translation_reconciliation (reconciliation_id, tenant_id, engagement_id,
+        reporting_unit_id, period_revision_id, calculation_run_id, tolerance_version_id,
+        tolerance_content_hash, single_limit_snapshot, cumulative_limit_snapshot,
+        scope_snapshot, reconciliation_engine_version, canonicalization_version,
+        reconciliation_input_hash, finalized_by)
+VALUES ('${RECON}','${TEN}','${ENG}','${UNIT}','${PR3}','${FXRUN3}','${TOLV}',
+        'tol-h',1.00,10.00,'{"pair":"JPY->CNY"}'::jsonb,'1.0.0','sqlcanon-2','recon-h','${CFR4}');
+SQL
+expect_ok "0044 前置：R4 選定第三期的折算結果" \
+  "${T1} SELECT fn_period_fx_select_run('${PR3}','${FXRUN3}','${RECON}','${CFR4}')"
 PRIOR3=$(PSQL_C <<<"${T1} SELECT current_run_id FROM period_cash_flow_source_selection
          WHERE cf_selection_id = fn_current_cf_source_selection('${PR2}')")
-expect_ok "0044 前置：R4 以前期已選定結果選定第三期的權威來源" \
-  "${T1} SELECT fn_cf_select_source('${PR3}','${RUN_P3}','PRIOR_SELECTED_RUN','${PRIOR3}',NULL,'${CFR4}')"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='${PRIOR3}'")
+[ "${n}" -ge 2 ] && ok "0044 前置：前期已選定 run 有 ${n} 筆實際輸出（前期比較不是空證）" \
+  || ng "0044 前置：前期 run 只有 ${n} 筆輸出"
+expect_ok "0044 前置：R4 以折算結果與前期已選定 run 選定第三期的權威來源" \
+  "${T1} SELECT fn_cf_select_source('${PR3}','${FXRUN3}','PRIOR_SELECTED_RUN','${PRIOR3}',NULL,'${CFR4}')"
 n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_source_fact WHERE period_revision_id='${PR3}'")
 [ "${n}" = "0" ] && ok "0044 前置：第三期沒有任何金額事實（零活動是合法的，驗零事實分支）" \
   || ng "0044 前置：第三期已有 ${n} 筆事實"
@@ -1443,7 +1561,7 @@ m=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry
   || ng "0044：事實 ${n} 筆／封套資料集 ${m}"
 n=$(PSQL_C <<<"${T1} SELECT string_agg(payload->>'role'||':'||(payload->>'output_kind'),',' ORDER BY payload->>'role')
      FROM calculation_manifest_entry WHERE manifest_id='${MANI44}' AND object_type='SOURCE_CALCULATION_RUN'")
-[ "${n}" = "CURRENT:NO_FX,PRIOR:NO_FX" ] \
+[ "${n}" = "CURRENT:FX_TRANSLATION,PRIOR:NO_FX" ] \
   && ok "0044：前期已選定結果情境下凍結兩筆來源 run，且各自標明原始輸出形狀" \
   || ng "0044：來源 run 為 ${n}"
 n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry
@@ -1521,5 +1639,138 @@ wait ${APID}
 [ "${waited}" -ge 1 ] \
   && ok "0044 競態：同一期間的兩次凍結互相序列化（等待 ${waited}s，批次集合不相交仍序列化）" \
   || ng "0044 競態：第二次凍結未被序列化（等待 ${waited}s）"
+
+# ══ 12　0045：私有化、結果雜湊復驗、來源輸出證據完整 ═════════════════
+# ── P1-1：結構驗證 helper 不得成為跨租戶探測工具 ──
+n=$(PSQL_C <<<"SELECT has_function_privilege('app_runtime',
+     'fn_cf_manifest_assert_contract(uuid)','EXECUTE')::text")
+[ "${n}" = "false" ] && ok "0045：結構驗證 helper 已撤回 app_runtime 的 EXECUTE（僅內部使用）" \
+  || ng "0045：app_runtime 仍可執行結構驗證 helper"
+n=$(APP_C <<<"${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')" 2>&1 | grep -c "permission denied")
+[ "${n}" -ge 1 ] && ok "0045：app_runtime 直接呼叫結構驗證 helper 被權限擋下" \
+  || ng "0045：app_runtime 仍呼叫得動結構驗證 helper"
+expect_err "0045：在別的租戶脈絡下不得以已知 UUID 探測本租戶的凍結集合" \
+  "${T2} SELECT fn_cf_manifest_assert_contract('${MANI43}')" "CROSS_TENANT_DENIED"
+
+# ── P1-2：凍結當下復驗來源 run 的結果雜湊 ──
+n=$(PSQL_C <<<"${T1} SELECT (fn_calc_result_hash('${FXRUN3}') = result_content_hash)::text
+     FROM calculation_run WHERE calculation_run_id='${FXRUN3}'")
+[ "${n}" = "true" ] \
+  && ok "0045：FX 重算公式與引擎（fn_fx_materialize）一致——引擎產生的 run 對得上" \
+  || ng "0045：FX 重算與引擎不一致（${n}）"
+n=$(PSQL_C <<<"${T1} SELECT (fn_calc_result_hash('${PRIOR3}') = result_content_hash)::text
+     FROM calculation_run WHERE calculation_run_id='${PRIOR3}'")
+[ "${n}" = "true" ] && ok "0045：NO_FX 重算公式與該 run 記載的結果雜湊一致" \
+  || ng "0045：NO_FX 重算不一致（${n}）"
+
+SNAP=$(freeze_snapshot)
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE balance_snapshot_line DISABLE TRIGGER USER;
+UPDATE balance_snapshot_line SET debit = debit + 1
+ WHERE calculation_run_id='${PRIOR3}' AND account_code='1002';
+ALTER TABLE balance_snapshot_line ENABLE TRIGGER USER;
+SQL
+n=$(PSQL_C <<<"${T1} SELECT (fn_calc_result_hash('${PRIOR3}') <> result_content_hash)::text
+     FROM calculation_run WHERE calculation_run_id='${PRIOR3}'")
+[ "${n}" = "true" ] && ok "0045 前置：前期來源 run 的輸出已被竄改（重算雜湊與記載不符）" \
+  || ng "0045 前置：竄改未生效（${n}）"
+expect_err "0045：來源 run 的輸出被破壞 → 拒絕凍結（不得把損壞行＋舊雜湊一起封存）" \
+  "${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}','${POLA}','${MAPA}',
+     ARRAY['${B_P3}']::uuid[],'${JIA}','1.0.0')" "CFS_SOURCE_RUN_RESULT_HASH_MISMATCH"
+no_freeze "${SNAP}" "來源輸出損壞而拒絕凍結"
+PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+ALTER TABLE balance_snapshot_line DISABLE TRIGGER USER;
+UPDATE balance_snapshot_line SET debit = debit - 1
+ WHERE calculation_run_id='${PRIOR3}' AND account_code='1002';
+ALTER TABLE balance_snapshot_line ENABLE TRIGGER USER;
+SQL
+RUN45=$(PSQL_C <<<"${T1} SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}',
+        '${POLA}','${MAPA}',ARRAY['${B_P3}']::uuid[],'${JIA}','1.0.0')" 2>/dev/null)
+[ -n "${RUN45}" ] && ok "0045：還原竄改後凍結恢復成立（證明上一條擋的就是那次破壞）" \
+  || ng "0045：還原後仍無法凍結"
+MANI45=$(PSQL_C <<<"${T1} SELECT manifest_id FROM calculation_run WHERE calculation_run_id='${RUN45}'")
+
+# ── P1-2：FX payload 必須足以**由凍結內容重算**來源 run 的結果雜湊 ──
+n=$(PSQL_C <<<"${T1} SELECT (payload->'lines'->0 ? 'translation_policy_rule_id')::text||'/'||
+     (payload->'lines'->0 ? 'components')::text||'/'||
+     (jsonb_array_length(payload->'lines'->0->'components') > 0)::text||'/'||
+     (payload ? 'cta_lines')::text
+     FROM calculation_manifest_entry WHERE manifest_id='${MANI45}'
+       AND object_type='SOURCE_CALCULATION_RUN' AND payload->>'role'='CURRENT'")
+[ "${n}" = "true/true/true/true" ] \
+  && ok "0045：FX 來源凍結了命中規則、逐筆 component 與 CTA 證據" \
+  || ng "0045：FX payload 證據為 ${n}"
+RECALC=$(PSQL_C <<<"${T1}
+  WITH e AS (SELECT payload AS p FROM calculation_manifest_entry
+              WHERE manifest_id='${MANI45}' AND object_type='SOURCE_CALCULATION_RUN'
+                AND payload->>'role'='CURRENT'),
+  parts AS (
+    SELECT (l->>'source_account_code')||':'||(l->>'source_posting_layer')||':'||
+           (l->>'result_debit')||'/'||(l->>'result_credit')||':'||
+           COALESCE(l->>'translation_policy_rule_id','-')||'#'||
+           COALESCE((SELECT string_agg((c->>'source_kind')||'>'||
+                       COALESCE(c->>'exchange_rate_observation_id','-')||'>'||
+                       COALESCE(c->>'equity_lot_id','-')||'>'||
+                       COALESCE(c->>'opening_balance_id','-')||'>'||
+                       (c->>'result_debit')||'/'||(c->>'result_credit'), ','
+                     ORDER BY (c->>'line_no')::int)
+                     FROM jsonb_array_elements(l->'components') c), '') AS part
+      FROM e, jsonb_array_elements(e.p->'lines') l
+    UNION ALL
+    SELECT 'CTA:'||(t->>'account_id')||':'||(t->>'debit')||'/'||(t->>'credit')||':'||
+           (t->>'translation_policy_version_id')||':'||(t->>'exchange_rate_version_id')
+      FROM e, jsonb_array_elements(e.p->'cta_lines') t)
+  SELECT fn_fx_sha(string_agg(part,'|' ORDER BY part)) FROM parts")
+STORED=$(PSQL_C <<<"${T1} SELECT payload->>'result_content_hash' FROM calculation_manifest_entry
+         WHERE manifest_id='${MANI45}' AND object_type='SOURCE_CALCULATION_RUN'
+           AND payload->>'role'='CURRENT'")
+[ -n "${RECALC}" ] && [ "${RECALC}" = "${STORED}" ] \
+  && ok "0045：**只用凍結 payload** 就能重算出來源 FX run 的結果雜湊（重演不必回查結果表）" \
+  || ng "0045：由 payload 重算得 ${RECALC}，凍結記載為 ${STORED}"
+
+# ── P1-3：NO_FX 的「逐筆相等」必須是全欄位，且兩邊都非空 ──
+for role in CURRENT PRIOR; do
+  RID=$(PSQL_C <<<"${T1} SELECT payload->>'calculation_run_id' FROM calculation_manifest_entry
+        WHERE manifest_id='${MANI45}' AND object_type='SOURCE_CALCULATION_RUN'
+          AND payload->>'role'='${role}' AND payload->>'output_kind'='NO_FX'")
+  [ -z "${RID}" ] && continue
+  froz=$(PSQL_C <<<"${T1} SELECT string_agg((l->>'posting_layer')||'|'||(l->>'account_id')||'|'||
+         (l->>'account_code')||'|'||(l->>'account_name')||'|'||(l->>'debit')||'|'||(l->>'credit'),
+         E'\n' ORDER BY (l->>'snapshot_line_id')::bigint)
+         FROM calculation_manifest_entry e, jsonb_array_elements(e.payload->'lines') l
+         WHERE e.manifest_id='${MANI45}' AND e.object_type='SOURCE_CALCULATION_RUN'
+           AND e.payload->>'role'='${role}'")
+  live=$(PSQL_C <<<"${T1} SELECT string_agg(posting_layer||'|'||account_id||'|'||account_code||'|'||
+         account_name||'|'||debit::text||'|'||credit::text, E'\n' ORDER BY snapshot_line_id)
+         FROM balance_snapshot_line WHERE calculation_run_id='${RID}'")
+  cnt=$(PSQL_C <<<"${T1} SELECT count(*) FROM balance_snapshot_line WHERE calculation_run_id='${RID}'")
+  [ "${cnt}" -ge 2 ] && [ -n "${froz}" ] && [ "${froz}" = "${live}" ] \
+    && ok "0045：${role} 的 NO_FX 來源逐筆全欄位相等（層／科目／代碼／名稱／借／貸，${cnt} 筆非空）" \
+    || ng "0045：${role} 的凍結行資料與實際不符（${cnt} 筆）"
+done
+
+# ── P1-4：凍結與改選在期間列上序列化（0042 已 FOR UPDATE OF pr） ──
+( PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+BEGIN;
+SELECT fn_cash_flow_support_freeze_and_run('${PR3}','${UNIT}','${POLA}','${MAPA}',
+       ARRAY['${B_P3}']::uuid[],'${JIA}','1.0.0');
+SELECT pg_sleep(3);
+COMMIT;
+SQL
+) & APID=$!
+sleep 0.8
+start=$(date +%s)
+PSQL_C >/dev/null 2>&1 <<<"${T1} SELECT fn_cf_select_source('${PR3}','${FXRUN3}','PRIOR_SELECTED_RUN','${PRIOR3}',NULL,'${CFR4}')"
+waited=$(( $(date +%s) - start ))
+wait ${APID}
+[ "${waited}" -ge 1 ] \
+  && ok "0045：改選被凍結交易的期間列鎖擋住（等待 ${waited}s——凍結途中不可能有新版選定提交）" \
+  || ng "0045：改選未被序列化（等待 ${waited}s）"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM period_cash_flow_source_selection WHERE period_revision_id='${PR3}'")
+[ "${n}" -ge 2 ] && ok "0045：改選在凍結提交後才生效（第三期已有 ${n} 版選定）" \
+  || ng "0045：改選未生效（${n} 版）"
 
 [ "${STANDALONE:-0}" = "1" ] && summary

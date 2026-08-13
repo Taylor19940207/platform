@@ -3,13 +3,13 @@
 > 檔名保留 `PHASE1` 是為了不讓既有連結失效；本檔內容已推進至 **2b 第二刀 A 完成**。
 > 後續 M3-04 換機交接持續更新本檔，不再為每一小段新增 handoff。
 
-最近完整測試基準：**`6a1a3b7`（1,377／1,377）**，工作區乾淨。
+最近完整測試基準：**2b 第二刀 A ＋ hardening（1,399／1,399）**，工作區乾淨。
 **尚未 push**（`25d84dd` 之後的提交）。
-完整測試 **1,377** 零失敗：單元 66 ／ DB 整合 875 ／ 端到端 436。
-**44 份 migration**（可從零重建）。
+完整測試 **1,399** 零失敗：單元 66 ／ DB 整合 896 ／ 端到端 437。
+**45 份 migration**（可從零重建）。
 
 **權威契約：`docs/slices/SLICE-M3-04_現金流支持資料.md` 第五版**（經五輪走查凍結）。
-新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0044，
+新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0045，
 就能直接開始 **2b 第三刀：支持資料列 ＋ 結果雜湊與 replay**（範圍見下）。
 
 ## 現在切在哪裡
@@ -83,7 +83,7 @@ cashflow DB 測試由 36 增至 **144**；既有 36 條的斷言與預期錯誤�
 1. ~~支持資料 run（`calculation_scope = 'CASH_FLOW_SUPPORT'`）與多批次來源橋接~~
    **已完成（0043，提交 `62700c6`／`6f2bf0a`，CLOSED／PASS）**；
 2. ~~A：CFS Manifest 的 system-only 凍結入口 ＋ `fn_manifest_verify` 驗證~~
-   **已完成（0044，提交 `6a1a3b7`）**；
+   **已完成（0044 ＋ 0045 hardening）**；
 3. `CashFlowSupportLine` 原樣承接已接受 fact 的 signed amount 與命中映射，
    **結果雜湊與 replay 併在同一刀**；**← 下一刀**
 4. `DATA_PRESENT` 只能由系統依已接受 fact 衍生；
@@ -182,24 +182,39 @@ batches[], actor, engine)`，案件層 **R2**。**政策與映射版本由參數
 `fn_cf_manifest_assert_contract`（scope／singleton／條件式期初證據／來源 run 1 或 2 筆／
 object_id 非空）——**沒有第二套 canonical 或 hash**。
 
-cashflow DB 測試 204 → **260**。十項控制分三批反證轉紅；第四批（兩把鎖）**不轉紅**，
-兩個結論見下。
+cashflow DB 測試 204 → **281**（含 0045 的 hardening）。十項控制分三批反證轉紅；
+第四批（兩把鎖）**不轉紅**，兩個結論見下。
 
-**四件下一刀必須知道的事**：
+### 0045　走查後的三項收口（與 0044 同一刀交付）
 
-1. **`SOURCE_CALCULATION_RUN` 的 FX 分支已實作但沒有測試走過**。現金流的來源 run
-   若是折算 run，選定會要求同期的 `PeriodFxRunSelection`，那需要容許值版本＋折算
-   調節＋折算政策鏈＋匯率版本——等於在現金流 fixture 裡重建整條 M3-02／M3-03 鏈。
-   NO_FX 分支已逐筆驗過（凍結行資料等於實際輸出）。**下一刀本來就需要一個 FX 期間
-   （K2 要用），那條 `translation_result` 形狀的斷言必須在那裡補上。**
-2. **凍結函式不再自己檢查來源批次**：0043 的 helper 是那份唯一實作。反證時把凍結
+1. **結構驗證 helper 私有化**：`fn_cf_manifest_assert_contract` 原本是
+   SECURITY DEFINER 卻授權 app_runtime 且不驗租戶——等於一支拿已知 UUID 探測
+   他人 Manifest 的工具。撤回授權 ＋ 加 `current_tenant()` 查證。
+2. **來源 run 的凍結補完**：FX payload 補上 `translation_policy_rule_id`、逐筆
+   component 與 CTA 的政策／匯率版本證據；新增 `fn_calc_result_hash(run)` 並在
+   **凍結當下復驗**來源 run 的 `result_content_hash`——輸出若被資料修復破壞，
+   不得把「損壞行＋舊雜湊」一起封存。測試已釘住「**只用凍結 payload** 就能重算出
+   來源 FX run 的結果雜湊」。
+3. **改選競態的記載更正**：`fn_cf_select_source`（0042）本來就 `FOR UPDATE OF pr`，
+   與凍結鎖同一列 → 該邊界不存在，已改為雙 session 測試（凍結交易未提交時，
+   改選會被期間列鎖擋住）。
+
+`fn_calc_result_hash` 的兩條公式是**既有生成端的鏡像**（FX 取自
+`fn_fx_materialize`；NO_FX 取自 worker 的 canonical 結果雜湊）。生成端一個在 SQL、
+一個在 TypeScript，沒有共用位置，因此**防分岔靠測試**：cashflow 釘引擎產生的折算
+run，端到端 `calculation-run` 套件釘 worker 產生的 NO_FX run。**改動任一端的公式，
+那兩條斷言就會轉紅——不要只改一邊。**
+
+**三件下一刀必須知道的事**：
+1. **凍結函式不再自己檢查來源批次**：0043 的 helper 是那份唯一實作。反證時把凍結
    函式裡的批次檢查與 `FOR UPDATE` 拿掉不會轉紅——擋住競態的一直是 helper 的鎖。
    錯誤碼不變，但現在是在 manifest 物化**之後**由 helper 拋出（整份回滾）。
-3. **期間鎖沒有測試能單獨證明它**：任何兩次同期間的凍結都共用政策／映射／選定那
+2. **期間鎖沒有測試能單獨證明它**：任何兩次同期間的凍結都共用政策／映射／選定那
    幾列的 `FOR UPDATE`。保留它是為了「先鎖期間、再解析現行選定」的順序保證；
    不要因為看起來多餘就拿掉，也不要宣稱測試證明過它。版本列鎖同樣**擋不住取代鏈
-   被接上**（新版本是 INSERT，不 UPDATE 舊列）。
-4. **`fn_cfs_*` 是第三個命名前綴**，不匹配 0043 加的 `^fn_(cf|cash_flow)_` 權限掃描。
+   被接上**（新版本是 INSERT，不 UPDATE 舊列）——顯式帶入政策／映射版本之後，
+   後續版本被建立也不會改變本次凍結的輸入，不必假裝鎖擋得住它。
+3. **`fn_cfs_*` 是第三個命名前綴**，不匹配 0043 加的 `^fn_(cf|cash_flow)_` 權限掃描。
    目前那兩支是 SECURITY INVOKER 所以無妨；**日後若有人用 `fn_cfs_*` 命名 SECURITY
    DEFINER 函式，會靜默漏掃**——加函式時記得一併擴充掃描的正規式。
 
@@ -208,10 +223,15 @@ cashflow DB 測試 204 → **260**。十項控制分三批反證轉紅；第四�
 凍結」、`CFS_RUN_MANIFEST_ALREADY_USED` 改用新 run 的 manifest、helper 權限斷言
 改為 `true/false/false`。0039～0042 的斷言未動。
 
-**測試 fixture 的兩個實測陷阱**：
+**測試 fixture 的三個實測陷阱**：
 - `balance_snapshot_line` 必須在 run 轉 `COMPLETED` **之前**寫入（0013 的
-  `trg_bsl_run_state`）；`translation_result` 另需 component，CTA component 又需
-  `translation_adjustment_line` → `entry` → 折算政策與匯率版本（第 1 點的成本來源）。
+  `trg_bsl_run_state`）；來源 run 的 `result_content_hash` 一律用
+  `fn_calc_result_hash()` 實算，填假雜湊會讓凍結當下的復驗永遠測不到。
+- **折算 run 不要手工拼**：`translation_result` 需要 component、CTA component 需要
+  `translation_adjustment_line` → `entry` → 折算政策與匯率版本，且 component 引用的
+  版本必須與該 run 凍結的 manifest 一致。現金流第三期改為呼叫**引擎**
+  `fn_fx_translation_run`（前置：幣別指派、匯率版本走完 R2→R3→R4、折算政策＋規則、
+  `fn_period_fx_select_inputs`），這樣拿到的才是真實的輸出與 result hash。
 - `reporting_period` 對 `(reporting_unit_id, fiscal_calendar_id, daterange)` 有排除
   約束，聚合模式下與別的領域檔撞月份會讓整段 fixture 中止；新期間請挑沒人用過的年份。
 

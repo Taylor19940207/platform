@@ -1,147 +1,56 @@
--- 0044 現金流支持資料：Manifest 的 system-only 凍結入口（SLICE-M3-04 2b 第二刀 A）
+-- 0045 現金流凍結的收口（SLICE-M3-04 2b 第二刀 A 的 hardening）
 --
--- 0043 把 run 的建立收斂成單一入口，但**輸入還沒有被凍結**：`calculation_input_manifest`
--- 與 `calculation_manifest_entry` 對 app_runtime 一直是可寫的（NO_FX 需要），所以
--- 現金流的 run 可以掛在一份內容任人捏造、甚至完全空白的 Manifest 上。
--- 沒有凍結，「重演」只能回查現行主檔——那不是重演，是重算。
+-- 0044 走查抓出三件必須在同一刀內收口的事：
 --
--- ## 契約（本刀的完成範圍）
+-- 1. **結構驗證函式有跨租戶探測面**：`fn_cf_manifest_assert_contract` 是
+--    SECURITY DEFINER 卻授權給 app_runtime，且不驗 `current_tenant()`——
+--    等於一支可以拿任意已知 UUID 繞過 RLS 探測他人 Manifest 是否存在、
+--    結構是否完整的工具。它只是內部 helper，撤回授權並補租戶查證。
+-- 2. **來源 run 沒有真的證明「凍結實際輸出」**：FX 的 payload 少了
+--    `translation_policy_rule_id`、component 的來源證據與 CTA 的政策／匯率版本，
+--    因此**無法由 payload 重算來源 run 的 result hash**；而且凍結當下沒有重算並
+--    比對來源 run 自己的 `result_content_hash`——終態輸出若被資料修復破壞，
+--    0044 會把「損壞的行 ＋ 舊雜湊」一起封存，之後永遠對不出來。
+-- 3. **0044 檔頭關於「改選競態」的記載是錯的**：`fn_cf_select_source`（0042）
+--    本來就 `FOR UPDATE OF pr`，與凍結鎖的是同一列，兩者在期間列上序列化。
+--    該邊界不存在，檔頭已更正，並改以雙 session 測試證明。
 --
--- | 項目 | 決定 |
+-- ## 本檔交付
+--
+-- | # | 收口 |
 -- |---|---|
--- | 對外入口 | `fn_cash_flow_support_freeze_and_run(...)`，案件層 **R2**，唯一外部路徑 |
--- | 0043 的 `fn_cash_flow_support_run_create` | 降為**內部 helper**：撤回 app_runtime 的 EXECUTE |
--- | 直插封閉 | manifest／entry 的 INSERT trigger **只對 `CASH_FLOW_SUPPORT`** 要求執行身分為 owner；NO_FX／FX 路徑不動 |
--- | 版本輸入 | 政策與映射版本**由參數顯式帶入**——不得以「最新已批准」推導（驗收 1 的反證） |
--- | 權威來源選定 | 由既有 `fn_current_cf_source_selection()` 取現行選定（取代鏈，本就是顯式選定物件） |
--- | canonical／雜湊 | 逐字沿用 0034 的 `fn_fx_freeze_entry2` 與集合雜湊排序；驗證沿用 `fn_manifest_verify` |
--- | 結構契約 | 新增薄函式 `fn_cf_manifest_assert_contract()`：先呼叫 `fn_manifest_verify`，再驗 CFS 的結構 |
--- | 空 Manifest 的 run | helper 在寫入後、回傳前呼叫 `fn_cf_manifest_assert_contract`，**任何呼叫者**都不可能建立空 Manifest 的 run |
+-- | 1 | `fn_cf_manifest_assert_contract` 撤回 app_runtime 的 EXECUTE ＋ 加 `current_tenant()` 查證 |
+-- | 2 | `fn_calc_result_hash(run)`：依 scope 重算來源 run 的結果雜湊 |
+-- | 3 | `fn_cf_freeze_source_run_entry(run, role)`：凍結完整輸出證據 ＋ **凍結當下復驗 result hash** |
+-- | 4 | 凍結入口改用該 helper（其餘邏輯不動） |
 --
--- ## 凍結條目清單
+-- ## `fn_calc_result_hash` 的兩條公式都是**既有生成端的鏡像**
 --
--- | object_type | 筆數 | object_id |
--- |---|---|---|
--- | `SCOPE` | 恰 1 | NULL（來源封套：批次、資料集、覆蓋度、逐期覆蓋結論） |
--- | `CASH_FLOW_SOURCE_SELECTION` | 恰 1 | cf_selection_id |
--- | `CASH_FLOW_POLICY_VERSION` | 恰 1 | policy_version_id |
--- | `CASH_FLOW_CLASS_SET_VERSION` | 恰 1 | class_set_version_id（含分類與現金科目 membership 陣列） |
--- | `CASH_FLOW_MAPPING_VERSION` | 恰 1 | mapping_version_id（含規則陣列） |
--- | `CASH_FLOW_OPENING_BALANCE_SET_VERSION` | 0 或 1 | 恰 1 ⟺ 選定為 `FIRST_PERIOD_EVIDENCE` |
--- | `CASH_FLOW_COVERAGE_EXCEPTION` | 0..n | exception_id |
--- | `CASH_FLOW_SOURCE_FACT` | 0..n | source_fact_id（**零活動合法，facts 可為零筆**） |
--- | `SOURCE_CALCULATION_RUN` | 1 或 2 | run_id（`PRIOR_SELECTED_RUN` 時另含前期選定 run） |
+-- * `FX_TRANSLATION`：逐字取自 `fn_fx_materialize`（0034）——涵蓋金額**與來源證據**
+--   （命中規則、component 的觀測／批次／期初引用、CTA 的政策與匯率版本）。
+-- * 其餘（`NO_FX`）：逐字取自 worker 的 canonical 結果雜湊
+--   （`apps/worker/src/worker.ts` 的 `_res`）：排序後的（層｜科目｜借｜貸）。
 --
--- **`SCOPE` 承載來源封套而不是把它塞進 fact**：facts 可以是零筆，若封套只存在於
--- fact 的 payload，零活動期間整個來源封套就會消失，後續也無法「以那一筆
--- `data_coverage_id` 判定實際粒度」。同理，零活動的 R2→R3 正式結論放在
--- `SCOPE.coverage_inputs`，否則 replay 仍得回查現行 Coverage。
---
--- **來源 run 凍結實際行資料，不只身分＋雜湊**：只凍雜湊的話，後續仍得查來源 run
--- 的結果表，資料若損壞只能失敗而無法重演——那不符合「replay 只讀凍結 payload」。
--- 以 `output_kind` 區分原始輸出形狀（`NO_FX` 為 `balance_snapshot_line`；
--- `FX_TRANSLATION` 為 `translation_result` 加其來源 snapshot 身分），
--- **本刀不換算、不選現金科目、不計算控制總額**。
---
--- ## 本檔明確不做
---
--- * `CashFlowSupportLine`、`DATA_PRESENT` 衍生、粒度判定、K1～K4、結果雜湊與 replay。
---   結果雜湊與 replay 已改排到支持資料列那一刀：在有真實輸出之前，replay 只會是
---   拿 Manifest 集合雜湊冒充 result hash。
--- * 畫面與期間遷移解鎖。
--- * **不回改 0039～0042**。0043 只加一行（helper 尾端的結構契約查證）與一次 REVOKE。
---
--- ## 兩個已知邊界
---
--- 1. **改選競態並不存在**（走查更正）：`fn_cf_select_source`（0042）本來就
---    `FOR UPDATE OF pr`，與本檔鎖的是同一筆 `period_revision`，因此凍結與改選在
---    期間列上序列化——不會有「凍結途中新版選定提交」的情形。雙 session 測試已釘住。
--- 2. **期間列鎖目前沒有測試能單獨證明它**：任何兩次同期間的凍結都會共用政策／
---    映射／選定那幾列的 `FOR UPDATE`，序列化實際上是它們做到的（實測反證——拿掉
---    `FOR UPDATE OF pr` 仍全綠）。保留它是為了「先鎖期間、再解析現行選定」這個
---    順序保證；不要因為它看起來多餘就拿掉，也不要宣稱測試證明過它。
--- 3. **FX 來源 run 的原始輸出形狀（`translation_result`）尚未被測試走過**：
---    現金流的來源 run 若是折算 run，選定會要求同期的 `PeriodFxRunSelection`，
---    而那需要容許值版本＋折算調節＋折算政策鏈＋匯率版本——等於在現金流 fixture
---    裡重建整條 M3-02／M3-03 的鏈。NO_FX 分支已逐筆驗過（凍結行資料等於實際輸出）。
---    **下一刀（支持資料列與 K1～K4）本來就需要一個 FX 期間，該條斷言在那裡補。**
--- 4. `SCOPE` 與 `SOURCE_CALCULATION_RUN` 是與 NO_FX／FX **共用**的 object_type。
---    本檔的部分唯一索引與 object_id 檢查因此也會約束既有 manifest——實查兩者
---    本來就滿足（各恰一筆、`SOURCE_CALCULATION_RUN` 的 object_id 恆非空），
---    但這是動到既有最後防線的變更，落地後必須立刻跑 fx 與端到端計算套件。
+-- 兩者是**鏡像而非唯一實作**，這是本檔唯一接受的重複——因為生成端一個在 SQL、
+-- 一個在 TypeScript worker 裡，沒有共用的位置。防分岔的方式是把它釘死在測試上：
+-- 引擎產生的折算 run 與 worker 產生的 NO_FX run 都必須滿足
+-- `fn_calc_result_hash(run) = run.result_content_hash`。任一端改了公式，該斷言就轉紅。
 
--- ═══ 1　system-only：CFS 的 Manifest 與條目只能由函式寫入 ══════════
--- 與 0043 同一個理由：app_runtime 對這兩張表的 INSERT 不能收回（NO_FX 要用），
--- 所以用**執行身分**當邊界。兩支都必須維持 **SECURITY INVOKER**——改成 DEFINER
--- 之後 `current_user` 會變成 owner，檢查對誰都通過。
-CREATE FUNCTION fn_cfs_manifest_insert_guard() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE v_owner name;
-BEGIN
-  IF NEW.calculation_scope = 'CASH_FLOW_SUPPORT' THEN
-    SELECT pg_catalog.pg_get_userbyid(c.relowner) INTO v_owner
-      FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID;
-    IF current_user <> v_owner THEN
-      RAISE EXCEPTION 'CFS_MANIFEST_SYSTEM_ONLY: 現金流的凍結集合只能由 fn_cash_flow_support_freeze_and_run 建立';
-    END IF;
-  END IF;
-  RETURN NEW;
-END $$;
-CREATE TRIGGER trg_cim_cfs_system_only BEFORE INSERT ON calculation_input_manifest
-  FOR EACH ROW EXECUTE FUNCTION fn_cfs_manifest_insert_guard();
-
-CREATE FUNCTION fn_cfs_manifest_entry_insert_guard() RETURNS trigger
-LANGUAGE plpgsql AS $$
-DECLARE v_owner name; v_scope text;
-BEGIN
-  SELECT calculation_scope INTO v_scope
-    FROM calculation_input_manifest WHERE manifest_id = NEW.manifest_id;
-  -- 查不到＝跨租戶而 RLS 擋掉（本函式是 INVOKER，執行身分就是寫入者）。
-  -- 不能因此當作「不是現金流」放行——那正好是繞過本守衛的方式。
-  IF v_scope IS NULL THEN
-    RAISE EXCEPTION 'CFS_MANIFEST_SYSTEM_ONLY: 條目所屬的凍結集合不存在或不可見（fail closed）';
-  END IF;
-  IF v_scope = 'CASH_FLOW_SUPPORT' THEN
-    SELECT pg_catalog.pg_get_userbyid(c.relowner) INTO v_owner
-      FROM pg_catalog.pg_class c WHERE c.oid = TG_RELID;
-    IF current_user <> v_owner THEN
-      RAISE EXCEPTION 'CFS_MANIFEST_SYSTEM_ONLY: 現金流的凍結條目只能由 fn_cash_flow_support_freeze_and_run 建立';
-    END IF;
-  END IF;
-  RETURN NEW;
-END $$;
-CREATE TRIGGER trg_cme_cfs_system_only BEFORE INSERT ON calculation_manifest_entry
-  FOR EACH ROW EXECUTE FUNCTION fn_cfs_manifest_entry_insert_guard();
-
--- ═══ 2　條目的唯一性（結構層最後防線） ═════════════════════════════
--- singleton：一份凍結集合內每種至多一筆。
-CREATE UNIQUE INDEX cme_cf_singleton_uq ON calculation_manifest_entry (manifest_id, object_type)
-  WHERE object_type IN ('SCOPE','CASH_FLOW_SOURCE_SELECTION','CASH_FLOW_POLICY_VERSION',
-                        'CASH_FLOW_CLASS_SET_VERSION','CASH_FLOW_MAPPING_VERSION',
-                        'CASH_FLOW_OPENING_BALANCE_SET_VERSION');
--- 多值：同一物件不得凍結兩次。
-CREATE UNIQUE INDEX cme_cf_multi_uq
-  ON calculation_manifest_entry (manifest_id, object_type, object_id)
-  WHERE object_type IN ('CASH_FLOW_COVERAGE_EXCEPTION','CASH_FLOW_SOURCE_FACT',
-                        'SOURCE_CALCULATION_RUN');
--- PostgreSQL 的唯一索引把每個 NULL 視為互異，object_id 可空就等於留下重複通道。
-ALTER TABLE calculation_manifest_entry ADD CONSTRAINT cme_multi_object_id_ck CHECK (
-  object_type NOT IN ('CASH_FLOW_COVERAGE_EXCEPTION','CASH_FLOW_SOURCE_FACT',
-                      'SOURCE_CALCULATION_RUN')
-  OR object_id IS NOT NULL);
-
--- ═══ 3　結構契約：薄薄一層，不重寫 canonical 或 hash ═══════════════
--- `fn_manifest_verify` 驗的是「這份集合還是不是原來那一份」；它不知道現金流
--- 需要哪些條目。缺一份政策或一份選定的集合，雜湊完全自洽——卻不能拿來計算。
-CREATE FUNCTION fn_cf_manifest_assert_contract(p_manifest uuid) RETURNS void
+-- ═══ 1　結構驗證 helper 私有化 ═════════════════════════════════════
+CREATE OR REPLACE FUNCTION fn_cf_manifest_assert_contract(p_manifest uuid) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE v_scope text; v_kind text; v_t text; v_n int; v_opening int; v_runs int;
+DECLARE v_scope text; v_kind text; v_t text; v_n int; v_opening int; v_runs int; v_tenant uuid;
 BEGIN
-  -- 完整性先於結構：內容若已被竄改，結構對不對都沒有意義
+  -- SECURITY DEFINER 不受 RLS 保護：租戶必須自己查，否則本函式就是一支
+  -- 「拿已知 UUID 探測他人物件」的工具（不同錯誤訊息就是資訊）。
+  SELECT tenant_id, calculation_scope INTO v_tenant, v_scope
+    FROM calculation_input_manifest WHERE manifest_id = p_manifest;
+  IF v_tenant IS DISTINCT FROM current_tenant() THEN
+    RAISE EXCEPTION 'CROSS_TENANT_DENIED: 凍結集合不屬於目前租戶';
+  END IF;
+
   PERFORM fn_manifest_verify(p_manifest);
 
-  SELECT calculation_scope INTO v_scope
-    FROM calculation_input_manifest WHERE manifest_id = p_manifest;
   IF v_scope IS DISTINCT FROM 'CASH_FLOW_SUPPORT' THEN
     RAISE EXCEPTION 'CFS_MANIFEST_SCOPE_MISMATCH: 凍結集合的 scope 為 %，不是現金流支持',
       COALESCE(v_scope, '（不存在）');
@@ -165,7 +74,6 @@ BEGIN
       v_kind, v_opening;
   END IF;
 
-  -- 來源 run：本期一筆；期初來自前期已選定結果時另有一筆
   SELECT count(*) INTO v_runs FROM calculation_manifest_entry
    WHERE manifest_id = p_manifest AND object_type = 'SOURCE_CALCULATION_RUN';
   IF v_runs <> (CASE WHEN v_kind = 'PRIOR_SELECTED_RUN' THEN 2 ELSE 1 END) THEN
@@ -179,15 +87,144 @@ BEGIN
     RAISE EXCEPTION 'CFS_MANIFEST_OBJECT_ID_REQUIRED: % 筆條目沒有 object_id（只有 SCOPE 允許）', v_n;
   END IF;
 END $$;
+REVOKE ALL ON FUNCTION fn_cf_manifest_assert_contract(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION fn_cf_manifest_assert_contract(uuid) FROM app_runtime;
 
--- ═══ 4　凍結並建立 run：唯一對外入口 ═══════════════════════════════
--- 順序是本函式的全部重點：
---   鎖（期間 → 版本列 → 批次）→ **單一 statement 物化整份輸入** → 只驗物化後的
---   集合 → 寫入 → 結構契約查證。
--- PL/pgSQL 在預設隔離等級下每個 statement 各有 snapshot，「同一個函式」證明不了
--- 「同一份輸入」；先鎖再以**一個** statement 建成 `v_entries`，之後所有判定都只讀
--- 這個變數，凍結內容才真的是同一時刻的事實。
-CREATE FUNCTION fn_cash_flow_support_freeze_and_run(
+-- ═══ 2　來源 run 的結果雜湊：依 scope 重算 ═════════════════════════
+CREATE FUNCTION fn_calc_result_hash(p_run uuid) RETURNS text
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_scope text; v_hash text;
+BEGIN
+  SELECT m.calculation_scope INTO v_scope
+    FROM calculation_run r JOIN calculation_input_manifest m ON m.manifest_id = r.manifest_id
+   WHERE r.calculation_run_id = p_run;
+  IF v_scope IS NULL THEN
+    RETURN NULL;
+  END IF;
+  IF v_scope = 'FX_TRANSLATION' THEN
+    -- fn_fx_materialize（0034）的鏡像：涵蓋金額與來源證據
+    SELECT fn_fx_sha(string_agg(part, '|' ORDER BY part)) INTO v_hash FROM (
+      SELECT bsl.account_code || ':' || bsl.posting_layer || ':' ||
+             tr.result_debit::text || '/' || tr.result_credit::text || ':' ||
+             COALESCE(tr.translation_policy_rule_id::text, '-') || '#' ||
+             COALESCE((SELECT string_agg(c.source_kind || '>' ||
+                         COALESCE(c.exchange_rate_observation_id::text, '-') || '>' ||
+                         COALESCE(c.equity_lot_id::text, '-') || '>' ||
+                         COALESCE(c.opening_balance_id::text, '-') || '>' ||
+                         c.result_debit::text || '/' || c.result_credit::text,
+                       ',' ORDER BY c.line_no)
+                       FROM translation_result_component c
+                      WHERE c.translation_result_id = tr.translation_result_id), '') AS part
+        FROM translation_result tr
+        JOIN balance_snapshot_line bsl ON bsl.snapshot_line_id = tr.source_snapshot_line_id
+       WHERE tr.calculation_run_id = p_run
+      UNION ALL
+      SELECT 'CTA:' || tl.account_id::text || ':' || tl.debit::text || '/' || tl.credit::text ||
+             ':' || te.translation_policy_version_id::text || ':' || te.exchange_rate_version_id::text
+        FROM translation_adjustment_line tl
+        JOIN translation_adjustment_entry te ON te.translation_entry_id = tl.translation_entry_id
+       WHERE te.calculation_run_id = p_run) q;
+  ELSE
+    -- worker 的 canonical 結果雜湊鏡像：排序後的（層｜科目｜借｜貸）
+    SELECT encode(sha256(convert_to(COALESCE(string_agg(
+             posting_layer || '|' || account_code || '|' || debit::text || '|' || credit::text,
+             E'\n' ORDER BY posting_layer, account_code), ''), 'UTF8')), 'hex')
+      INTO v_hash FROM balance_snapshot_line WHERE calculation_run_id = p_run;
+  END IF;
+  RETURN v_hash;
+END $$;
+REVOKE ALL ON FUNCTION fn_calc_result_hash(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION fn_calc_result_hash(uuid) TO app_runtime;
+
+-- ═══ 3　來源 run 的凍結條目：完整證據 ＋ 凍結當下復驗 ═══════════════
+-- 「凍結實際輸出」要成立必須兩件事同時做到：payload 足以重算來源 run 的
+-- result hash；而且**凍結的那一刻**重算過一次並與記載的雜湊相符。
+-- 少了後者，被資料修復破壞的輸出會連同舊雜湊一起被封存，日後永遠對不出來。
+CREATE FUNCTION fn_cf_freeze_source_run_entry(p_run uuid, p_role text) RETURNS jsonb
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE cr record; m record; v_recomputed text; v_payload jsonb;
+BEGIN
+  SELECT * INTO cr FROM calculation_run WHERE calculation_run_id = p_run;
+  IF cr.calculation_run_id IS NULL THEN
+    RAISE EXCEPTION 'CFS_SOURCE_RUN_NOT_FOUND: 來源 run 不存在（%）', p_run;
+  END IF;
+  SELECT * INTO m FROM calculation_input_manifest WHERE manifest_id = cr.manifest_id;
+  IF cr.result_content_hash IS NULL OR btrim(cr.result_content_hash) = '' THEN
+    RAISE EXCEPTION 'CFS_SOURCE_RUN_NO_RESULT_HASH: 來源 run 沒有結果雜湊，不能作為凍結輸入';
+  END IF;
+  v_recomputed := fn_calc_result_hash(p_run);
+  IF v_recomputed IS DISTINCT FROM cr.result_content_hash THEN
+    RAISE EXCEPTION 'CFS_SOURCE_RUN_RESULT_HASH_MISMATCH: 來源 run % 的輸出與其結果雜湊不符（重算 %／記載 %）——不得把損壞的輸出連同舊雜湊一起封存',
+      p_run, COALESCE(v_recomputed, '(null)'), cr.result_content_hash;
+  END IF;
+
+  v_payload := jsonb_build_object(
+    'calculation_run_id', cr.calculation_run_id, 'role', p_role,
+    'calculation_scope', m.calculation_scope, 'manifest_id', cr.manifest_id,
+    'engine_version', cr.engine_version, 'status', cr.status,
+    'result_content_hash', cr.result_content_hash,
+    'result_hash_verified_at_freeze', true,
+    'output_kind', m.calculation_scope,
+    'lines', CASE WHEN m.calculation_scope = 'FX_TRANSLATION' THEN
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'translation_result_id', tr.translation_result_id,
+            'source_snapshot_line_id', tr.source_snapshot_line_id,
+            'source_account_id', bsl.account_id, 'source_account_code', bsl.account_code,
+            'source_account_name', bsl.account_name,
+            'source_posting_layer', bsl.posting_layer,
+            'source_debit_functional', bsl.debit, 'source_credit_functional', bsl.credit,
+            'amount_role', tr.amount_role, 'currency_code', tr.currency_code,
+            'source_debit', tr.source_debit, 'source_credit', tr.source_credit,
+            'result_debit', tr.result_debit, 'result_credit', tr.result_credit,
+            -- result hash 涵蓋命中的規則與逐筆 component，凍結就必須帶上它們，
+            -- 否則由 payload 重算不出來源 run 的結果雜湊。
+            'translation_policy_rule_id', tr.translation_policy_rule_id,
+            'components', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                  'component_id', c.component_id, 'line_no', c.line_no,
+                  'source_kind', c.source_kind,
+                  'exchange_rate_observation_id', c.exchange_rate_observation_id,
+                  'equity_lot_id', c.equity_lot_id,
+                  'opening_balance_id', c.opening_balance_id,
+                  'translation_adjustment_line_id', c.translation_adjustment_line_id,
+                  'source_debit', c.source_debit, 'source_credit', c.source_credit,
+                  'result_debit', c.result_debit, 'result_credit', c.result_credit)
+                ORDER BY c.line_no), '[]'::jsonb)
+              FROM translation_result_component c
+             WHERE c.translation_result_id = tr.translation_result_id))
+          ORDER BY tr.source_snapshot_line_id, tr.amount_role), '[]'::jsonb)
+         FROM translation_result tr
+         JOIN balance_snapshot_line bsl ON bsl.snapshot_line_id = tr.source_snapshot_line_id
+        WHERE tr.calculation_run_id = p_run)
+      ELSE
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'snapshot_line_id', b.snapshot_line_id, 'posting_layer', b.posting_layer,
+            'posting_layer_id', b.posting_layer_id,
+            'account_id', b.account_id, 'account_code', b.account_code,
+            'account_name', b.account_name, 'debit', b.debit, 'credit', b.credit)
+          ORDER BY b.snapshot_line_id), '[]'::jsonb)
+         FROM balance_snapshot_line b WHERE b.calculation_run_id = p_run)
+      END,
+    -- CTA 殘差的政策與匯率版本證據：result hash 的第二個 UNION 分支就是它
+    'cta_lines', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+          'translation_line_id', tl.translation_line_id, 'line_no', tl.line_no,
+          'account_id', tl.account_id, 'debit', tl.debit, 'credit', tl.credit,
+          'translation_entry_id', te.translation_entry_id,
+          'translation_policy_version_id', te.translation_policy_version_id,
+          'exchange_rate_version_id', te.exchange_rate_version_id,
+          'posting_layer_id', te.posting_layer_id, 'rule_type', te.rule_type,
+          'reporting_currency', te.reporting_currency)
+        ORDER BY tl.translation_line_id), '[]'::jsonb)
+       FROM translation_adjustment_line tl
+       JOIN translation_adjustment_entry te ON te.translation_entry_id = tl.translation_entry_id
+      WHERE te.calculation_run_id = p_run));
+
+  RETURN fn_fx_freeze_entry2('[]'::jsonb, 'SOURCE_CALCULATION_RUN', p_run,
+           'result_hash', cr.result_content_hash, v_payload)->0;
+END $$;
+REVOKE ALL ON FUNCTION fn_cf_freeze_source_run_entry(uuid, text) FROM PUBLIC;
+
+-- ═══ 4　凍結入口改用該 helper（其餘邏輯不動） ═══════════════════════
+CREATE OR REPLACE FUNCTION fn_cash_flow_support_freeze_and_run(
   p_period_revision uuid, p_reporting_unit uuid,
   p_policy_version uuid, p_mapping_version uuid,
   p_source_batches uuid[], p_actor uuid, p_engine_version text
@@ -426,39 +463,10 @@ BEGIN
        AND f.import_batch_id = ANY(p_source_batches)
 
     UNION ALL
-    -- 來源 run：凍結**實際行資料**。只凍身分＋雜湊的話，後續仍得查來源結果表，
-    -- 資料若損壞只能失敗而無法重演。以 output_kind 區分原始輸出形狀，本刀不換算。
-    SELECT fn_fx_freeze_entry2('[]'::jsonb, 'SOURCE_CALCULATION_RUN', cr.calculation_run_id,
-      'result_hash', cr.result_content_hash, jsonb_build_object(
-      'calculation_run_id', cr.calculation_run_id, 'role', src.role,
-      'calculation_scope', m.calculation_scope, 'manifest_id', cr.manifest_id,
-      'engine_version', cr.engine_version, 'status', cr.status,
-      'result_content_hash', cr.result_content_hash,
-      'output_kind', m.calculation_scope,
-      'lines', CASE WHEN m.calculation_scope = 'FX_TRANSLATION' THEN
-        (SELECT COALESCE(jsonb_agg(jsonb_build_object(
-              'translation_result_id', tr.translation_result_id,
-              'source_snapshot_line_id', tr.source_snapshot_line_id,
-              'source_account_id', bsl.account_id, 'source_account_code', bsl.account_code,
-              'source_posting_layer', bsl.posting_layer,
-              'amount_role', tr.amount_role, 'currency_code', tr.currency_code,
-              'source_debit', tr.source_debit, 'source_credit', tr.source_credit,
-              'result_debit', tr.result_debit, 'result_credit', tr.result_credit)
-            ORDER BY tr.source_snapshot_line_id, tr.amount_role), '[]'::jsonb)
-           FROM translation_result tr
-           JOIN balance_snapshot_line bsl ON bsl.snapshot_line_id = tr.source_snapshot_line_id
-          WHERE tr.calculation_run_id = cr.calculation_run_id)
-        ELSE
-        (SELECT COALESCE(jsonb_agg(jsonb_build_object(
-              'snapshot_line_id', b.snapshot_line_id, 'posting_layer', b.posting_layer,
-              'account_id', b.account_id, 'account_code', b.account_code,
-              'account_name', b.account_name, 'debit', b.debit, 'credit', b.credit)
-            ORDER BY b.snapshot_line_id), '[]'::jsonb)
-           FROM balance_snapshot_line b WHERE b.calculation_run_id = cr.calculation_run_id)
-        END))->0
+    -- 來源 run：交給 fn_cf_freeze_source_run_entry——它同時做**凍結當下的
+    -- result hash 復驗**，並凍結足以重算該雜湊的全部證據（規則、component、CTA）。
+    SELECT fn_cf_freeze_source_run_entry(src.run_id, src.role)
       FROM (VALUES (sel.current_run_id, 'CURRENT'), (sel.prior_run_id, 'PRIOR')) AS src(run_id, role)
-      JOIN calculation_run cr ON cr.calculation_run_id = src.run_id
-      JOIN calculation_input_manifest m ON m.manifest_id = cr.manifest_id
      WHERE src.run_id IS NOT NULL
   ) x;
 
@@ -498,89 +506,8 @@ BEGIN
   RETURN v_run;
 END $$;
 
--- ═══ 5　0043 的入口降為內部 helper ═════════════════════════════════
--- 唯一的改動是**尾端**加一次結構契約查證：放在 run 與橋接寫入之後，
--- 既有的批次／角色／重複判定順序完全不動（放在前面會讓那些負面測試
--- 以「Manifest 不完整」這個新理由被擋下，變成以錯誤理由通過）。
-CREATE OR REPLACE FUNCTION fn_cash_flow_support_run_create(
-  p_manifest uuid, p_source_batches uuid[], p_actor uuid, p_engine_version text
-) RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE
-  m record; v_run uuid; v_batch uuid; v_locked int := 0; v_distinct int;
-BEGIN
-  IF p_engine_version IS NULL OR p_engine_version = '' THEN
-    RAISE EXCEPTION 'CFS_RUN_ENGINE_VERSION_REQUIRED: 建立 run 必須指明引擎版本（重演要比對它）';
-  END IF;
-
-  SELECT manifest_id, tenant_id, engagement_id, period_revision_id, calculation_scope,
-         frozen_set_content_hash
-    INTO m FROM calculation_input_manifest WHERE manifest_id = p_manifest FOR UPDATE;
-  IF m.manifest_id IS NULL THEN
-    RAISE EXCEPTION 'CFS_RUN_MANIFEST_NOT_FOUND: Manifest 不存在（%）', p_manifest;
-  END IF;
-  IF m.calculation_scope <> 'CASH_FLOW_SUPPORT' THEN
-    RAISE EXCEPTION 'CFS_RUN_SCOPE_MISMATCH: 本入口只建立 CASH_FLOW_SUPPORT run（該 Manifest 為 %）',
-      m.calculation_scope;
-  END IF;
-  PERFORM fn_cf_assert_actor(p_actor, 'R2', m.tenant_id, m.engagement_id);
-
-  IF EXISTS (SELECT 1 FROM calculation_run
-              WHERE manifest_id = p_manifest AND replay_of_run_id IS NULL) THEN
-    RAISE EXCEPTION 'CFS_RUN_MANIFEST_ALREADY_USED: 這份 Manifest 已有原始 run';
-  END IF;
-
-  IF p_source_batches IS NULL OR cardinality(p_source_batches) = 0 THEN
-    RAISE EXCEPTION 'CFS_RUN_SOURCE_BATCH_REQUIRED: 現金流支持 run 必須至少凍結一筆來源批次（空集合等於來源歸屬未宣告）';
-  END IF;
-  IF EXISTS (SELECT 1 FROM unnest(p_source_batches) b WHERE b IS NULL) THEN
-    RAISE EXCEPTION 'CFS_RUN_SOURCE_BATCH_REQUIRED: 來源批次清單含空值';
-  END IF;
-  SELECT count(DISTINCT b) INTO v_distinct FROM unnest(p_source_batches) b;
-  IF v_distinct <> cardinality(p_source_batches) THEN
-    RAISE EXCEPTION 'CFS_RUN_SOURCE_BATCH_DUPLICATE: 同一批次不得重複列入來源（重複＝同一份資料被算兩次）';
-  END IF;
-
-  FOR v_batch IN
-    SELECT ib.import_batch_id FROM import_batch ib
-     WHERE ib.import_batch_id = ANY(p_source_batches) AND ib.tenant_id = m.tenant_id
-     ORDER BY ib.import_batch_id FOR UPDATE
-  LOOP
-    v_locked := v_locked + 1;
-  END LOOP;
-  IF v_locked <> v_distinct THEN
-    RAISE EXCEPTION 'CFS_RUN_SOURCE_BATCH_NOT_FOUND: 來源批次不存在或不屬本租戶（鎖到 %／需要 %）',
-      v_locked, v_distinct;
-  END IF;
-
-  v_run := gen_random_uuid();
-  INSERT INTO calculation_run (calculation_run_id, tenant_id, engagement_id, period_revision_id,
-          import_batch_id, manifest_id, run_type, status, request_key, request_content_hash,
-          engine_version, created_by)
-  VALUES (v_run, m.tenant_id, m.engagement_id, m.period_revision_id,
-          NULL, p_manifest, 'PREVIEW', 'RUNNING', gen_random_uuid(),
-          m.frozen_set_content_hash, p_engine_version, p_actor);
-
-  FOREACH v_batch IN ARRAY p_source_batches LOOP
-    INSERT INTO calculation_run_source_batch (calculation_run_id, import_batch_id, tenant_id)
-    VALUES (v_run, v_batch, m.tenant_id);
-  END LOOP;
-
-  -- 完整性與結構契約：空 Manifest 的 run 因此對**任何呼叫者**都不可能成立
-  PERFORM fn_cf_manifest_assert_contract(p_manifest);
-  RETURN v_run;
-END $$;
-
--- ═══ 6　權限 ═══════════════════════════════════════════════════════
+-- ═══ 5　權限 ═══════════════════════════════════════════════════════
 REVOKE ALL ON FUNCTION fn_cash_flow_support_freeze_and_run(uuid, uuid, uuid, uuid, uuid[], uuid, text)
   FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION fn_cash_flow_support_freeze_and_run(uuid, uuid, uuid, uuid, uuid[], uuid, text)
   TO app_runtime;
-REVOKE ALL ON FUNCTION fn_cf_manifest_assert_contract(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION fn_cf_manifest_assert_contract(uuid) TO app_runtime;
--- 0043 的入口自本檔起是**內部 helper**：外部只能經凍結入口。
--- 0043 對 app_runtime 有明示 GRANT，只撤 PUBLIC 不會生效，必須逐一撤回。
-REVOKE ALL ON FUNCTION fn_cash_flow_support_run_create(uuid, uuid[], uuid, text) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION fn_cash_flow_support_run_create(uuid, uuid[], uuid, text) FROM app_runtime;
--- trigger 守衛由寫入者自己的身分執行（SECURITY INVOKER），對外不開放
-REVOKE ALL ON FUNCTION fn_cfs_manifest_insert_guard() FROM PUBLIC;
-REVOKE ALL ON FUNCTION fn_cfs_manifest_entry_insert_guard() FROM PUBLIC;

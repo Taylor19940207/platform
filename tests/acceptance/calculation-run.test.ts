@@ -353,6 +353,13 @@ try {
          JOIN background_job j ON j.subject_id = r.calculation_run_id
         WHERE (r.status IN ('COMPLETED','FAILED')) <> (j.status IN ('COMPLETED','FAILED'))`) === "0");
 
+  // 11B SQL 端的結果雜湊鏡像必須與 worker 的生成公式一致（0045）
+  // fn_calc_result_hash 是 worker canonical 結果雜湊的鏡像，凍結來源 run 時用它復驗。
+  // 兩端各自實作，唯一的防分岔手段就是拿**真實 worker 產出的 run** 對一次。
+  check("fn_calc_result_hash 對 worker 產出的 NO_FX run 重算結果一致（0045 鏡像未分岔）",
+    sql(`SELECT (fn_calc_result_hash('${RUN1}'::uuid) = result_content_hash)::text
+           FROM calculation_run WHERE calculation_run_id = '${RUN1}'::uuid`) === "true");
+
   // 12 事件完整性
   check("建立／重演建立／完成／失敗事件皆存在",
     Number(sql(`SELECT count(DISTINCT event_type) FROM audit_event WHERE kind='DOMAIN_EVENT'
