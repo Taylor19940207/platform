@@ -723,4 +723,344 @@ n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.p
 [ "${n}" = "0" ] && ok "0042：SECURITY DEFINER 函式一律撤回 PUBLIC" \
   || ng "0042：${n} 支函式仍對 PUBLIC 開放"
 
+
+# ══ 10　0043：CASH_FLOW_SUPPORT run 的建立入口 ═════════════════════
+# 0040 讓現金流 run 的 import_batch_id 可空、來源改由橋接凍結，但沒有入口：
+# app_runtime 對 calculation_run 有 INSERT（NO_FX 要用），對橋接只有 SELECT，
+# 因此建得出「scope 是現金流、卻零筆來源」的 run。本節驗證入口收斂與來源凍結。
+MF43N=c0440000-0000-0000-0000-000000000201    # app_runtime 直插用
+MF43P=c0440000-0000-0000-0000-000000000202    # 正控制
+MF43C=c0440000-0000-0000-0000-000000000203    # 併發
+MF43FX=c0440000-0000-0000-0000-000000000205   # FX_TRANSLATION 既有行為
+B43A=c0460000-0000-0000-0000-000000000201     # ACCEPTED
+B43B=c0460000-0000-0000-0000-000000000202     # ACCEPTED
+B43DR=c0460000-0000-0000-0000-000000000203    # DRAFT
+B43VA=c0460000-0000-0000-0000-000000000204    # VALIDATED
+B43QU=c0460000-0000-0000-0000-000000000205    # QUARANTINED
+B43SU=c0460000-0000-0000-0000-000000000206    # SUPERSEDED
+B43P2=c0460000-0000-0000-0000-000000000207    # ACCEPTED 但屬 PR2（跨期間）
+B43E9=c0460000-0000-0000-0000-000000000208    # ACCEPTED 但屬 ENG99（同租戶跨案件）
+B43T2=c0460000-0000-0000-0000-000000000209    # ACCEPTED 但屬 TEN2（跨租戶）
+B43CC=c0460000-0000-0000-0000-000000000210    # 併發用（ACCEPTED → 併發轉 SUPERSEDED）
+B43NX=c0460000-0000-0000-0000-000000000299    # 不存在的批次 ID
+T2R2=af420000-0000-0000-0000-000000000006     # **租戶層** R2（角色種類正確、作用域錯誤）
+
+_has import_batch "import_batch_id = '${B43A}'" || PSQL_C >/dev/null <<SQL || { ng "0043 fixture 建立失敗（fail closed）"; exit 1; }
+${T1}
+-- 同案件同期間的各狀態批次。INSERT 不經狀態機 trigger（它只掛 UPDATE），
+-- 因此可直接落在目標狀態；每條負面測試都會先斷言狀態確實如宣告。
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status) VALUES
+  ('${B43A}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','ACCEPTED'),
+  ('${B43B}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','ACCEPTED'),
+  ('${B43DR}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','DRAFT'),
+  ('${B43VA}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','VALIDATED'),
+  ('${B43QU}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','QUARANTINED'),
+  ('${B43CC}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}','${JIA}','ACCEPTED'),
+  ('${B43P2}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR2}','${JIA}','${JIA}','ACCEPTED');
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status, superseded_by_id)
+VALUES ('${B43SU}','${TEN}','${ENG}','cccccccc-0000-0000-0000-000000000001','${PR}','${JIA}',
+        '${JIA}','SUPERSEDED','${B43A}');
+-- 同租戶、**另一案件**的完整期間鏈（0024 要求批次的法人與期間都屬同一案件）。
+-- 用 …098 系列自建，不沿用 adjustment.test.sh 的 …099 鏈：那組在聚合模式下已存在
+-- （撞主鍵會讓整段 fixture 中止），且它的 reporting_unit 沒有 legal_entity_id，
+-- 掛批次會先撞 0024 的歸屬守衛，變成「以錯誤理由拒絕」。
+INSERT INTO legal_entity (legal_entity_id, tenant_id, engagement_id, name, authoritative_code, country_code)
+VALUES ('cccccccc-0000-0000-0000-000000000098','${TEN}','${ENG99}','另一案件法人','9999999999998','JP');
+INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, legal_entity_id, unit_scope, name)
+VALUES ('bbbbbbbb-0000-0000-0000-000000000098','${TEN}','${ENG99}',
+        'cccccccc-0000-0000-0000-000000000098','LEGAL_ENTITY','另一案件法人單位');
+INSERT INTO fiscal_calendar (fiscal_calendar_id, tenant_id, engagement_id, name, year_start_month)
+VALUES ('ffffffff-0000-0000-0000-000000000098','${TEN}','${ENG99}','另一案件曆（現金流）',4);
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id,
+        fiscal_calendar_id, label, start_date, end_date)
+VALUES ('dddddddd-0000-0000-0000-000000000098','${TEN}','${ENG99}',
+        'bbbbbbbb-0000-0000-0000-000000000098','ffffffff-0000-0000-0000-000000000098',
+        '2026-03','2026-03-01','2026-03-31');
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id)
+VALUES ('99999999-0000-0000-0000-000000000098','${TEN}','dddddddd-0000-0000-0000-000000000098');
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status)
+VALUES ('${B43E9}','${TEN}','${ENG99}','cccccccc-0000-0000-0000-000000000098',
+        '99999999-0000-0000-0000-000000000098','${JIA}','${JIA}','ACCEPTED');
+-- 租戶層 R2：角色種類正確、作用域錯誤（§26.3 嚴格相等的反例）
+INSERT INTO app_user (user_id, tenant_id, email, display_name)
+VALUES ('${T2R2}','${TEN}','cf-tenant-r2@t1.jp','租戶層 R2');
+INSERT INTO role_assignment (tenant_id, user_id, role, engagement_id)
+VALUES ('${TEN}','${T2R2}','R2',NULL);
+INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id, period_revision_id,
+        calculation_scope, canonicalization_version, frozen_set_content_hash, created_by) VALUES
+  ('${MF43N}','${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2','cfs-neg','${JIA}'),
+  ('${MF43P}','${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2','cfs-pos','${JIA}'),
+  ('${MF43C}','${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2','cfs-race','${JIA}'),
+  ('${MF43FX}','${TEN}','${ENG}','${PR}','FX_TRANSLATION','sqlcanon-2','cfs-fx','${JIA}');
+${T2}
+-- **另一租戶**的完整鏈：跨租戶批次必須是真的存在，否則「拒絕」證明不了什麼
+INSERT INTO client_engagement (engagement_id, tenant_id, name)
+VALUES ('eeeeeeee-0000-0000-0000-000000000022','${TEN2}','T2 案件');
+INSERT INTO legal_entity (legal_entity_id, tenant_id, engagement_id, name, authoritative_code, country_code)
+VALUES ('cccccccc-0000-0000-0000-000000000022','${TEN2}','eeeeeeee-0000-0000-0000-000000000022',
+        'T2 法人','2222222222222','JP');
+INSERT INTO reporting_unit (reporting_unit_id, tenant_id, engagement_id, legal_entity_id, unit_scope, name)
+VALUES ('bbbbbbbb-0000-0000-0000-000000000022','${TEN2}','eeeeeeee-0000-0000-0000-000000000022',
+        'cccccccc-0000-0000-0000-000000000022','LEGAL_ENTITY','T2 單位');
+INSERT INTO fiscal_calendar (fiscal_calendar_id, tenant_id, engagement_id, name, year_start_month)
+VALUES ('ffffffff-0000-0000-0000-000000000022','${TEN2}','eeeeeeee-0000-0000-0000-000000000022','T2 曆',4);
+INSERT INTO reporting_period (reporting_period_id, tenant_id, engagement_id, reporting_unit_id,
+        fiscal_calendar_id, label, start_date, end_date)
+VALUES ('dddddddd-0000-0000-0000-000000000022','${TEN2}','eeeeeeee-0000-0000-0000-000000000022',
+        'bbbbbbbb-0000-0000-0000-000000000022','ffffffff-0000-0000-0000-000000000022',
+        '2026-03','2026-03-01','2026-03-31');
+INSERT INTO period_revision (period_revision_id, tenant_id, reporting_period_id)
+VALUES ('99999999-0000-0000-0000-000000000022','${TEN2}','dddddddd-0000-0000-0000-000000000022');
+INSERT INTO import_batch (import_batch_id, tenant_id, engagement_id, declared_legal_entity_id,
+        declared_period_revision_id, uploaded_by, provided_by, status)
+VALUES ('${B43T2}','${TEN2}','eeeeeeee-0000-0000-0000-000000000022',
+        'cccccccc-0000-0000-0000-000000000022','99999999-0000-0000-0000-000000000022',
+        'a2222222-0000-0000-0000-000000000009','a2222222-0000-0000-0000-000000000009','ACCEPTED');
+SQL
+
+# 每條負面測試各用一份**新的** Manifest，並逐條回驗「沒有留下半套 run」。
+# 共用一份的話，控制一旦被拿掉，第一條會佔用它、後面全部以 MANIFEST_ALREADY_USED
+# 連鎖失敗——反證時就分不出是哪一項控制在守。
+mfn() {
+  PSQL_C <<<"${T1} INSERT INTO calculation_input_manifest (manifest_id, tenant_id, engagement_id,
+        period_revision_id, calculation_scope, canonicalization_version, frozen_set_content_hash,
+        created_by)
+   VALUES (gen_random_uuid(),'${TEN}','${ENG}','${PR}','CASH_FLOW_SUPPORT','sqlcanon-2',
+           'cfs-neg','${JIA}') RETURNING manifest_id"
+}
+no_run() {  # $1=manifest $2=情境
+  local r b
+  r=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run WHERE manifest_id='$1'")
+  b=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run_source_batch sb
+       JOIN calculation_run r ON r.calculation_run_id = sb.calculation_run_id
+       WHERE r.manifest_id='$1'")
+  [ "${r}" = "0" ] && [ "${b}" = "0" ] && ok "0043：$2 之後沒有留下半套 run（run 0 筆／橋接 0 筆）" \
+    || ng "0043：$2 之後留下 run ${r} 筆／橋接 ${b} 筆"
+}
+
+# ── 前置：每條負面測試要擋的東西都必須先確認確實處於目標狀態 ──
+st=$(PSQL_C <<<"${T1} SELECT string_agg(status::text,',' ORDER BY import_batch_id)
+     FROM import_batch WHERE import_batch_id IN
+       ('${B43A}','${B43B}','${B43DR}','${B43VA}','${B43QU}','${B43SU}')")
+[ "${st}" = "ACCEPTED,ACCEPTED,DRAFT,VALIDATED,QUARANTINED,SUPERSEDED" ] \
+  && ok "0043 前置：六筆批次分別處於 ACCEPTED×2／DRAFT／VALIDATED／QUARANTINED／SUPERSEDED" \
+  || ng "0043 前置：批次狀態為 ${st}"
+st=$(PSQL_C <<<"${T1} SELECT status||'/'||(declared_period_revision_id='${PR2}')::text
+     FROM import_batch WHERE import_batch_id='${B43P2}'")
+[ "${st}" = "ACCEPTED/true" ] && ok "0043 前置：跨期間批次本身是 ACCEPTED（擋它的只能是期間）" \
+  || ng "0043 前置：跨期間批次為 ${st}"
+st=$(PSQL_C <<<"${T1} SELECT status||'/'||(engagement_id='${ENG99}')::text
+     FROM import_batch WHERE import_batch_id='${B43E9}'")
+[ "${st}" = "ACCEPTED/true" ] && ok "0043 前置：跨案件批次本身是 ACCEPTED 且同租戶（擋它的只能是案件）" \
+  || ng "0043 前置：跨案件批次為 ${st}"
+st=$(PSQL_C <<<"${T2} SELECT status||'/'||(tenant_id='${TEN2}')::text
+     FROM import_batch WHERE import_batch_id='${B43T2}'")
+[ "${st}" = "ACCEPTED/true" ] && ok "0043 前置：跨租戶批次確實存在且為 ACCEPTED（在 T2 脈絡下查得到）" \
+  || ng "0043 前置：跨租戶批次為 ${st}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run WHERE manifest_id='${MF43P}'")
+[ "${n}" = "0" ] && ok "0043 前置：正控制的 Manifest 尚無任何 run" || ng "0043 前置：已有 ${n} 筆 run"
+
+# ── system-only：權限是邊界（不是 GUC 標記） ──
+# 先證明 app_runtime **確實有** calculation_run 的 INSERT 授權——否則下一條測試
+# 擋下來的可能只是缺授權，而不是本刀的守衛。
+n=$(PSQL_C <<<"SELECT count(*) FROM information_schema.role_table_grants
+     WHERE grantee='app_runtime' AND table_name='calculation_run' AND privilege_type='INSERT'")
+[ "${n}" = "1" ] && ok "0043 前置：app_runtime 對 calculation_run 確有 INSERT 授權（NO_FX 需要，不能收回）" \
+  || ng "0043 前置：app_runtime 的 calculation_run INSERT 授權數為 ${n}"
+n=$(APP_C <<<"${T1} INSERT INTO calculation_run (tenant_id, engagement_id, period_revision_id,
+      manifest_id, run_type, status, request_key, request_content_hash, engine_version, created_by)
+    VALUES ('${TEN}','${ENG}','${PR}','${MF43N}','PREVIEW','RUNNING',gen_random_uuid(),'h','1.0.0','${JIA}')" 2>&1 \
+    | grep -c "CFS_RUN_SYSTEM_ONLY")
+[ "${n}" -ge 1 ] && ok "0043：app_runtime 直插現金流 run 被拒（system-only，只能經函式）" \
+  || ng "0043：app_runtime 直插未被 CFS_RUN_SYSTEM_ONLY 擋下"
+n=$(PSQL_C <<<"SELECT count(*) FROM information_schema.role_table_grants
+     WHERE grantee='app_runtime' AND table_name='calculation_run_source_batch'
+       AND privilege_type IN ('INSERT','UPDATE','DELETE')")
+[ "${n}" = "0" ] && ok "0043：app_runtime 對來源橋接無任何寫入授權（橋接只能由函式凍結）" \
+  || ng "0043：app_runtime 對橋接仍有 ${n} 項寫入授權"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run WHERE manifest_id='${MF43N}'")
+[ "${n}" = "0" ] && ok "0043：被拒的直插沒有留下半套 run" || ng "0043：留下 ${n} 筆 run"
+
+# ── 入口本身的參數契約 ──
+expect_err "0043：NO_FX 的 Manifest 不得走現金流入口" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${NOFXMF}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_SCOPE_MISMATCH"
+expect_err "0043：Manifest 不存在 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_run_create('c0440000-0000-0000-0000-000000000999',
+     ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" "CFS_RUN_MANIFEST_NOT_FOUND"
+MF=$(mfn)
+expect_err "0043：缺引擎版本 → 拒絕（重演要比對它）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43A}']::uuid[],'${JIA}','')" \
+  "CFS_RUN_ENGINE_VERSION_REQUIRED"
+no_run "${MF}" "缺引擎版本"
+
+# ── 來源清單：至少一筆、不重複 ──
+MF=$(mfn)
+expect_err "0043：空來源清單 → 拒絕（空集合等於來源歸屬未宣告）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY[]::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_SOURCE_BATCH_REQUIRED"
+no_run "${MF}" "空來源清單"
+MF=$(mfn)
+expect_err "0043：來源清單為 NULL → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',NULL,'${JIA}','1.0.0')" \
+  "CFS_RUN_SOURCE_BATCH_REQUIRED"
+MF=$(mfn)
+expect_err "0043：來源清單含空值 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43A}',NULL]::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_SOURCE_BATCH_REQUIRED"
+MF=$(mfn)
+expect_err "0043：同一批次重複列入 → 拒絕（重複＝同一份資料被算兩次）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43A}','${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_SOURCE_BATCH_DUPLICATE"
+no_run "${MF}" "重複來源批次"
+
+# ── 每一筆來源批次都必須是同租戶、同案件、同期間且 ACCEPTED ──
+MF=$(mfn)
+expect_err "0043：DRAFT 批次不得成為來源" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43DR}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_BATCH_NOT_ACCEPTED"
+no_run "${MF}" "DRAFT 批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：VALIDATED 批次不得成為來源（通過驗證不等於已接受）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43VA}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_BATCH_NOT_ACCEPTED"
+no_run "${MF}" "VALIDATED 批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：QUARANTINED 批次不得成為來源" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43QU}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_BATCH_NOT_ACCEPTED"
+no_run "${MF}" "QUARANTINED 批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：SUPERSEDED 批次不得成為來源（曾經接受過也不行）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43SU}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_BATCH_NOT_ACCEPTED"
+no_run "${MF}" "SUPERSEDED 批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：跨期間的已接受批次不得成為來源" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43P2}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_BATCH_PERIOD_MISMATCH"
+no_run "${MF}" "跨期間的已接受批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：同租戶但屬另一案件的已接受批次不得成為來源" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43E9}']::uuid[],'${JIA}','1.0.0')" \
+  "§24.1A"
+no_run "${MF}" "同租戶但屬另一案件的已接受批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：另一租戶的已接受批次不得成為來源（鎖的範圍就限本租戶）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43T2}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_SOURCE_BATCH_NOT_FOUND"
+no_run "${MF}" "另一租戶的已接受批次不得成為來源"
+MF=$(mfn)
+expect_err "0043：不存在的批次 → 拒絕" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43NX}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_SOURCE_BATCH_NOT_FOUND"
+no_run "${MF}" "不存在的批次"
+
+# ── 多批次：只要一筆不合法，整次建立全部回滾 ──
+MF=$(mfn)
+expect_err "0043：多批次中一筆未接受 → 整次拒絕" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',
+     ARRAY['${B43A}','${B43QU}','${B43B}']::uuid[],'${JIA}','1.0.0')" "CFS_BATCH_NOT_ACCEPTED"
+no_run "${MF}" "多批次中一筆未接受（合法的那兩筆橋接也不得留下）"
+
+# ── 角色：案件層 R2，作用域嚴格相等 ──
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${CFR4}' AND role='R2' AND revoked_at IS NULL")
+[ "${n}" = "0" ] && ok "0043 前置：CFR4 在本案件不持有 R2（反例是角色種類不符）" \
+  || ng "0043 前置：CFR4 仍持有 ${n} 筆 R2"
+MF=$(mfn)
+expect_err "0043：非 R2（案件層 R4）不得建立現金流支持 run" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43A}']::uuid[],'${CFR4}','1.0.0')" \
+  "ACTOR_ROLE_NOT_HELD"
+no_run "${MF}" "非 R2 發起"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${T2R2}' AND role='R2' AND engagement_id IS NULL AND revoked_at IS NULL")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM role_assignment
+     WHERE user_id='${T2R2}' AND engagement_id='${ENG}' AND revoked_at IS NULL")
+[ "${n}" = "1" ] && [ "${m}" = "0" ] \
+  && ok "0043 前置：T2R2 持有租戶層 R2、本案件無任何指派（角色種類正確、作用域錯誤）" \
+  || ng "0043 前置：T2R2 租戶層 ${n} 筆／案件層 ${m} 筆"
+MF=$(mfn)
+expect_err "0043：租戶層 R2 不得建立現金流支持 run（§26.3 作用域嚴格相等）" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43A}']::uuid[],'${T2R2}','1.0.0')" \
+  "ACTOR_ROLE_NOT_HELD"
+no_run "${MF}" "租戶層 R2 發起"
+MF=$(mfn)
+expect_err "0043：在別的租戶脈絡下不得建立本租戶的 run" \
+  "${T2} SELECT fn_cash_flow_support_run_create('${MF}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "CROSS_TENANT_DENIED"
+no_run "${MF}" "跨租戶脈絡發起"
+
+# ── 正控制：兩筆合法批次，經 app_runtime 走函式 ──
+# 用 APP_C 才同時證明兩件事：GRANT EXECUTE 生效、且 system-only 守衛不擋函式路徑。
+RUN43=$(APP_C <<<"${T1} SELECT fn_cash_flow_support_run_create('${MF43P}',
+        ARRAY['${B43A}','${B43B}']::uuid[],'${JIA}','1.0.0')" 2>/dev/null)
+[ -n "${RUN43}" ] && ok "0043：R2 經函式以兩筆已接受批次建立現金流支持 run" \
+  || ng "0043：正控制建立失敗"
+st=$(PSQL_C <<<"${T1} SELECT status||'/'||(import_batch_id IS NULL)::text||'/'||
+     (result_content_hash IS NULL)::text||'/'||(completed_at IS NULL)::text||'/'||
+     (failed_at IS NULL)::text||'/'||(replay_of_run_id IS NULL)::text
+     FROM calculation_run WHERE calculation_run_id='${RUN43}'")
+[ "${st}" = "RUNNING/true/true/true/true/true" ] \
+  && ok "0043：run 建立即 RUNNING、單一批次欄位為 NULL、結果與終態欄位皆未預填" \
+  || ng "0043：run 狀態為 ${st}"
+st=$(PSQL_C <<<"${T1} SELECT string_agg(import_batch_id::text,',' ORDER BY import_batch_id)
+     FROM calculation_run_source_batch WHERE calculation_run_id='${RUN43}'")
+[ "${st}" = "${B43A},${B43B}" ] && ok "0043：來源橋接恰好是那兩筆批次（同一交易內凍結）" \
+  || ng "0043：橋接為 ${st}"
+st=$(PSQL_C <<<"${T1} SELECT (r.created_by='${JIA}')::text||'/'||
+     (r.request_content_hash = m.frozen_set_content_hash)::text||'/'||r.engine_version
+     FROM calculation_run r JOIN calculation_input_manifest m ON m.manifest_id=r.manifest_id
+     WHERE r.calculation_run_id='${RUN43}'")
+[ "${st}" = "true/true/1.0.0" ] \
+  && ok "0043：建立者、請求雜湊（＝Manifest 凍結雜湊）與引擎版本都如實記錄" \
+  || ng "0043：run 欄位為 ${st}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM cash_flow_support_line WHERE calculation_run_id='${RUN43}'")
+m=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_manifest_entry WHERE manifest_id='${MF43P}'")
+[ "${n}" = "0" ] && [ "${m}" = "0" ] \
+  && ok "0043：本刀只建立 run——不產生支持資料列、不凍結 Manifest 條目（屬 2b 後續）" \
+  || ng "0043：支持資料列 ${n} 筆／Manifest 條目 ${m} 筆"
+expect_err "0043：同一份 Manifest 不得再建第二個原始 run" \
+  "${T1} SELECT fn_cash_flow_support_run_create('${MF43P}',ARRAY['${B43A}']::uuid[],'${JIA}','1.0.0')" \
+  "CFS_RUN_MANIFEST_ALREADY_USED"
+
+# ── 既有的單批次契約不得因本刀改變 ──
+expect_err "0043：FX_TRANSLATION run 不帶 import_batch_id 仍被既有守衛拒絕" \
+  "${T1} INSERT INTO calculation_run (tenant_id, engagement_id, period_revision_id, manifest_id,
+        run_type, status, request_key, request_content_hash, engine_version, created_by)
+   VALUES ('${TEN}','${ENG}','${PR}','${MF43FX}','PREVIEW','RUNNING',gen_random_uuid(),'h','1.0.0','${JIA}')" \
+  "Run 必須指明來源批次"
+
+# ── 併發：批次狀態變更不得穿過建立交易 ──
+# B 先持有未提交的 ACCEPTED → SUPERSEDED；A 呼叫函式時會卡在 FOR UPDATE，
+# 等 B 提交後讀到的是 SUPERSEDED，因此必須失敗。沒有列鎖時 A 會讀到舊值而成功。
+st=$(PSQL_C <<<"${T1} SELECT status FROM import_batch WHERE import_batch_id='${B43CC}'")
+[ "${st}" = "ACCEPTED" ] && ok "0043 併發前置：競態批次在 B 動手前確實是 ACCEPTED" \
+  || ng "0043 併發前置：狀態為 ${st}"
+( PSQL_C >/dev/null 2>&1 <<SQL
+${T1}
+BEGIN;
+UPDATE import_batch SET status='SUPERSEDED', superseded_by_id='${B43A}'
+ WHERE import_batch_id='${B43CC}';
+SELECT pg_sleep(3);
+COMMIT;
+SQL
+) & BPID=$!
+sleep 0.8
+start=$(date +%s)
+out=$(PSQL_C <<<"${T1} SELECT fn_cash_flow_support_run_create('${MF43C}',
+      ARRAY['${B43CC}']::uuid[],'${JIA}','1.0.0')" 2>&1)
+waited=$(( $(date +%s) - start ))
+wait ${BPID}
+[ "${waited}" -ge 1 ] && ok "0043 競態：A 的建立被 B 的列鎖擋住（等待 ${waited}s，未讀到過期狀態）" \
+  || ng "0043 競態：A 未被阻塞（等待 ${waited}s）——FOR UPDATE 未生效"
+echo "${out}" | grep -q "CFS_BATCH_NOT_ACCEPTED" \
+  && ok "0043 競態：B 提交後 A 讀到 SUPERSEDED 並失敗（狀態變更未穿過建立交易）" \
+  || ng "0043 競態：A 未以 CFS_BATCH_NOT_ACCEPTED 失敗 → ${out}"
+n=$(PSQL_C <<<"${T1} SELECT count(*) FROM calculation_run WHERE manifest_id='${MF43C}'")
+[ "${n}" = "0" ] && ok "0043 競態：失敗的建立沒有留下 run" || ng "0043 競態：留下 ${n} 筆 run"
+
 [ "${STANDALONE:-0}" = "1" ] && summary
