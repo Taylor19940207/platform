@@ -1034,6 +1034,30 @@ expect_err "0043：FX_TRANSLATION run 不帶 import_batch_id 仍被既有守衛�
    VALUES ('${TEN}','${ENG}','${PR}','${MF43FX}','PREVIEW','RUNNING',gen_random_uuid(),'h','1.0.0','${JIA}')" \
   "Run 必須指明來源批次"
 
+# ── 權限：0042 的掃描用 LIKE 'fn_cf%'，而 LIKE 的 `_` 是**單字元萬用字元**，
+# 等於要求第五個字元是 f——fn_cash_flow_support_run_create 被靜默排除。
+# 不改既有那三條（斷言不得修改），改用正規表示式另立一組涵蓋兩種命名。
+n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+     WHERE ns.nspname='public' AND p.proname ~ '^fn_(cf|cash_flow)_' AND p.prosecdef
+       AND NOT ('search_path=pg_catalog, public' = ANY(COALESCE(p.proconfig,ARRAY['']::text[])))")
+[ "${n}" = "0" ] && ok "0043：現金流全部 SECURITY DEFINER 函式都固定 search_path（含 fn_cash_flow_*）" \
+  || ng "0043：${n} 支函式未固定 search_path"
+n=$(PSQL_C <<<"SELECT count(*) FROM pg_proc p JOIN pg_namespace ns ON ns.oid=p.pronamespace
+     WHERE ns.nspname='public' AND p.proname ~ '^fn_(cf|cash_flow)_' AND p.prosecdef
+       AND has_function_privilege('public', p.oid, 'EXECUTE')")
+[ "${n}" = "0" ] && ok "0043：現金流全部 SECURITY DEFINER 函式一律撤回 PUBLIC（含 fn_cash_flow_*）" \
+  || ng "0043：${n} 支函式仍對 PUBLIC 開放"
+n=$(PSQL_C <<<"SELECT prosecdef::text||'/'||has_function_privilege('public',oid,'EXECUTE')::text||'/'||
+     has_function_privilege('app_runtime',oid,'EXECUTE')::text
+     FROM pg_proc WHERE proname='fn_cash_flow_support_run_create'")
+[ "${n}" = "true/false/true" ] \
+  && ok "0043：建立入口為 SECURITY DEFINER、PUBLIC 無 EXECUTE、只授權 app_runtime" \
+  || ng "0043：建立入口的權限為 ${n}"
+n=$(PSQL_C <<<"SELECT prosecdef::text FROM pg_proc WHERE proname='fn_calculation_run_insert_guard'")
+[ "${n}" = "false" ] \
+  && ok "0043：run 的 INSERT trigger 維持 SECURITY INVOKER（改成 DEFINER 會讓 system-only 檢查對誰都通過）" \
+  || ng "0043：trigger 的 prosecdef 為 ${n}"
+
 # ── 併發：批次狀態變更不得穿過建立交易 ──
 # B 先持有未提交的 ACCEPTED → SUPERSEDED；A 呼叫函式時會卡在 FOR UPDATE，
 # 等 B 提交後讀到的是 SUPERSEDED，因此必須失敗。沒有列鎖時 A 會讀到舊值而成功。
