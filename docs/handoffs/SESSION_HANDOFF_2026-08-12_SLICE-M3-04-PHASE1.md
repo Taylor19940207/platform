@@ -1,18 +1,21 @@
-# SESSION HANDOFF　2026-08-12　SLICE-M3-04 現金流支持資料（第一段完成）
+# SESSION HANDOFF　SLICE-M3-04 現金流支持資料（持續更新的唯一交接入口）
 
-基準：**HEAD `b87af36`**，已 push，工作區乾淨。
-完整測試 **1,144** 零失敗：單元 66 ／ DB 整合 651 ／ 端到端 427。
-**41 份 migration**（可從零重建）。
+> 檔名保留 `PHASE1` 是為了不讓既有連結失效；本檔內容已推進至 **Phase 2a 完成**。
+> 後續 M3-04 換機交接持續更新本檔，不再為每一小段新增 handoff。
+
+基準：**HEAD `6ad2e82`**，已 push，工作區乾淨。
+完整測試 **1,261** 零失敗：單元 66 ／ DB 整合 759 ／ 端到端 436。
+**42 份 migration**（可從零重建）。
 
 **權威契約：`docs/slices/SLICE-M3-04_現金流支持資料.md` 第五版**（經五輪走查凍結）。
-新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0041，
-就能直接開始 2a。
+新 session 只要先讀 `SESSION_START.md`、本 handoff、該契約與 0039～0042，
+就能直接開始 **2b**。
 
-## 為什麼在這裡切
+## 現在切在哪裡
 
-現在正好在乾淨的架構邊界：契約已凍結、模型與結構守衛完成、全綠，
-而下一步從**資料結構**轉入**角色工作流函式**——兩者的測試形態不同
-（前者驗 CHECK 與外鍵，後者驗角色、父鏈與 `current_tenant()`）。
+契約、模型、結構守衛與角色工作流已完成且全綠。下一步從**工作流**轉入
+**計算與判定**：支持資料 run、Manifest、輸出、完整度與 K1～K4。
+2a 已獨立提交並關閉，不得與 2b 重做或混改。
 
 ## 第一段交付（0039／0040／0041）
 
@@ -49,12 +52,13 @@ run 的來源歸屬就會說謊。因此新增 `calculation_run_source_batch` �
 fact 的 `actual_granularity` 改為**直接等於封套所指的那一筆**。
 封套建立後不可 UPDATE／DELETE，更正走新 dataset。
 
-## 第二段：拆成 2a／2b，**禁止一次混做**
+## 第二段：2a 已關閉，下一步只做 2b
 
-### 2a　角色工作流函式（下一步）
+### 2a　角色工作流函式（0042，CLOSED／PASS）
 
-全部為 **system-only 函式**，一律：固定 `SET search_path = pg_catalog, public`、
-`REVOKE ALL … FROM PUBLIC` 後明示授權、驗 `current_tenant()` 與完整父鏈。
+0042 未回改 0039～0041。全部寫入入口為 **system-only 函式**：固定
+`SET search_path = pg_catalog, public`、`REVOKE ALL … FROM PUBLIC` 後明示授權，
+驗 `current_tenant()`、角色作用域與完整父鏈；`app_runtime` 對現金流各表維持只有 SELECT。
 
 | # | 函式 | 角色 |
 |---|---|---|
@@ -66,19 +70,53 @@ fact 的 `actual_granularity` 改為**直接等於封套所指的那一筆**。
 | 6 | `PeriodCashFlowSourceSelection` 選定 | R4；版本鏈由**取代鏈**判斷、不得分叉 |
 | 7 | 零活動的 R2 確認、R3 覆核 | R2 ＋ R3（四組資料齊備才完整） |
 
-**2a 明確不做**：`CalculationRun`、Manifest、`CashFlowSupportLine`、
-K1～K4、replay。
+另完成：十一張表的父鏈與版本鏈守衛、`CashFlowZeroActivityAttestation`、映射的
+R2→R3→R4／SoD／生效區間重疊／靜態粒度相容、Coverage 有效結論的父鏈，以及
+`DATA_PRESENT` fail closed（只能留給 2b 的系統衍生入口）。
 
-**測試紀律**：每個負面測試**先斷言角色與父鏈前置成立**，避免被較早的守衛
-以別的理由擋下而假綠（本刀已踩過四次，見下）。
-2a 完成後**單獨提交、跑完整測試一輪**，再開 2b。
+cashflow DB 測試由 36 增至 **144**；既有 36 條的斷言與預期錯誤未弱化。
+九項控制分五批反證，皆在反轉後轉紅、還原後全綠。2a 的提交為 `6ad2e82`。
 
-### 2b　計算與判定（2a 穩定後）
+### 2b　計算與判定（下一步）
 
-支持資料 run（`calculation_scope = 'CASH_FLOW_SUPPORT'`）、Manifest 凍結與
-重演、完整度判定、K1～K4 控制總額、期間級就緒判定，以及契約的 26 條驗收。
+只做以下範圍：
 
-## 本段踩過的測試陷阱（2a 會再遇到）
+1. 支持資料 run（`calculation_scope = 'CASH_FLOW_SUPPORT'`）與多批次來源橋接；
+2. Manifest 凍結、`fn_manifest_verify`、結果雜湊與 replay；
+3. `CashFlowSupportLine` 只原樣承接已接受 fact 的 signed amount 與命中映射；
+4. `DATA_PRESENT` 只能由系統依已接受 fact 衍生；
+5. 以實際 `DataCoverage` 判定 run-level 粒度是否滿足政策；
+6. 完整度的穩定代碼、K1～K4 控制總額與期間級就緒判定；
+7. 契約 26 條驗收與指名反證，完成後跑完整一輪。
+
+**尚未完成的兩條界線，不得誤寫成 2a 已完成**：
+
+- `CFS_MAPPING_AMBIGUOUS` 現在只驗**同一版本內**的規則重疊；跨版本由取代鏈決定
+  現行版本，本來就不是「映射歧義」。2b 的動態判定只對現行批准版本執行。
+- 粒度目前只有建立規則時的**靜態相容性**；「實際 DataCoverage 是否足夠」尚未實作，
+  必須由 2b 以封套綁定的那一筆 `data_coverage_id` 判定。
+
+2b 明確不做畫面，也不解鎖期間遷移；先讓計算、凍結、重演與控制總額在 DB 層閉合。
+
+## 2026-08-13 端到端 fixture 退化與修復（94c0b29）
+
+`351eb86` 的 B-06 畫面種子為同一期間加入一筆 `ACCEPTED` 批次與一筆 `RUNNING` run。
+四支既有端到端測試卻用「只按期間查批次」或 `LIMIT 1` 找自己剛建立的物件，開始回傳
+多列或抓到 seed 的 run。舊 handoff 所寫的 1,144 全綠是 B-06 種子變更前的事實，
+其後沒有完整重跑，不能拿來代表當時 HEAD。
+
+修復規則已成為測試契約：
+
+- 批次以測試自己可計算的 `file_sha256` ＋期間＋上傳者定位；
+- 同內容重複上傳另以 `created_at > since` 排除較早批次；
+- run 以該測試自己的 `request_key` 反查，不用 `LIMIT 1`；
+- 每次取得 ID 後立刻回驗父鏈與雜湊（run 另驗來源批次）；
+- 計數型斷言只計該測試自己的批次／run，不看全表。
+
+這次修復使端到端斷言由 427 增至 **436**；修復後基線為 1,153，2a 加入後為 1,261。
+日後 seed 增加資料時，**不得假設「某期間只有一批」或「第一列就是我的資料」**。
+
+## 已踩過、2b 仍須遵守的測試陷阱
 
 1. **被更前面的守衛以別的理由擋住**：fact 的測試需要**真正的**支持資料集
    （否則先撞封套守衛）；矩陣測試需要**存在的**來源列（否則先撞跨租戶檢查）。
@@ -95,7 +133,7 @@ K1～K4、replay。
 - `calculation_run` 建立時必須是 `RUNNING`，結果狀態由執行交易寫入。
 - 一份 manifest 只能有一個原始 run（`calc_run_manifest_origin_uq`）。
 
-## 契約中尚未實作、但 2a／2b 必須遵守的邊界
+## 契約中尚未實作、2b 必須遵守的邊界
 
 - **P0 只收集與映射，不重建**（GB-04）。支持資料列**沒有任何可以放推算結果的
   欄位**——要重建就得先加欄位，那個動作會很顯眼。
@@ -108,7 +146,7 @@ K1～K4、replay。
 
 ## MVP 3 全域剩餘
 
-1. **REQ-CFS-001**（本刀，第二段未完）——未完成前 **MVP 3 不得關閉**。
+1. **REQ-CFS-001**（本刀，2b 未完）——未完成前 **MVP 3 不得關閉**。
 2. **G-03：B 基礎（遞延稅）判定**；`AMENDED` 取代鏈亦未完成。
 3. **對外輸出／`OutputProfile` 核對**——`ROUNDING_DIFFERENCE` 的真正使用場景。
 4. 折算結果就緒的**正式 Guard ID**（須走 CR，BACKLOG 已記）。
