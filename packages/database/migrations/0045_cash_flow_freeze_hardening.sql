@@ -23,6 +23,7 @@
 -- | 2 | `fn_calc_result_hash(run)`：依 scope 重算來源 run 的結果雜湊 |
 -- | 3 | `fn_cf_freeze_source_run_entry(run, role)`：凍結完整輸出證據 ＋ **凍結當下復驗 result hash** |
 -- | 4 | 凍結入口改用該 helper（其餘邏輯不動） |
+-- | 5 | `fn_calc_result_hash` 同樣私有化 ＋ 租戶查證（與 #1 同型，走查後補） |
 --
 -- ## `fn_calc_result_hash` 的兩條公式都是**既有生成端的鏡像**
 --
@@ -93,11 +94,16 @@ REVOKE EXECUTE ON FUNCTION fn_cf_manifest_assert_contract(uuid) FROM app_runtime
 -- ═══ 2　來源 run 的結果雜湊：依 scope 重算 ═════════════════════════
 CREATE FUNCTION fn_calc_result_hash(p_run uuid) RETURNS text
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE v_scope text; v_hash text;
+DECLARE v_scope text; v_hash text; v_tenant uuid;
 BEGIN
-  SELECT m.calculation_scope INTO v_scope
+  -- 與 fn_cf_manifest_assert_contract 同一個理由：SECURITY DEFINER 不受 RLS 保護，
+  -- 不驗租戶的話，知道別人的 run UUID 就能探測它存在並取得結果雜湊。
+  SELECT r.tenant_id, m.calculation_scope INTO v_tenant, v_scope
     FROM calculation_run r JOIN calculation_input_manifest m ON m.manifest_id = r.manifest_id
    WHERE r.calculation_run_id = p_run;
+  IF v_tenant IS DISTINCT FROM current_tenant() THEN
+    RAISE EXCEPTION 'CROSS_TENANT_DENIED: Run 不屬於目前租戶';
+  END IF;
   IF v_scope IS NULL THEN
     RETURN NULL;
   END IF;
@@ -133,8 +139,9 @@ BEGIN
   END IF;
   RETURN v_hash;
 END $$;
+-- 內部 helper：凍結路徑以 owner 身分呼叫，app_runtime 不需要也不應該拿到它。
 REVOKE ALL ON FUNCTION fn_calc_result_hash(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION fn_calc_result_hash(uuid) TO app_runtime;
+REVOKE EXECUTE ON FUNCTION fn_calc_result_hash(uuid) FROM app_runtime;
 
 -- ═══ 3　來源 run 的凍結條目：完整證據 ＋ 凍結當下復驗 ═══════════════
 -- 「凍結實際輸出」要成立必須兩件事同時做到：payload 足以重算來源 run 的
@@ -253,8 +260,9 @@ BEGIN
   -- ── 4.2 鎖版本列 ──
   -- 這些鎖真正做到的是「同一期間的兩次凍結互相序列化」（不相交批次的競態測試
   -- 就是被它們擋下的）。**它們擋不住取代鏈被接上**：新版本是帶 supersedes 的
-  -- INSERT，不 UPDATE 舊列，`FOR UPDATE` 攔不到——那屬於檔頭記錄的「改選競態」
-  -- 同一類邊界，由後續刀的期間級就緒判定把關。
+  -- INSERT，不 UPDATE 舊列，`FOR UPDATE` 攔不到。**這不是缺口**：政策與映射版本
+  -- 由參數顯式帶入，後續版本被建立也不會改變本次凍結的輸入；而「凍結途中改選」
+  -- 由期間列鎖擋住（`fn_cf_select_source` 同樣 `FOR UPDATE OF pr`，已有雙 session 測試）。
   SELECT p.policy_version_id, p.tenant_id, p.engagement_id, p.reporting_unit_id,
          p.class_set_version_id, p.approved_at
     INTO pol FROM cash_flow_policy_version p

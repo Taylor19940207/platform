@@ -356,8 +356,10 @@ try {
   // 11B SQL 端的結果雜湊鏡像必須與 worker 的生成公式一致（0045）
   // fn_calc_result_hash 是 worker canonical 結果雜湊的鏡像，凍結來源 run 時用它復驗。
   // 兩端各自實作，唯一的防分岔手段就是拿**真實 worker 產出的 run** 對一次。
+  // 該函式驗 current_tenant()（0045 的跨租戶探測面收口），因此要帶上租戶脈絡。
   check("fn_calc_result_hash 對 worker 產出的 NO_FX run 重算結果一致（0045 鏡像未分岔）",
-    sql(`SELECT (fn_calc_result_hash('${RUN1}'::uuid) = result_content_hash)::text
+    sql(`SET app.tenant_id = '11111111-1111-1111-1111-111111111111';
+         SELECT (fn_calc_result_hash('${RUN1}'::uuid) = result_content_hash)::text
            FROM calculation_run WHERE calculation_run_id = '${RUN1}'::uuid`) === "true");
 
   // 12 事件完整性

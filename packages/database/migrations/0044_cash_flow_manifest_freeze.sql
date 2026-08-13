@@ -60,7 +60,10 @@
 --    映射／選定那幾列的 `FOR UPDATE`，序列化實際上是它們做到的（實測反證——拿掉
 --    `FOR UPDATE OF pr` 仍全綠）。保留它是為了「先鎖期間、再解析現行選定」這個
 --    順序保證；不要因為它看起來多餘就拿掉，也不要宣稱測試證明過它。
--- 3. **FX 來源 run 的原始輸出形狀（`translation_result`）尚未被測試走過**：
+-- 3. ~~**FX 來源 run 的原始輸出形狀（`translation_result`）尚未被測試走過**~~
+--    **已由 0045 關閉**：第三期的本期來源改為引擎（`fn_fx_translation_run`）真正
+--    產生的折算 run，FX payload 與 result hash 均由真實輸出驗證。以下段落保留為
+--    當時的判斷紀錄，不要據此以為現在仍有缺口。
 --    現金流的來源 run 若是折算 run，選定會要求同期的 `PeriodFxRunSelection`，
 --    而那需要容許值版本＋折算調節＋折算政策鏈＋匯率版本——等於在現金流 fixture
 --    裡重建整條 M3-02／M3-03 的鏈。NO_FX 分支已逐筆驗過（凍結行資料等於實際輸出）。
@@ -216,8 +219,9 @@ BEGIN
   -- ── 4.2 鎖版本列 ──
   -- 這些鎖真正做到的是「同一期間的兩次凍結互相序列化」（不相交批次的競態測試
   -- 就是被它們擋下的）。**它們擋不住取代鏈被接上**：新版本是帶 supersedes 的
-  -- INSERT，不 UPDATE 舊列，`FOR UPDATE` 攔不到——那屬於檔頭記錄的「改選競態」
-  -- 同一類邊界，由後續刀的期間級就緒判定把關。
+  -- INSERT，不 UPDATE 舊列，`FOR UPDATE` 攔不到。**這不是缺口**：政策與映射版本
+  -- 由參數顯式帶入，後續版本被建立也不會改變本次凍結的輸入；而「凍結途中改選」
+  -- 由期間列鎖擋住（`fn_cf_select_source` 同樣 `FOR UPDATE OF pr`，已有雙 session 測試）。
   SELECT p.policy_version_id, p.tenant_id, p.engagement_id, p.reporting_unit_id,
          p.class_set_version_id, p.approved_at
     INTO pol FROM cash_flow_policy_version p

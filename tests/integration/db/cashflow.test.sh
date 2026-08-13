@@ -1651,6 +1651,15 @@ n=$(APP_C <<<"${T1} SELECT fn_cf_manifest_assert_contract('${MANI43}')" 2>&1 | g
   || ng "0045：app_runtime 仍呼叫得動結構驗證 helper"
 expect_err "0045：在別的租戶脈絡下不得以已知 UUID 探測本租戶的凍結集合" \
   "${T2} SELECT fn_cf_manifest_assert_contract('${MANI43}')" "CROSS_TENANT_DENIED"
+# 結果雜湊函式是同一型的探測面：知道別人的 run UUID 就能確認它存在並取得結果雜湊
+n=$(PSQL_C <<<"SELECT has_function_privilege('app_runtime','fn_calc_result_hash(uuid)','EXECUTE')::text")
+[ "${n}" = "false" ] && ok "0045：結果雜湊函式已撤回 app_runtime 的 EXECUTE（僅內部使用）" \
+  || ng "0045：app_runtime 仍可執行結果雜湊函式"
+n=$(APP_C <<<"${T1} SELECT fn_calc_result_hash('${PRIOR3}')" 2>&1 | grep -c "permission denied")
+[ "${n}" -ge 1 ] && ok "0045：app_runtime 直接呼叫結果雜湊函式被權限擋下" \
+  || ng "0045：app_runtime 仍呼叫得動結果雜湊函式"
+expect_err "0045：在別的租戶脈絡下不得以已知 UUID 探測本租戶 run 的結果雜湊" \
+  "${T2} SELECT fn_calc_result_hash('${PRIOR3}')" "CROSS_TENANT_DENIED"
 
 # ── P1-2：凍結當下復驗來源 run 的結果雜湊 ──
 n=$(PSQL_C <<<"${T1} SELECT (fn_calc_result_hash('${FXRUN3}') = result_content_hash)::text

@@ -5,7 +5,7 @@
 
 最近完整測試基準：**2b 第二刀 A ＋ hardening（1,399／1,399）**，工作區乾淨。
 **尚未 push**（`25d84dd` 之後的提交）。
-完整測試 **1,399** 零失敗：單元 66 ／ DB 整合 896 ／ 端到端 437。
+完整測試 **1,402** 零失敗：單元 66 ／ DB 整合 899 ／ 端到端 437。
 **45 份 migration**（可從零重建）。
 
 **權威契約：`docs/slices/SLICE-M3-04_現金流支持資料.md` 第五版**（經五輪走查凍結）。
@@ -182,14 +182,16 @@ batches[], actor, engine)`，案件層 **R2**。**政策與映射版本由參數
 `fn_cf_manifest_assert_contract`（scope／singleton／條件式期初證據／來源 run 1 或 2 筆／
 object_id 非空）——**沒有第二套 canonical 或 hash**。
 
-cashflow DB 測試 204 → **281**（含 0045 的 hardening）。十項控制分三批反證轉紅；
+cashflow DB 測試 204 → **284**（含 0045 的 hardening）。十項控制分三批反證轉紅；
 第四批（兩把鎖）**不轉紅**，兩個結論見下。
 
 ### 0045　走查後的三項收口（與 0044 同一刀交付）
 
-1. **結構驗證 helper 私有化**：`fn_cf_manifest_assert_contract` 原本是
-   SECURITY DEFINER 卻授權 app_runtime 且不驗租戶——等於一支拿已知 UUID 探測
-   他人 Manifest 的工具。撤回授權 ＋ 加 `current_tenant()` 查證。
+1. **SECURITY DEFINER helper 一律私有化 ＋ 驗租戶**：`fn_cf_manifest_assert_contract`
+   與 `fn_calc_result_hash` 原本都授權 app_runtime 且不驗租戶——等於兩支拿已知 UUID
+   探測他人 Manifest／Run 是否存在（甚至取得結果雜湊）的工具。兩支都撤回授權並加
+   `current_tenant()` 查證。**新增 SECURITY DEFINER helper 時預設就該這樣做**：
+   凍結路徑以 owner 身分呼叫它們，app_runtime 從來不需要。
 2. **來源 run 的凍結補完**：FX payload 補上 `translation_policy_rule_id`、逐筆
    component 與 CTA 的政策／匯率版本證據；新增 `fn_calc_result_hash(run)` 並在
    **凍結當下復驗**來源 run 的 `result_content_hash`——輸出若被資料修復破壞，
